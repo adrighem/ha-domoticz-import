@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/app-icon-1254.png" alt="Domoticz Sync app icon" width="160">
+  <img src="custom_components/domoticz_sync/brand/icon@2x.png" alt="Domoticz Sync app icon" width="160">
 </p>
 
 # Domoticz Sync for Home Assistant
@@ -20,6 +20,10 @@ It is intentionally read-only for the first version:
 ## Installation
 
 This integration is installed via **HACS (Home Assistant Community Store)** as a custom repository:
+
+[![Open your Home Assistant instance and add this repository to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=adrighem&repository=ha-domoticz-sync&category=integration)
+
+Alternatively, add it manually:
 
 1. Open **HACS** in your Home Assistant interface.
 2. Click the three dots `...` in the top-right corner and select **Custom repositories**.
