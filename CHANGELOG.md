@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.1.4](https://github.com/adrighem/ha-domoticz-sync/compare/v0.1.3...v0.1.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* complete local brand asset support ([26464a9](https://github.com/adrighem/ha-domoticz-sync/commit/26464a9aed81766dff214c4dedf9c48abe384ad3))
+
 ## [0.1.3](https://github.com/adrighem/ha-domoticz-sync/compare/v0.1.2...v0.1.3) (2026-07-25)
 
 
