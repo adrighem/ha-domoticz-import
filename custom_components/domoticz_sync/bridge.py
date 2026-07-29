@@ -1,0 +1,452 @@
+"""Authenticated Home Assistant endpoint for the Domoticz companion plugin."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from typing import Final
+
+from aiohttp import WSCloseCode, WSMsgType, web
+from homeassistant.components.http import HomeAssistantView
+
+from .const import DOMAIN
+from .core.protocol import (
+    DIRECTION_DOMOTICZ_TO_HA,
+    DIRECTION_HA_TO_DOMOTICZ,
+    ProtocolAuthenticationError,
+    ProtocolError,
+    build_challenge,
+    build_ready,
+    canonical_json_dumps,
+    canonical_json_loads,
+    derive_session_id,
+    derive_session_key,
+    generate_nonce,
+    make_handshake_context,
+    parse_hello,
+    sign_envelope,
+    validate_link_id,
+    validate_nonce,
+    validate_pairing_key,
+    verify_authenticate,
+    verify_envelope,
+)
+
+BRIDGE_WEBSOCKET_PATH: Final = "/api/domoticz_sync/websocket"
+
+MAX_BRIDGE_MESSAGE_BYTES: Final = 64 * 1024
+MAX_PENDING_HANDSHAKES: Final = 8
+PREPARE_TIMEOUT: Final = 5.0
+FIRST_MESSAGE_TIMEOUT: Final = 3.0
+AUTHENTICATION_TIMEOUT: Final = 10.0
+INVENTORY_TIMEOUT: Final = 10.0
+HEARTBEAT_INTERVAL: Final = 30.0
+HEARTBEAT_RESPONSE_TIMEOUT: Final = 10.0
+
+_POLICY_CLOSE_MESSAGE: Final = b"Protocol error"
+_PEER_CLOSE_MESSAGE: Final = b"Connection closed"
+_SHUTDOWN_CLOSE_MESSAGE: Final = b"Bridge unavailable"
+
+
+class BridgeConfigurationError(ValueError):
+    """A bridge link conflicts with another configured link."""
+
+
+class _PeerClosed(Exception):
+    """The peer closed its connection normally."""
+
+
+@dataclass(frozen=True, slots=True)
+class BridgeLink:
+    """Credentials for one configured Domoticz bridge."""
+
+    entry_id: str
+    link_id: str
+    pairing_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Validate credentials even when constructed directly."""
+        validate_link_id(self.link_id)
+        validate_pairing_key(self.pairing_key)
+
+
+@dataclass(slots=True)
+class BridgeSession:
+    """One mutually authenticated Domoticz connection."""
+
+    link_id: str
+    destination_id: str
+    session_id: str
+    websocket: web.WebSocketResponse = field(repr=False)
+    session_key: bytes = field(repr=False)
+    client_sequence: int = 0
+    server_sequence: int = 0
+    ready: bool = False
+
+
+class DomoticzBridgeManager:
+    """Own configured links and their active authenticated sessions."""
+
+    def __init__(self) -> None:
+        """Initialize an empty manager."""
+        self._lock = asyncio.Lock()
+        self._links: dict[str, BridgeLink] = {}
+        self._entry_links: dict[str, str] = {}
+        self._sessions: dict[str, BridgeSession] = {}
+        self._pending_handshakes = 0
+
+    async def async_register_link(
+        self,
+        *,
+        entry_id: str,
+        link_id: str,
+        pairing_key: str,
+    ) -> None:
+        """Register or atomically replace one config entry's bridge link."""
+        replacement = BridgeLink(entry_id, link_id, pairing_key)
+        session_to_close: BridgeSession | None = None
+
+        async with self._lock:
+            owner = self._links.get(link_id)
+            if owner is not None and owner.entry_id != entry_id:
+                raise BridgeConfigurationError("bridge link is already configured")
+
+            previous_link_id = self._entry_links.get(entry_id)
+            if previous_link_id is not None and previous_link_id != link_id:
+                self._links.pop(previous_link_id, None)
+                session_to_close = self._sessions.pop(previous_link_id, None)
+
+            current_session = self._sessions.get(link_id)
+            if (
+                current_session is not None
+                and owner is not None
+                and owner.pairing_key != pairing_key
+            ):
+                session_to_close = self._sessions.pop(link_id)
+
+            self._links[link_id] = replacement
+            self._entry_links[entry_id] = link_id
+
+        if session_to_close is not None:
+            await _async_close(
+                session_to_close.websocket,
+                WSCloseCode.GOING_AWAY,
+                _SHUTDOWN_CLOSE_MESSAGE,
+            )
+
+    async def async_unregister_entry(self, entry_id: str) -> None:
+        """Remove a config entry and close its active bridge connection."""
+        async with self._lock:
+            link_id = self._entry_links.pop(entry_id, None)
+            if link_id is None:
+                return
+            self._links.pop(link_id, None)
+            session = self._sessions.pop(link_id, None)
+
+        if session is not None:
+            await _async_close(
+                session.websocket,
+                WSCloseCode.GOING_AWAY,
+                _SHUTDOWN_CLOSE_MESSAGE,
+            )
+
+    async def async_shutdown(self) -> None:
+        """Close all active sessions during Home Assistant shutdown."""
+        async with self._lock:
+            sessions = tuple(self._sessions.values())
+            self._sessions.clear()
+            self._links.clear()
+            self._entry_links.clear()
+
+        await asyncio.gather(
+            *(
+                _async_close(
+                    session.websocket,
+                    WSCloseCode.GOING_AWAY,
+                    _SHUTDOWN_CLOSE_MESSAGE,
+                )
+                for session in sessions
+            )
+        )
+
+    async def async_reserve_handshake(self) -> bool:
+        """Reserve one bounded unauthenticated handshake slot."""
+        async with self._lock:
+            if self._pending_handshakes >= MAX_PENDING_HANDSHAKES:
+                return False
+            self._pending_handshakes += 1
+            return True
+
+    async def async_release_handshake(self) -> None:
+        """Release a previously reserved handshake slot."""
+        async with self._lock:
+            if self._pending_handshakes > 0:
+                self._pending_handshakes -= 1
+
+    async def async_handle_reserved(
+        self,
+        websocket: web.WebSocketResponse,
+    ) -> None:
+        """Authenticate and run a connection with a reserved handshake slot."""
+        session: BridgeSession | None = None
+        reservation_released = False
+
+        try:
+            async with asyncio.timeout(AUTHENTICATION_TIMEOUT):
+                session = await self._async_authenticate(websocket)
+
+            await self.async_release_handshake()
+            reservation_released = True
+            await self._async_run_session(session)
+        except _PeerClosed:
+            await _async_close(
+                websocket,
+                WSCloseCode.GOING_AWAY,
+                _PEER_CLOSE_MESSAGE,
+            )
+        except ProtocolError, TimeoutError:
+            await _async_close(
+                websocket,
+                WSCloseCode.POLICY_VIOLATION,
+                _POLICY_CLOSE_MESSAGE,
+            )
+        except ConnectionError:
+            # aiohttp may surface a transport loss while sending or receiving.
+            pass
+        finally:
+            if not reservation_released:
+                await self.async_release_handshake()
+            if session is not None:
+                await self._async_release_session(session)
+
+    async def async_is_ready(self, link_id: str) -> bool:
+        """Return whether a link currently has a ready authenticated session."""
+        async with self._lock:
+            session = self._sessions.get(link_id)
+            return session is not None and session.ready
+
+    async def async_active_session_count(self) -> int:
+        """Return the number of authenticated sessions."""
+        async with self._lock:
+            return len(self._sessions)
+
+    async def _async_authenticate(
+        self,
+        websocket: web.WebSocketResponse,
+    ) -> BridgeSession:
+        """Perform mutual authentication and claim the configured link."""
+        async with asyncio.timeout(FIRST_MESSAGE_TIMEOUT):
+            hello = parse_hello(await _async_receive_document(websocket))
+
+        async with self._lock:
+            link = self._links.get(hello.link_id)
+        # Link IDs carry 128 bits of randomness and are not authentication
+        # credentials. Rejecting an unknown ID here releases scarce pre-auth
+        # capacity without weakening pairing-key authentication.
+        if link is None:
+            raise ProtocolAuthenticationError("protocol authentication failed")
+        pairing_key = link.pairing_key
+
+        context = make_handshake_context(hello, generate_nonce())
+        await _async_send_document(
+            websocket,
+            build_challenge(pairing_key, context),
+        )
+        verify_authenticate(
+            pairing_key,
+            context,
+            await _async_receive_document(websocket),
+        )
+        session_key = derive_session_key(pairing_key, context)
+        session = BridgeSession(
+            link_id=link.link_id,
+            destination_id=hello.destination_id,
+            session_id=derive_session_id(session_key, context),
+            websocket=websocket,
+            session_key=session_key,
+        )
+
+        async with self._lock:
+            if session.link_id in self._sessions:
+                raise ProtocolError("protocol authentication failed")
+            # Re-check after the network round trip so an unload or rotation
+            # cannot authenticate against stale credentials.
+            if self._links.get(session.link_id) != link:
+                raise ProtocolError("protocol authentication failed")
+            self._sessions[session.link_id] = session
+
+        try:
+            await _async_send_document(websocket, build_ready(session_key, context))
+        except BaseException:
+            await self._async_release_session(session)
+            raise
+        return session
+
+    async def _async_run_session(self, session: BridgeSession) -> None:
+        """Accept initial inventory, announce readiness, then keep the link alive."""
+        async with asyncio.timeout(INVENTORY_TIMEOUT):
+            inventory = await self._async_receive_payload(session)
+        if inventory != {"targets": [], "type": "inventory"}:
+            raise ProtocolError("invalid protocol message")
+
+        await self._async_send_payload(session, {"type": "ready"})
+        session.ready = True
+
+        pending_ping_id: str | None = None
+        pending_ping_deadline: float | None = None
+        loop = asyncio.get_running_loop()
+        while True:
+            timeout = (
+                max(0.0, pending_ping_deadline - loop.time())
+                if pending_ping_deadline is not None
+                else HEARTBEAT_INTERVAL
+            )
+            try:
+                async with asyncio.timeout(timeout):
+                    payload = await self._async_receive_payload(session)
+            except TimeoutError:
+                if pending_ping_id is not None:
+                    raise _PeerClosed from None
+                pending_ping_id = generate_nonce()
+                pending_ping_deadline = loop.time() + HEARTBEAT_RESPONSE_TIMEOUT
+                await self._async_send_payload(
+                    session,
+                    {"id": pending_ping_id, "type": "ping"},
+                )
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "ping":
+                ping_id = _validate_heartbeat_payload(payload)
+                await self._async_send_payload(
+                    session,
+                    {"id": ping_id, "type": "pong"},
+                )
+                continue
+
+            if message_type == "pong":
+                pong_id = _validate_heartbeat_payload(payload)
+                if pending_ping_id is None or pong_id != pending_ping_id:
+                    raise ProtocolError("invalid protocol message")
+                pending_ping_id = None
+                pending_ping_deadline = None
+                continue
+
+            raise ProtocolError("invalid protocol message")
+
+    async def _async_receive_payload(
+        self,
+        session: BridgeSession,
+    ) -> dict[str, object]:
+        """Receive one authenticated, in-order client envelope."""
+        verified = verify_envelope(
+            session.session_key,
+            await _async_receive_document(session.websocket),
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=session.session_id,
+            last_sequence=session.client_sequence,
+        )
+        session.client_sequence = verified.sequence
+        return verified.payload
+
+    async def _async_send_payload(
+        self,
+        session: BridgeSession,
+        payload: dict[str, object],
+    ) -> None:
+        """Send one authenticated, in-order server envelope."""
+        sequence = session.server_sequence + 1
+        document = sign_envelope(
+            session.session_key,
+            direction=DIRECTION_HA_TO_DOMOTICZ,
+            session_id=session.session_id,
+            sequence=sequence,
+            payload=payload,
+        )
+        await _async_send_document(session.websocket, document)
+        session.server_sequence = sequence
+
+    async def _async_release_session(self, session: BridgeSession) -> None:
+        """Release a session only if it is still the active instance."""
+        async with self._lock:
+            if self._sessions.get(session.link_id) is session:
+                self._sessions.pop(session.link_id)
+
+
+class DomoticzBridgeView(HomeAssistantView):
+    """Unauthenticated HTTP upgrade endpoint with protocol-level authentication."""
+
+    name = f"api:{DOMAIN}:websocket"
+    url = BRIDGE_WEBSOCKET_PATH
+    requires_auth = False
+    cors_allowed = False
+
+    def __init__(self, manager: DomoticzBridgeManager) -> None:
+        """Initialize the singleton view."""
+        self._manager = manager
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        """Upgrade one bounded Domoticz bridge connection."""
+        if not await self._manager.async_reserve_handshake():
+            return web.Response(status=HTTPStatus.SERVICE_UNAVAILABLE)
+
+        websocket = web.WebSocketResponse(
+            autoping=True,
+            compress=False,
+            max_msg_size=MAX_BRIDGE_MESSAGE_BYTES,
+        )
+        try:
+            async with asyncio.timeout(PREPARE_TIMEOUT):
+                await websocket.prepare(request)
+        except BaseException:
+            await self._manager.async_release_handshake()
+            raise
+
+        await self._manager.async_handle_reserved(websocket)
+        return websocket
+
+
+async def _async_receive_document(
+    websocket: web.WebSocketResponse,
+) -> object:
+    """Receive one canonical text document or classify a closed peer."""
+    message = await websocket.receive()
+    if message.type is WSMsgType.TEXT:
+        return canonical_json_loads(message.data)
+    if message.type in {
+        WSMsgType.CLOSE,
+        WSMsgType.CLOSED,
+        WSMsgType.CLOSING,
+        WSMsgType.ERROR,
+    }:
+        raise _PeerClosed
+    raise ProtocolError("invalid protocol message")
+
+
+async def _async_send_document(
+    websocket: web.WebSocketResponse,
+    document: object,
+) -> None:
+    """Send one canonical text document."""
+    await websocket.send_str(canonical_json_dumps(document))
+
+
+def _validate_heartbeat_payload(payload: dict[str, object]) -> str:
+    """Validate an exact signed application heartbeat payload."""
+    if set(payload) != {"id", "type"}:
+        raise ProtocolError("invalid protocol message")
+    heartbeat_id = payload["id"]
+    validate_nonce(heartbeat_id)
+    assert isinstance(heartbeat_id, str)
+    return heartbeat_id
+
+
+async def _async_close(
+    websocket: web.WebSocketResponse,
+    code: WSCloseCode,
+    message: bytes,
+) -> None:
+    """Close a WebSocket without leaking protocol or credential details."""
+    if not websocket.closed:
+        await websocket.close(code=code, message=message)

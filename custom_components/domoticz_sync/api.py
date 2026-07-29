@@ -40,9 +40,7 @@ class DomoticzApi:
         self._session = session
         self.base_url = normalize_base_url(base_url)
         self._auth = (
-            BasicAuth(username, password or "")
-            if username or password
-            else None
+            BasicAuth(username, password or "") if username or password else None
         )
 
     async def async_get_server_time(self) -> dict[str, Any]:
@@ -127,6 +125,8 @@ def normalize_base_url(base_url: str) -> str:
         raise DomoticzApiError("Domoticz URL must use http or https")
     if not parsed.netloc:
         raise DomoticzApiError("Domoticz URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise DomoticzApiError("Domoticz URL must not contain embedded credentials")
 
     path = parsed.path.rstrip("/")
     if path.endswith("/json.htm"):

@@ -29,6 +29,7 @@
     "step": {
       "init": {
         "title": "Domoticz Sync options",
+        "description": "Use these credentials when configuring the companion plugin in Domoticz.\n\nLink ID: `{link_id}`\n\nPairing key: `{pairing_key}`\n\nKeep the pairing key private. It is specific to this connection and is not your Home Assistant password or access token.",
         "data": {
           "include_hidden": "Include hidden devices",
           "favorite_only": "Only import favorite devices",
