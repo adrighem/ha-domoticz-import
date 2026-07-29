@@ -14,6 +14,7 @@ from pytest_homeassistant_custom_component.common import (  # noqa: E402
     MockConfigEntry,
 )
 
+from custom_components.domoticz_sync import CONFIG_SCHEMA  # noqa: E402
 from custom_components.domoticz_sync.api import DomoticzApi  # noqa: E402
 from custom_components.domoticz_sync.const import (  # noqa: E402
     CONF_EXPORT_LABEL_ID,
@@ -22,6 +23,11 @@ from custom_components.domoticz_sync.const import (  # noqa: E402
     EXPORT_LABEL_NAME,
 )
 from custom_components.domoticz_sync.models import DomoticzDevice  # noqa: E402
+
+
+def test_integration_declares_config_entry_only_schema() -> None:
+    """The integration-level bridge does not imply YAML configuration."""
+    assert CONFIG_SCHEMA({}) == {}
 
 
 def _state_for_source(
