@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.2.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.1.4...v0.2.0) (2026-07-29)
+
+
+### Features
+
+* add authenticated Domoticz companion bridge ([#11](https://github.com/adrighem/ha-domoticz-sync/issues/11)) ([b114fdb](https://github.com/adrighem/ha-domoticz-sync/commit/b114fdbd774acaca264ce0ad1e7bcea5a8edad8c))
+
 ## [0.1.4](https://github.com/adrighem/ha-domoticz-sync/compare/v0.1.3...v0.1.4) (2026-07-28)
 
 
