@@ -33,13 +33,81 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[test,lint]"
+          python -m pip install ".[test,home-assistant-test,lint]"
 
       - name: Lint
         run: python -m ruff check .
 
       - name: Test
-        run: python -m pytest
+        run: |
+          env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            python -m pytest
 
       - name: Compile
-        run: python -m compileall custom_components tests
+        run: python -m compileall custom_components plugin.py tests
+
+  core-compatibility:
+    name: Neutral core Python 3.9
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+          cache: pip
+
+      - name: Install test runner
+        run: python -m pip install "pytest<9" "pytest-asyncio>=1.2"
+
+      - name: Test neutral core
+        run: |
+          env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            python -m pytest \
+            tests/test_capabilities.py \
+            tests/test_catalog.py \
+            tests/test_domoticz_plugin.py \
+            tests/test_execution.py \
+            tests/test_protocol.py \
+            tests/test_reconciliation.py
+
+      - name: Smoke-test vendored core
+        run: |
+          env -i PATH="$PATH" \
+            PYTHONPATH="$PWD/custom_components/domoticz_sync" \
+            python -c "from core import ReconciliationExecutor, TargetCatalog, protocol"
+
+  home-assistant-minimum:
+    name: Home Assistant 2026.6
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]" \
+            "pytest-homeassistant-custom-component==0.13.336"
+
+      - name: Test Home Assistant lifecycle and source adapter
+        run: |
+          env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            python -m pytest \
+            tests/test_bridge.py \
+            tests/test_config_flow.py \
+            tests/test_diagnostics.py \
+            tests/test_export_label.py \
+            tests/test_home_assistant.py \
+            tests/test_home_assistant_source.py \
+            tests/test_plugin_bridge_integration.py

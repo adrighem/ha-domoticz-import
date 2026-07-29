@@ -9,6 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import DomoticzDataUpdateCoordinator
 from .models import DomoticzDevice
+from .provenance import domoticz_provenance_attributes
 
 
 class DomoticzEntity(CoordinatorEntity[DomoticzDataUpdateCoordinator]):
@@ -69,11 +70,9 @@ class DomoticzEntity(CoordinatorEntity[DomoticzDataUpdateCoordinator]):
         """Return useful Domoticz metadata."""
         device = self.domoticz_device
         if device is None:
-            return {"domoticz_idx": self._idx}
+            return domoticz_provenance_attributes(self._idx)
 
-        attributes = {
-            "domoticz_idx": device.idx,
-        }
+        attributes = domoticz_provenance_attributes(device.idx)
         if device.type:
             attributes["domoticz_type"] = device.type
         if device.sub_type:

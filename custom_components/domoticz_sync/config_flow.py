@@ -19,19 +19,29 @@ from .api import (
     DomoticzConnectionError,
     normalize_base_url,
 )
+from .bridge_credentials import (
+    generate_bridge_credentials,
+    read_bridge_credentials,
+)
 from .const import (
     CONF_FAVORITE_ONLY,
     CONF_INCLUDE_HIDDEN,
+    CONF_LINK_ID,
+    CONF_PAIRING_KEY,
     CONF_SCAN_INTERVAL,
     CONF_VERIFY_SSL,
+    CONFIG_ENTRY_MINOR_VERSION,
+    CONFIG_ENTRY_VERSION,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_URL,
     DEFAULT_VERIFY_SSL,
     DOMAIN,
     MIN_SCAN_INTERVAL,
 )
+from .core.protocol import ProtocolError
 
 _LOGGER = logging.getLogger(__name__)
+_UNAVAILABLE_PAIRING_CREDENTIAL = "Unavailable"
 
 
 def _user_schema(user_input: dict[str, Any] | None = None) -> vol.Schema:
@@ -40,12 +50,8 @@ def _user_schema(user_input: dict[str, Any] | None = None) -> vol.Schema:
     return vol.Schema(
         {
             vol.Required(CONF_URL, default=user_input.get(CONF_URL, DEFAULT_URL)): str,
-            vol.Optional(
-                CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")
-            ): str,
-            vol.Optional(
-                CONF_PASSWORD, default=user_input.get(CONF_PASSWORD, "")
-            ): str,
+            vol.Optional(CONF_USERNAME, default=user_input.get(CONF_USERNAME, "")): str,
+            vol.Optional(CONF_PASSWORD, default=user_input.get(CONF_PASSWORD, "")): str,
             vol.Optional(
                 CONF_VERIFY_SSL,
                 default=user_input.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
@@ -93,7 +99,8 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 class DomoticzSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Domoticz Sync."""
 
-    VERSION = 1
+    VERSION = CONFIG_ENTRY_VERSION
+    MINOR_VERSION = CONFIG_ENTRY_MINOR_VERSION
 
     @staticmethod
     @callback
@@ -115,7 +122,7 @@ class DomoticzSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             info = await validate_input(self.hass, user_input)
         except DomoticzAuthError:
             errors["base"] = "invalid_auth"
-        except (DomoticzApiError, DomoticzConnectionError):
+        except DomoticzApiError, DomoticzConnectionError:
             errors["base"] = "cannot_connect"
         except Exception:
             _LOGGER.exception("Unexpected error validating Domoticz connection")
@@ -123,11 +130,14 @@ class DomoticzSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         else:
             await self.async_set_unique_id(info["base_url"])
             self._abort_if_unique_id_configured()
+            credentials = generate_bridge_credentials()
             data = {
                 CONF_URL: info["base_url"],
                 CONF_USERNAME: user_input.get(CONF_USERNAME, ""),
                 CONF_PASSWORD: user_input.get(CONF_PASSWORD, ""),
                 CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
+                CONF_LINK_ID: credentials.link_id,
+                CONF_PAIRING_KEY: credentials.pairing_key,
             }
             return self.async_create_entry(title=info["title"], data=data)
 
@@ -141,6 +151,24 @@ class DomoticzSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Handle Domoticz Sync options."""
 
+    def _pairing_placeholders(self) -> dict[str, str]:
+        """Return credentials for display without changing the config entry."""
+        try:
+            credentials = read_bridge_credentials(self.config_entry)
+        except ProtocolError:
+            _LOGGER.error(
+                "Stored companion bridge credentials are invalid "
+                "and cannot be displayed"
+            )
+            return {
+                CONF_LINK_ID: _UNAVAILABLE_PAIRING_CREDENTIAL,
+                CONF_PAIRING_KEY: _UNAVAILABLE_PAIRING_CREDENTIAL,
+            }
+        return {
+            CONF_LINK_ID: credentials.link_id,
+            CONF_PAIRING_KEY: credentials.pairing_key,
+        }
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -151,4 +179,5 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=_options_schema(self.config_entry),
+            description_placeholders=self._pairing_placeholders(),
         )

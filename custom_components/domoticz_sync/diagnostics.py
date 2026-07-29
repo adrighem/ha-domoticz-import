@@ -9,7 +9,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 
-TO_REDACT = {CONF_PASSWORD}
+from .const import CONF_PAIRING_KEY
+
+TO_REDACT = {CONF_PASSWORD, CONF_PAIRING_KEY}
 
 
 async def async_get_config_entry_diagnostics(
@@ -19,5 +21,5 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics for a config entry."""
     return {
         "entry": async_redact_data(entry.data, TO_REDACT),
-        "options": entry.options,
+        "options": async_redact_data(entry.options, TO_REDACT),
     }

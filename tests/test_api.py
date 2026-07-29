@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
 from aiohttp import ClientResponseError
 
 from custom_components.domoticz_sync.api import (
@@ -60,6 +61,19 @@ def test_normalize_base_url():
         normalize_base_url("https://xmpp.vanadrighem.eu:8443/domoticz")
         == "https://xmpp.vanadrighem.eu:8443/domoticz"
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://embedded-user@domoticz.local",
+        "http://embedded-user:embedded-value@domoticz.local",
+    ],
+)
+def test_normalize_base_url_rejects_embedded_credentials(url):
+    """Credentials must use the dedicated fields and never enter URLs."""
+    with pytest.raises(DomoticzApiError, match="must not contain"):
+        normalize_base_url(url)
 
 
 def test_get_devices_sends_expected_params():
