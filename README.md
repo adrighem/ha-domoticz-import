@@ -136,7 +136,7 @@ feature-negotiation, and transport-security rules.
 <!-- x-release-please-start-version -->
 ```bash
 cd /path/to/domoticz/plugins
-git clone --branch v0.2.0 https://github.com/adrighem/ha-domoticz-sync.git
+git clone --branch v0.3.0 https://github.com/adrighem/ha-domoticz-sync.git
 ```
 <!-- x-release-please-end -->
 
@@ -174,7 +174,7 @@ Domoticz plugins directory must be updated and restarted separately:
 ```bash
 cd /path/to/domoticz/plugins/ha-domoticz-sync
 git fetch --tags
-git checkout v0.2.0
+git checkout v0.3.0
 # Restart Domoticz after the update.
 ```
 <!-- x-release-please-end -->
