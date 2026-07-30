@@ -14,7 +14,11 @@ import math
 import re
 import secrets
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Union
+
+from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
+from .reconciliation import ReconciliationAction, ReconciliationActionKind
 
 PROTOCOL_VERSION = 1
 
@@ -23,7 +27,7 @@ DIRECTION_HA_TO_DOMOTICZ = "home_assistant_to_domoticz"
 
 PAIRING_KEY_BITS = 256
 NONCE_BITS = 256
-MAX_MESSAGE_BYTES = 262_144
+MAX_MESSAGE_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 32
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEQUENCE = MAX_SAFE_INTEGER
@@ -43,6 +47,25 @@ _HELLO_KEYS = {"version", "type", "link_id", "destination_id", "client_nonce"}
 _CHALLENGE_KEYS = {"version", "type", "server_nonce", "server_proof"}
 _AUTHENTICATE_KEYS = {"version", "type", "client_proof"}
 _READY_KEYS = {"version", "type", "session_id"}
+_APPLY_KEYS = {"type", "request_id", "action"}
+_APPLY_RESULT_KEYS = {
+    "type",
+    "request_id",
+    "status",
+    "target_id",
+    "source",
+}
+_ACTION_KEYS = {"kind", "capability", "target_id", "stale"}
+_CAPABILITY_KEYS = {
+    "source",
+    "kind",
+    "name",
+    "value",
+    "availability",
+    "semantic",
+    "unit",
+}
+_SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _ENVELOPE_KEYS = {
     "version",
     "type",
@@ -76,6 +99,13 @@ class ProtocolAuthenticationError(ProtocolError):
 
 class ProtocolSequenceError(ProtocolError):
     """An authenticated envelope is replayed, missing, or out of order."""
+
+
+class ApplyResultStatus(str, Enum):
+    """The only safe outcomes returned for one remote action."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
 
 
 @dataclass(frozen=True)
@@ -118,6 +148,42 @@ class VerifiedEnvelope:
     direction: str
     sequence: int
     payload: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class ApplyRequest:
+    """One correlation identifier and complete target-neutral action."""
+
+    request_id: str
+    action: ReconciliationAction
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as strictly as parsed input."""
+        _validate_request_id(self.request_id)
+        if not isinstance(self.action, ReconciliationAction):
+            raise ProtocolFormatError("invalid protocol message")
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    """A sanitized remote confirmation or rejection."""
+
+    request_id: str
+    status: ApplyResultStatus
+    target_id: Optional[str]
+    source: Optional[SourceIdentity]
+
+    def __post_init__(self) -> None:
+        """Require result fields to agree with their status."""
+        _validate_request_id(self.request_id)
+        if not isinstance(self.status, ApplyResultStatus):
+            raise ProtocolFormatError("invalid protocol message")
+        if self.status is ApplyResultStatus.CONFIRMED:
+            _validate_target_id(self.target_id)
+            if not isinstance(self.source, SourceIdentity):
+                raise ProtocolFormatError("invalid protocol message")
+        elif self.target_id is not None or self.source is not None:
+            raise ProtocolFormatError("invalid protocol message")
 
 
 def canonical_json_dumps(value: object) -> str:
@@ -197,6 +263,11 @@ def validate_pairing_key(value: object) -> None:
 def generate_nonce() -> str:
     """Generate a 256-bit canonical URL-safe handshake nonce."""
     return _encode_token(secrets.token_bytes(_NONCE_BYTES))
+
+
+def generate_request_id() -> str:
+    """Generate a strong correlation ID accepted by the identifier schema."""
+    return "request_" + generate_nonce()
 
 
 def validate_nonce(value: object) -> None:
@@ -488,6 +559,84 @@ def verify_envelope(
     )
 
 
+def build_apply(
+    request_id: str,
+    action: ReconciliationAction,
+) -> Dict[str, object]:
+    """Build one strict Home Assistant-to-Domoticz application request."""
+    request = ApplyRequest(request_id=request_id, action=action)
+    return _normalize_payload(
+        {
+            "type": "apply",
+            "request_id": request.request_id,
+            "action": _action_to_dict(request.action),
+        }
+    )
+
+
+def parse_apply(document: object) -> ApplyRequest:
+    """Parse one exact application request into the neutral action model."""
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _APPLY_KEYS,
+            "apply",
+        )
+        return ApplyRequest(
+            request_id=_require_string(data["request_id"]),
+            action=_action_from_dict(data["action"]),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def build_apply_result(
+    request_id: str,
+    status: ApplyResultStatus,
+    target_id: Optional[str],
+    source: Optional[SourceIdentity],
+) -> Dict[str, object]:
+    """Build one strict Domoticz-to-Home Assistant action result."""
+    result = ApplyResult(
+        request_id=request_id,
+        status=status,
+        target_id=target_id,
+        source=source,
+    )
+    return _normalize_payload(
+        {
+            "type": "apply_result",
+            "request_id": result.request_id,
+            "status": result.status.value,
+            "target_id": result.target_id,
+            "source": (
+                _source_to_dict(result.source) if result.source is not None else None
+            ),
+        }
+    )
+
+
+def parse_apply_result(document: object) -> ApplyResult:
+    """Parse one exact action result without accepting remote error details."""
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _APPLY_RESULT_KEYS,
+            "apply_result",
+        )
+        source_data = data["source"]
+        return ApplyResult(
+            request_id=_require_string(data["request_id"]),
+            status=ApplyResultStatus(data["status"]),
+            target_id=data["target_id"],
+            source=(
+                _source_from_dict(source_data) if source_data is not None else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
 def _object_without_duplicate_keys(
     pairs: List[Tuple[str, object]],
 ) -> Dict[str, object]:
@@ -547,6 +696,17 @@ def _validate_identifier(value: object) -> None:
         raise ProtocolFormatError("invalid protocol message")
 
 
+def _validate_request_id(value: object) -> None:
+    """Require a bounded, log-safe request correlation identifier."""
+    _validate_identifier(value)
+
+
+def _validate_target_id(value: object) -> None:
+    """Apply the target-neutral opaque identifier rules."""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ProtocolFormatError("invalid protocol message")
+
+
 def _validate_direction(value: object) -> None:
     """Require one of the two role-specific wire directions."""
     if type(value) is not str or value not in _DIRECTIONS:
@@ -583,6 +743,19 @@ def _require_message(
     if type(document["version"]) is not int or (
         document["version"] != PROTOCOL_VERSION
     ):
+        raise ProtocolFormatError("invalid protocol message")
+    if type(document["type"]) is not str or document["type"] != expected_type:
+        raise ProtocolFormatError("invalid protocol message")
+    return document
+
+
+def _require_application_message(
+    document: object,
+    expected_keys: set,
+    expected_type: str,
+) -> Dict[str, object]:
+    """Require one exact application payload and its discriminator."""
+    if type(document) is not dict or set(document) != expected_keys:
         raise ProtocolFormatError("invalid protocol message")
     if type(document["type"]) is not str or document["type"] != expected_type:
         raise ProtocolFormatError("invalid protocol message")
@@ -694,6 +867,81 @@ def _normalize_payload(payload: object) -> Dict[str, object]:
     return normalized
 
 
+def _source_to_dict(source: SourceIdentity) -> Dict[str, object]:
+    """Serialize one complete source identity."""
+    return {
+        "system": source.system,
+        "instance_id": source.instance_id,
+        "object_id": source.object_id,
+        "capability_id": source.capability_id,
+    }
+
+
+def _source_from_dict(document: object) -> SourceIdentity:
+    """Parse one exact source identity using its neutral model rules."""
+    _require_exact_object(document, _SOURCE_KEYS)
+    return SourceIdentity(
+        system=document["system"],
+        instance_id=document["instance_id"],
+        object_id=document["object_id"],
+        capability_id=document["capability_id"],
+    )
+
+
+def _capability_to_dict(capability: Capability) -> Dict[str, object]:
+    """Serialize every field that defines one capability snapshot."""
+    return {
+        "source": _source_to_dict(capability.source),
+        "kind": capability.kind.value,
+        "name": capability.name,
+        "value": capability.value,
+        "availability": capability.availability.value,
+        "semantic": capability.semantic,
+        "unit": capability.unit,
+    }
+
+
+def _capability_from_dict(document: object) -> Capability:
+    """Parse one exact capability using the complete neutral semantics."""
+    _require_exact_object(document, _CAPABILITY_KEYS)
+    return Capability(
+        source=_source_from_dict(document["source"]),
+        kind=CapabilityKind(document["kind"]),
+        name=document["name"],
+        value=document["value"],
+        availability=Availability(document["availability"]),
+        semantic=document["semantic"],
+        unit=document["unit"],
+    )
+
+
+def _action_to_dict(action: ReconciliationAction) -> Dict[str, object]:
+    """Serialize every field that defines one reconciliation action."""
+    return {
+        "kind": action.kind.value,
+        "capability": _capability_to_dict(action.capability),
+        "target_id": action.target_id,
+        "stale": action.stale,
+    }
+
+
+def _action_from_dict(document: object) -> ReconciliationAction:
+    """Parse one exact action using the complete neutral model semantics."""
+    _require_exact_object(document, _ACTION_KEYS)
+    return ReconciliationAction(
+        kind=ReconciliationActionKind(document["kind"]),
+        capability=_capability_from_dict(document["capability"]),
+        target_id=document["target_id"],
+        stale=document["stale"],
+    )
+
+
+def _require_exact_object(document: object, expected_keys: set) -> None:
+    """Reject missing, extra, and non-object nested application fields."""
+    if type(document) is not dict or set(document) != expected_keys:
+        raise ProtocolFormatError("invalid protocol message")
+
+
 def _unsigned_envelope(
     direction: str,
     session_id: str,
@@ -719,6 +967,9 @@ __all__ = [
     "NONCE_BITS",
     "PAIRING_KEY_BITS",
     "PROTOCOL_VERSION",
+    "ApplyRequest",
+    "ApplyResult",
+    "ApplyResultStatus",
     "ClientHello",
     "HandshakeContext",
     "ProtocolAuthenticationError",
@@ -727,6 +978,8 @@ __all__ = [
     "ProtocolSequenceError",
     "VerifiedEnvelope",
     "accept_challenge",
+    "build_apply",
+    "build_apply_result",
     "build_authenticate",
     "build_challenge",
     "build_hello",
@@ -742,8 +995,11 @@ __all__ = [
     "generate_link_id",
     "generate_nonce",
     "generate_pairing_key",
+    "generate_request_id",
     "make_handshake_context",
     "parse_hello",
+    "parse_apply",
+    "parse_apply_result",
     "sign_envelope",
     "validate_destination_id",
     "validate_link_id",

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import importlib.util
 import sys
+import traceback
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -16,15 +17,40 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 
 from aiohttp import WSMsgType  # noqa: E402
 from aiohttp import client as aiohttp_client  # noqa: E402
+from homeassistant.const import (  # noqa: E402
+    ATTR_FRIENDLY_NAME,
+    ATTR_UNIT_OF_MEASUREMENT,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant  # noqa: E402
+from homeassistant.helpers import entity_registry as er  # noqa: E402
+from homeassistant.helpers import label_registry as lr  # noqa: E402
 from homeassistant.setup import async_setup_component  # noqa: E402
+from pytest_homeassistant_custom_component.common import (  # noqa: E402
+    MockConfigEntry,
+)
 from pytest_homeassistant_custom_component.typing import (  # noqa: E402
     ClientSessionGenerator,
 )
 
 from custom_components.domoticz_sync.bridge import (  # noqa: E402
+    BridgeApplicationSession,
     DomoticzBridgeManager,
     DomoticzBridgeView,
+)
+from custom_components.domoticz_sync.bridge_reconciliation import (  # noqa: E402
+    HomeAssistantExportApplication,
+)
+from custom_components.domoticz_sync.catalog_storage import (  # noqa: E402
+    HomeAssistantCatalogStorage,
+)
+from custom_components.domoticz_sync.const import (  # noqa: E402
+    CONF_EXPORT_LABEL_ID,
+    DOMAIN,
+    EXPORT_LABEL_NAME,
+)
+from custom_components.domoticz_sync.core.catalog import (  # noqa: E402
+    catalog_from_document,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     generate_link_id,
@@ -63,6 +89,62 @@ class _FakeConnection:
         self.disconnected = True
 
 
+class _FakeUnit:
+    """In-memory DomoticzEx unit with observable persistence calls."""
+
+    def __init__(self, domoticz: _FakeDomoticz, **kwargs: object) -> None:
+        self._domoticz = domoticz
+        self.Name = kwargs.get("Name")
+        self.DeviceID = kwargs.get("DeviceID")
+        self.Unit = kwargs.get("Unit", 1)
+        self.Type = kwargs.get("Type", 0)
+        self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
+        self.Options = dict(kwargs.get("Options", {}))
+        self.Used = kwargs.get("Used", 0)
+        self.nValue = kwargs.get("nValue", 0)
+        self.sValue = kwargs.get("sValue", "")
+        self.updates: list[dict[str, object]] = []
+        self.refreshes = 0
+
+    def Update(self, **kwargs: object) -> None:
+        self.updates.append(dict(kwargs))
+
+    def Refresh(self) -> None:
+        self.refreshes += 1
+
+
+class _FakeDevice:
+    """Container matching DomoticzEx's extended device model."""
+
+    def __init__(self) -> None:
+        self.TimedOut = 0
+        self.Units: dict[int, _FakeUnit] = {}
+
+
+class _FakeUnitCreator:
+    """Deferred DomoticzEx Unit creator."""
+
+    def __init__(
+        self,
+        domoticz: _FakeDomoticz,
+        kwargs: dict[str, object],
+    ) -> None:
+        self._domoticz = domoticz
+        self._kwargs = kwargs
+
+    def Create(self) -> _FakeUnit:
+        self._domoticz.create_calls.append(dict(self._kwargs))
+        unit = _FakeUnit(self._domoticz, **self._kwargs)
+        assert isinstance(unit.DeviceID, str)
+        assert isinstance(unit.Unit, int)
+        device = self._domoticz.devices.setdefault(
+            unit.DeviceID,
+            _FakeDevice(),
+        )
+        device.Units[unit.Unit] = unit
+        return unit
+
+
 class _FakeDomoticz(ModuleType):
     """Minimal DomoticzEx module used to load the real root plugin."""
 
@@ -70,6 +152,8 @@ class _FakeDomoticz(ModuleType):
         super().__init__("DomoticzEx")
         self.configuration: dict[str, object] = {}
         self.connections: list[_FakeConnection] = []
+        self.devices: dict[str, _FakeDevice] = {}
+        self.create_calls: list[dict[str, object]] = []
         self.logs: list[str] = []
         self.errors: list[str] = []
 
@@ -89,6 +173,9 @@ class _FakeDomoticz(ModuleType):
 
     def Heartbeat(self, _seconds: int) -> None:
         pass
+
+    def Unit(self, **kwargs: object) -> _FakeUnitCreator:
+        return _FakeUnitCreator(self, kwargs)
 
     def Log(self, message: str) -> None:
         self.logs.append(message)
@@ -128,6 +215,7 @@ def _load_plugin(
         "Mode3": pairing_key,
         "HomeFolder": str(ROOT),
     }
+    plugin_module.Devices = fake_domoticz.devices
     return plugin_module, fake_domoticz
 
 
@@ -149,6 +237,189 @@ async def _receive_text(websocket: object) -> str:
     assert message.type is WSMsgType.TEXT
     assert isinstance(message.data, str)
     return message.data
+
+
+class _ObservedApplication:
+    """Record successful runs while delegating to the real application."""
+
+    def __init__(self, application: HomeAssistantExportApplication) -> None:
+        self._application = application
+        self._condition = asyncio.Condition()
+        self.attempted_calls = 0
+        self.completed_calls = 0
+        self.failure_type_chains: list[tuple[str, ...]] = []
+        self.failure_frames: list[tuple[tuple[str, str, int], ...]] = []
+
+    async def async_connected(
+        self,
+        session: BridgeApplicationSession,
+    ) -> None:
+        try:
+            await self._application.async_connected(session)
+        except BaseException as error:
+            type_chain = []
+            current: BaseException | None = error
+            while current is not None:
+                type_chain.append(type(current).__name__)
+                current = current.__cause__
+            frames = tuple(
+                (Path(frame.filename).name, frame.name, frame.lineno)
+                for frame in traceback.extract_tb(error.__traceback__)
+            )
+            async with self._condition:
+                self.attempted_calls += 1
+                self.failure_type_chains.append(tuple(type_chain))
+                self.failure_frames.append(frames)
+                self._condition.notify_all()
+            raise
+        async with self._condition:
+            self.attempted_calls += 1
+            self.completed_calls += 1
+            self._condition.notify_all()
+
+    async def async_wait_for_calls(self, expected: int) -> None:
+        """Wait until the real application has completed enough sessions."""
+        async with asyncio.timeout(2):
+            async with self._condition:
+                await self._condition.wait_for(lambda: self.attempted_calls >= expected)
+        assert self.completed_calls >= expected, (
+            "bridge application failed with exception types "
+            f"{self.failure_type_chains[-1]} at {self.failure_frames[-1]}"
+        )
+
+
+class _ObservedBridgeView(DomoticzBridgeView):
+    """Expose completion of each real HTTP WebSocket request handler."""
+
+    def __init__(self, manager: DomoticzBridgeManager) -> None:
+        super().__init__(manager)
+        self._condition = asyncio.Condition()
+        self.completed_requests = 0
+
+    async def get(self, request: object) -> object:
+        try:
+            return await super().get(request)
+        finally:
+            async with self._condition:
+                self.completed_requests += 1
+                self._condition.notify_all()
+
+    async def async_wait_for_requests(self, expected: int) -> None:
+        """Wait until the complete view handler has returned."""
+        async with asyncio.timeout(2):
+            async with self._condition:
+                await self._condition.wait_for(
+                    lambda: self.completed_requests >= expected
+                )
+
+
+async def _open_plugin_connection(
+    plugin_module: ModuleType,
+    fake_domoticz: _FakeDomoticz,
+    client: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[object, _FakeConnection, object, int]:
+    """Connect the real plugin through authentication and application ready."""
+    plugin = plugin_module.DomoticzSyncPlugin()
+    plugin.onStart()
+    connection = fake_domoticz.connections[-1]
+    connection.connecting = False
+    connection.connected = True
+    plugin.onConnect(connection, 0, "connected")
+
+    upgrade_request = connection.sent[0]
+    request_headers = upgrade_request["Headers"]
+    assert isinstance(request_headers, dict)
+    upgrade_key = request_headers["Sec-WebSocket-Key"]
+    assert isinstance(upgrade_key, str)
+    decoded_upgrade_key = base64.b64decode(upgrade_key, validate=True)
+
+    with monkeypatch.context() as websocket_key_patch:
+        websocket_key_patch.setattr(
+            aiohttp_client,
+            "os",
+            SimpleNamespace(urandom=lambda size: decoded_upgrade_key),
+        )
+        websocket = await client.ws_connect(
+            upgrade_request["URL"],
+            origin=request_headers["Origin"],
+            compress=0,
+        )
+
+    response = websocket._response
+    plugin.onMessage(
+        connection,
+        {
+            "Status": str(response.status),
+            "Headers": dict(response.headers),
+        },
+    )
+
+    send_position = 1
+    hello, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(hello)
+    plugin.onMessage(
+        connection,
+        {"Payload": await _receive_text(websocket)},
+    )
+
+    authenticate, send_position = _next_text_payload(
+        connection,
+        send_position,
+    )
+    await websocket.send_str(authenticate)
+    plugin.onMessage(
+        connection,
+        {"Payload": await _receive_text(websocket)},
+    )
+
+    inventory, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(inventory)
+    plugin.onMessage(
+        connection,
+        {"Payload": await _receive_text(websocket)},
+    )
+
+    assert plugin.phase == plugin_module.PHASE_READY
+    return plugin, connection, websocket, send_position
+
+
+async def _exchange_one_apply(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+    application: _ObservedApplication,
+    expected_application_call: int,
+) -> int:
+    """Pass one signed apply and its signed result across the real socket."""
+    try:
+        payload = await _receive_text(websocket)
+    except AssertionError:
+        await application.async_wait_for_calls(expected_application_call)
+        raise
+    plugin.onMessage(connection, {"Payload": payload})
+    result, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(result)
+    return send_position
+
+
+async def _close_plugin_connection(
+    plugin: object,
+    websocket: object,
+    manager: DomoticzBridgeManager,
+    view: _ObservedBridgeView,
+    expected_request: int,
+) -> None:
+    """Close both ends and wait for bridge session cleanup."""
+    await websocket.close()
+    plugin.onStop()
+    for _ in range(20):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
+    await view.async_wait_for_requests(expected_request)
 
 
 @pytest.mark.asyncio
@@ -274,3 +545,200 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
             break
         await asyncio.sleep(0)
     assert await manager.async_active_session_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create once, reconnect without duplication, then update in place."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    source_entry = registry.async_get_or_create(
+        "sensor",
+        "integration_test",
+        "garden_temperature",
+        suggested_object_id="garden_temperature",
+        original_name="Garden temperature",
+        unit_of_measurement=UnitOfTemperature.CELSIUS,
+    )
+    registry.async_update_entity(
+        source_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    state_attributes = {
+        ATTR_FRIENDLY_NAME: "Garden temperature",
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
+    }
+    hass.states.async_set(
+        source_entry.entity_id,
+        "12.5",
+        state_attributes,
+    )
+
+    application = _ObservedApplication(HomeAssistantExportApplication(hass))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+    assert endpoint.port is not None
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    (
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    destination_id = first._destination_id
+    assert isinstance(destination_id, str)
+    try:
+        first_position = await _exchange_one_apply(
+            first,
+            first_connection,
+            first_websocket,
+            first_position,
+            application,
+            1,
+        )
+        await application.async_wait_for_calls(1)
+
+        storage = HomeAssistantCatalogStorage(
+            hass,
+            entry_id=entry.entry_id,
+            destination_id=destination_id,
+        )
+        catalog = catalog_from_document(await storage.async_load())
+        assert len(catalog.records) == 1
+        target_id = catalog.records[0].target_id
+        assert len(target_id) == 25
+        assert target_id.startswith("HA")
+        assert len(fake_domoticz.create_calls) == 1
+        assert first_position == len(first_connection.sent)
+
+        unit = fake_domoticz.devices[target_id].Units[1]
+        assert unit.Name == "Garden temperature"
+        assert unit.Type == 243
+        assert unit.SubType == 31
+        assert unit.Options == {"Custom": "1;celsius"}
+        assert unit.Used == 1
+        assert unit.nValue == 0
+        assert unit.sValue == "12.5"
+        assert fake_domoticz.devices[target_id].TimedOut == 0
+    finally:
+        await _close_plugin_connection(
+            first,
+            first_websocket,
+            manager,
+            bridge_view,
+            1,
+        )
+
+    (
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        await application.async_wait_for_calls(2)
+        assert second._destination_id == destination_id
+        assert second_position == len(second_connection.sent)
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id].Units[1] is unit
+        assert unit.sValue == "12.5"
+    finally:
+        await _close_plugin_connection(
+            second,
+            second_websocket,
+            manager,
+            bridge_view,
+            2,
+        )
+
+    hass.states.async_set(
+        source_entry.entity_id,
+        "18.75",
+        state_attributes,
+    )
+    (
+        third,
+        third_connection,
+        third_websocket,
+        third_position,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        third_position = await _exchange_one_apply(
+            third,
+            third_connection,
+            third_websocket,
+            third_position,
+            application,
+            3,
+        )
+        await application.async_wait_for_calls(3)
+
+        updated_storage = HomeAssistantCatalogStorage(
+            hass,
+            entry_id=entry.entry_id,
+            destination_id=destination_id,
+        )
+        updated_catalog = catalog_from_document(await updated_storage.async_load())
+        assert len(updated_catalog.records) == 1
+        assert updated_catalog.records[0].target_id == target_id
+        assert updated_catalog.records[0].capability.value == 18.75
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id].Units[1] is unit
+        assert unit.sValue == "18.75"
+        assert unit.updates[-1] == {"Log": False}
+        assert third_position == len(third_connection.sent)
+        assert fake_domoticz.errors == []
+    finally:
+        await _close_plugin_connection(
+            third,
+            third_websocket,
+            manager,
+            bridge_view,
+            3,
+        )

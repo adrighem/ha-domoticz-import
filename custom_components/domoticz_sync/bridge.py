@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Final
+from typing import Final, Protocol
 
 from aiohttp import WSCloseCode, WSMsgType, web
 from homeassistant.components.http import HomeAssistantView
@@ -57,6 +57,13 @@ class _PeerClosed(Exception):
     """The peer closed its connection normally."""
 
 
+class BridgeApplication(Protocol):
+    """Application invoked for one ready, authenticated bridge session."""
+
+    async def async_connected(self, session: BridgeApplicationSession) -> None:
+        """Use the ready session before the bridge starts its heartbeat loop."""
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeLink:
     """Credentials for one configured Domoticz bridge."""
@@ -75,6 +82,7 @@ class BridgeLink:
 class BridgeSession:
     """One mutually authenticated Domoticz connection."""
 
+    entry_id: str
     link_id: str
     destination_id: str
     session_id: str
@@ -85,11 +93,57 @@ class BridgeSession:
     ready: bool = False
 
 
+class BridgeApplicationSession:
+    """Narrow signed-payload facade for a ready bridge session."""
+
+    __slots__ = ("_active", "_manager", "_session")
+
+    def __init__(
+        self,
+        manager: DomoticzBridgeManager,
+        session: BridgeSession,
+    ) -> None:
+        """Bind the facade to one active bridge session."""
+        self._manager = manager
+        self._session = session
+        self._active = True
+
+    @property
+    def entry_id(self) -> str:
+        """Return the Home Assistant config entry owning this session."""
+        return self._session.entry_id
+
+    @property
+    def destination_id(self) -> str:
+        """Return the authenticated Domoticz destination identifier."""
+        return self._session.destination_id
+
+    async def async_send(self, payload: dict[str, object]) -> None:
+        """Send one signed, in-order application payload."""
+        self._ensure_active()
+        await self._manager._async_send_payload(self._session, payload)
+
+    async def async_receive(self) -> dict[str, object]:
+        """Receive one signed, in-order application payload."""
+        self._ensure_active()
+        return await self._manager._async_receive_payload(self._session)
+
+    def _deactivate(self) -> None:
+        """Prevent application traffic after control returns to the bridge."""
+        self._active = False
+
+    def _ensure_active(self) -> None:
+        """Reject use once the heartbeat loop owns the session."""
+        if not self._active:
+            raise ProtocolError("application session is no longer active")
+
+
 class DomoticzBridgeManager:
     """Own configured links and their active authenticated sessions."""
 
-    def __init__(self) -> None:
+    def __init__(self, application: BridgeApplication | None = None) -> None:
         """Initialize an empty manager."""
+        self._application = application
         self._lock = asyncio.Lock()
         self._links: dict[str, BridgeLink] = {}
         self._entry_links: dict[str, str] = {}
@@ -213,7 +267,11 @@ class DomoticzBridgeManager:
             )
         except ConnectionError:
             # aiohttp may surface a transport loss while sending or receiving.
-            pass
+            await _async_close(
+                websocket,
+                WSCloseCode.GOING_AWAY,
+                _PEER_CLOSE_MESSAGE,
+            )
         finally:
             if not reservation_released:
                 await self.async_release_handshake()
@@ -260,6 +318,7 @@ class DomoticzBridgeManager:
         )
         session_key = derive_session_key(pairing_key, context)
         session = BridgeSession(
+            entry_id=link.entry_id,
             link_id=link.link_id,
             destination_id=hello.destination_id,
             session_id=derive_session_id(session_key, context),
@@ -292,6 +351,13 @@ class DomoticzBridgeManager:
 
         await self._async_send_payload(session, {"type": "ready"})
         session.ready = True
+
+        if self._application is not None:
+            application_session = BridgeApplicationSession(self, session)
+            try:
+                await self._application.async_connected(application_session)
+            finally:
+                application_session._deactivate()
 
         pending_ping_id: str | None = None
         pending_ping_deadline: float | None = None

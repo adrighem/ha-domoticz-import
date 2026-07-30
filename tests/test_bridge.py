@@ -23,12 +23,14 @@ from custom_components.domoticz_sync.bridge import (  # noqa: E402
     BRIDGE_WEBSOCKET_PATH,
     MAX_BRIDGE_MESSAGE_BYTES,
     MAX_PENDING_HANDSHAKES,
+    BridgeApplicationSession,
     DomoticzBridgeManager,
     DomoticzBridgeView,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    ProtocolError,
     accept_challenge,
     build_authenticate,
     build_hello,
@@ -83,6 +85,41 @@ class AuthenticatedClient:
         )
         self.server_sequence = verified.sequence
         return verified.payload
+
+
+class ExchangingApplication:
+    """Application test double that exchanges one signed request and response."""
+
+    def __init__(self) -> None:
+        """Initialize application observations."""
+        self.called = asyncio.Event()
+        self.completed = asyncio.Event()
+        self.entry_id: str | None = None
+        self.destination_id: str | None = None
+
+    async def async_connected(self, session: BridgeApplicationSession) -> None:
+        """Record identifiers and exchange one application payload."""
+        self.entry_id = session.entry_id
+        self.destination_id = session.destination_id
+        self.called.set()
+        payload = await session.async_receive()
+        assert payload == {"type": "application-request", "value": 42}
+        await session.async_send({"type": "application-response", "value": 42})
+        self.completed.set()
+
+
+class FailingApplication:
+    """Application test double that fails as soon as it receives a session."""
+
+    def __init__(self, error: Exception) -> None:
+        """Store the failure raised by the callback."""
+        self.error = error
+        self.called = asyncio.Event()
+
+    async def async_connected(self, session: BridgeApplicationSession) -> None:
+        """Raise the configured application failure."""
+        self.called.set()
+        raise self.error
 
 
 async def _async_create_endpoint(
@@ -161,6 +198,109 @@ async def _async_connect(
     )
     assert verified.payload == {"type": "ready"}
     return AuthenticatedClient(websocket, session_key, session_id)
+
+
+@pytest.mark.asyncio
+async def test_application_runs_after_ready_and_exchanges_signed_payloads(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """The application exclusively owns the ready session before heartbeats."""
+    application = ExchangingApplication()
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    destination_id = generate_destination_id()
+    await manager.async_register_link(
+        entry_id="entry-application",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    connection = await _async_connect(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        destination_id=destination_id,
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+
+    assert await manager.async_is_ready(link_id)
+    assert application.entry_id == "entry-application"
+    assert application.destination_id == destination_id
+
+    await connection.async_send({"type": "application-request", "value": 42})
+    assert await connection.async_receive() == {
+        "type": "application-response",
+        "value": 42,
+    }
+    async with asyncio.timeout(1):
+        await application.completed.wait()
+
+    ping_id = generate_nonce()
+    await connection.async_send({"id": ping_id, "type": "ping"})
+    assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    await connection.websocket.close()
+
+
+@pytest.mark.parametrize(
+    ("application_error", "expected_close_code"),
+    [
+        pytest.param(
+            ProtocolError("invalid application message"),
+            WSCloseCode.POLICY_VIOLATION,
+            id="protocol-error",
+        ),
+        pytest.param(
+            TimeoutError(),
+            WSCloseCode.POLICY_VIOLATION,
+            id="timeout",
+        ),
+        pytest.param(
+            ConnectionError(),
+            WSCloseCode.GOING_AWAY,
+            id="connection-error",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_application_failure_closes_and_releases_session(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    application_error: Exception,
+    expected_close_code: WSCloseCode,
+) -> None:
+    """Expected application failures close and release the claimed session."""
+    application = FailingApplication(application_error)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-failure",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    connection = await _async_connect(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+        close = await connection.websocket.receive()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == expected_close_code
+    for _ in range(10):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
+    await connection.websocket.close()
 
 
 @pytest.mark.asyncio

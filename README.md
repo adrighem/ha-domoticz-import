@@ -7,17 +7,19 @@
 [![CI](https://github.com/adrighem/ha-domoticz-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/adrighem/ha-domoticz-sync/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/adrighem/ha-domoticz-sync/actions/workflows/codeql.yml/badge.svg)](https://github.com/adrighem/ha-domoticz-sync/actions/workflows/codeql.yml)
 
-This custom integration syncs device state from Domoticz into Home Assistant using the Domoticz JSON API.
+This custom integration imports device state from Domoticz into Home Assistant
+using the Domoticz JSON API. Its companion plugin can also export selected
+Home Assistant numeric sensors to Domoticz.
 
-It is intentionally read-only for the first version:
+The entities imported from Domoticz are intentionally read-only:
 
 - Polls `/json.htm?type=command&param=getdevices&filter=all&used=true&order=Name`
 - Creates Home Assistant sensors for typed Domoticz values such as temperature, humidity, pressure, power, counters, rain, wind, battery, and text values
 - Creates read-only binary sensors for Domoticz switch/security states such as motion, door contact, smoke, moisture, and on/off switches
 - Supports username/password Basic Auth
 - Supports hidden-device and favorite-only filters through the options flow
-- Includes a connection-only Domoticz companion plugin. It does not create
-  Domoticz devices yet.
+- Includes a Domoticz companion plugin that exports selected Home Assistant
+  numeric sensor entities as Domoticz Custom Sensors.
 
 ## Installation
 
@@ -69,9 +71,27 @@ private.
 ## Domoticz Companion Plugin
 
 The root-level `plugin.py` lets Domoticz make an outbound, authenticated
-WebSocket connection to Home Assistant. The current connection-only
-implementation validates pairing, inventory handshake, heartbeat, and
-reconnect behavior. It does not create or update Domoticz devices yet.
+WebSocket connection to Home Assistant. When the plugin connects, Home
+Assistant exports numeric sensor entities assigned the **Domoticz Export**
+label. The plugin creates, adopts, or updates matching Domoticz Custom Sensors.
+It uses deterministic device IDs, so reconnecting adopts the same devices
+instead of creating duplicates. It never deletes Domoticz devices.
+
+To select an entity for export in Home Assistant:
+
+1. Go to **Settings** -> **Devices & services** -> **Entities**.
+2. Open the entity.
+3. Add **Domoticz Export** under **Labels** and save.
+
+Export currently runs once when the Domoticz plugin connects. Restart the
+plugin or Domoticz after changing an entity state or label. Binary entity
+export and continuous state updates are planned for later. The plugin does not
+yet inventory Domoticz devices, so it cannot detect every manual change made on
+the Domoticz side. An unavailable Home Assistant entity marks its Domoticz
+device as timed out for the current Domoticz runtime. That flag is not
+persisted across a Domoticz restart. If the source remains unavailable, this
+connect-time version may not reassert the unchanged flag until the source state
+changes; full remote-state repair is planned for later.
 
 Install the whole repository as one Domoticz plugin directory. The plugin uses
 the shared neutral core shipped elsewhere in the repository, so copying only
