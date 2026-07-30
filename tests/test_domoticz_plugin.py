@@ -7,6 +7,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -694,10 +695,39 @@ def test_release_automation_updates_plugin_metadata():
     """Release Please keeps the Domoticz and Home Assistant versions aligned."""
     source = (ROOT / "plugin.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    manifest = json.loads(
+        (ROOT / "custom_components/domoticz_sync/manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    release_manifest = json.loads(
+        (ROOT / ".release-please-manifest.json").read_text(encoding="utf-8")
+    )
     release_config = json.loads(
         (ROOT / "release-please-config.json").read_text(encoding="utf-8")
     )
     extra_files = release_config["packages"]["."]["extra-files"]
+    metadata_text = ast.get_docstring(ast.parse(source))
+    assert metadata_text is not None
+    plugin_version = ET.fromstring(metadata_text).attrib["version"]
+    project_version_match = re.search(
+        r'(?m)^version = "([^"]+)"$',
+        project,
+    )
+    assert project_version_match is not None
+    release_blocks = re.findall(
+        r"<!-- x-release-please-start-version -->\n"
+        r"(.*?)"
+        r"<!-- x-release-please-end -->",
+        readme,
+        flags=re.DOTALL,
+    )
+    readme_versions = {
+        version
+        for block in release_blocks
+        for version in re.findall(r"\bv(\d+\.\d+\.\d+)\b", block)
+    }
 
     assert "# x-release-please-start-version" in source
     assert "# x-release-please-end" in source
@@ -705,6 +735,13 @@ def test_release_automation_updates_plugin_metadata():
     assert readme.count("x-release-please-start-version") == 2
     assert readme.count("x-release-please-end") == 2
     assert {"type": "generic", "path": "README.md"} in extra_files
+    assert {
+        plugin_version,
+        manifest["version"],
+        project_version_match.group(1),
+        release_manifest["."],
+    } == {plugin_version}
+    assert readme_versions == {plugin_version}
 
 
 def test_plugin_import_loads_protocol_without_core_package(loaded_plugin):

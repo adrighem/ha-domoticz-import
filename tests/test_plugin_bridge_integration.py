@@ -32,6 +32,7 @@ from homeassistant.const import (  # noqa: E402
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
+    UnitOfEnergy,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant  # noqa: E402
@@ -578,12 +579,55 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "source_unique_id",
+        "source_name",
+        "device_class",
+        "state_class",
+        "unit_of_measurement",
+        "expected_type",
+        "expected_subtype",
+        "expected_options",
+    ),
+    [
+        (
+            "garden_temperature",
+            "Garden temperature",
+            SensorDeviceClass.TEMPERATURE,
+            SensorStateClass.MEASUREMENT,
+            UnitOfTemperature.CELSIUS,
+            80,
+            5,
+            {},
+        ),
+        (
+            "daily_energy",
+            "Daily energy",
+            SensorDeviceClass.ENERGY,
+            SensorStateClass.TOTAL_INCREASING,
+            UnitOfEnergy.KILO_WATT_HOUR,
+            243,
+            31,
+            {"Custom": "1;kwh"},
+        ),
+    ],
+    ids=("native-temperature", "custom-energy"),
+)
 async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
+    source_unique_id: str,
+    source_name: str,
+    device_class: SensorDeviceClass,
+    state_class: SensorStateClass,
+    unit_of_measurement: str,
+    expected_type: int,
+    expected_subtype: int,
+    expected_options: dict[str, str],
 ) -> None:
-    """Create once, reconnect without duplication, then update in place."""
+    """Reconcile native and fallback numerics without duplicate targets."""
     export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -596,22 +640,22 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
     source_entry = registry.async_get_or_create(
         "sensor",
         "integration_test",
-        "garden_temperature",
-        suggested_object_id="garden_temperature",
-        capabilities={ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT},
-        original_device_class=SensorDeviceClass.TEMPERATURE,
-        original_name="Garden temperature",
-        unit_of_measurement=UnitOfTemperature.CELSIUS,
+        source_unique_id,
+        suggested_object_id=source_unique_id,
+        capabilities={ATTR_STATE_CLASS: state_class},
+        original_device_class=device_class,
+        original_name=source_name,
+        unit_of_measurement=unit_of_measurement,
     )
     registry.async_update_entity(
         source_entry.entity_id,
         labels={export_label.label_id},
     )
     state_attributes = {
-        ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
-        ATTR_FRIENDLY_NAME: "Garden temperature",
-        ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT,
-        ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
+        ATTR_DEVICE_CLASS: device_class,
+        ATTR_FRIENDLY_NAME: source_name,
+        ATTR_STATE_CLASS: state_class,
+        ATTR_UNIT_OF_MEASUREMENT: unit_of_measurement,
     }
     hass.states.async_set(
         source_entry.entity_id,
@@ -675,7 +719,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         )
         catalog = catalog_from_document(await storage.async_load())
         assert len(catalog.records) == 1
-        assert catalog.records[0].capability.state_class == "measurement"
+        assert catalog.records[0].capability.state_class == state_class
         target_id = catalog.records[0].target_id
         assert len(target_id) == 25
         assert target_id.startswith("HA")
@@ -683,11 +727,11 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         assert first_position == len(first_connection.sent)
 
         unit = fake_domoticz.devices[target_id].Units[1]
-        assert unit.Name == "Garden temperature"
-        assert unit.Type == 80
-        assert unit.SubType == 5
+        assert unit.Name == source_name
+        assert unit.Type == expected_type
+        assert unit.SubType == expected_subtype
         assert unit.SwitchType == 0
-        assert unit.Options == {}
+        assert unit.Options == expected_options
         assert unit.Used == 1
         assert unit.nValue == 0
         assert unit.sValue == "12.5"
