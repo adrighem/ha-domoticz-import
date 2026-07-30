@@ -24,6 +24,7 @@ from homeassistant.const import (
     UnitOfVolumetricFlux,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import DomoticzRuntimeData
@@ -91,8 +92,7 @@ async def async_setup_entry(
     for device_id, metrics in coordinator.data.metrics.items():
         device = coordinator.data.devices[device_id]
         entities.extend(
-            DomoticzSensor(coordinator, entry, device, metric)
-            for metric in metrics
+            DomoticzSensor(coordinator, entry, device, metric) for metric in metrics
         )
 
     async_add_entities(entities)
@@ -116,7 +116,11 @@ class DomoticzSensor(DomoticzEntity, SensorEntity):
         self._attr_device_class = _DEVICE_CLASS_MAP.get(metric.device_class)
         self._attr_state_class = _STATE_CLASS_MAP.get(metric.state_class)
         self._attr_native_unit_of_measurement = _UNIT_MAP.get(metric.unit)
-        self._attr_entity_category = metric.entity_category
+        self._attr_entity_category = (
+            EntityCategory(metric.entity_category)
+            if metric.entity_category is not None
+            else None
+        )
         self._attr_icon = metric.icon
 
     @property

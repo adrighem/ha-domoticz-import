@@ -130,6 +130,7 @@ class FakeDomoticz(ModuleType):
         self.persist_creates = True
         self.corrupt_refreshes = False
         self.logs = []
+        self.statuses = []
         self.errors = []
         self.heartbeat_seconds = None
 
@@ -152,6 +153,9 @@ class FakeDomoticz(ModuleType):
 
     def Log(self, message):
         self.logs.append(message)
+
+    def Status(self, message):
+        self.statuses.append(message)
 
     def Error(self, message):
         self.errors.append(message)
@@ -704,10 +708,15 @@ def test_v2_hello_repeats_http_selection_offer_and_features(loaded_plugin):
 
 
 def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
-    module, _domoticz = loaded_plugin
+    module, domoticz = loaded_plugin
     protocol = module.wire_protocol
     plugin, connection = _start_and_upgrade(module)
     session_key, session_id = _complete_handshake(module, plugin, connection)
+
+    assert domoticz.statuses == [
+        "Authenticated Home Assistant connection is ready; "
+        "protocol=ha-domoticz-sync.v2; features=ha-export.numeric.v1."
+    ]
 
     server_ping_id = protocol.generate_nonce()
     inbound_ping = protocol.sign_envelope(
@@ -817,7 +826,7 @@ def test_v1_fallback_is_heartbeat_only_and_never_applies(loaded_plugin):
     assert connection.disconnected
     assert len(connection.sent) == sent_before_apply + 1
     assert connection.sent[-1]["Operation"] == "Close"
-    assert any("v1 compatibility mode" in message for message in domoticz.logs)
+    assert any("v1 compatibility mode" in message for message in domoticz.statuses)
 
 
 def test_v2_without_numeric_feature_does_not_parse_or_apply(

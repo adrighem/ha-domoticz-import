@@ -877,12 +877,17 @@ class DomoticzSyncPlugin:
             self._reconnect_delay = 1
             self._last_ping_tick = self._heartbeat_tick
             if self._protocol_version == wire_protocol.PROTOCOL_VERSION:
-                Domoticz.Log(
+                Domoticz.Status(
                     "Authenticated Home Assistant connection is ready in "
-                    "v1 compatibility mode; entity export is disabled."
+                    "v1 compatibility mode; protocol=v1; features=none; "
+                    "entity export is disabled."
                 )
             else:
-                Domoticz.Log("Authenticated connection to Home Assistant is ready.")
+                features = ",".join(self._protocol_selection.features) or "none"
+                Domoticz.Status(
+                    "Authenticated Home Assistant connection is ready; "
+                    f"protocol={self._selected_protocol}; features={features}."
+                )
             return
 
         self._handle_signed_payload(payload)

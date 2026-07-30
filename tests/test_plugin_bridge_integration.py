@@ -162,6 +162,7 @@ class _FakeDomoticz(ModuleType):
         self.devices: dict[str, _FakeDevice] = {}
         self.create_calls: list[dict[str, object]] = []
         self.logs: list[str] = []
+        self.statuses: list[str] = []
         self.errors: list[str] = []
 
     def Configuration(
@@ -186,6 +187,9 @@ class _FakeDomoticz(ModuleType):
 
     def Log(self, message: str) -> None:
         self.logs.append(message)
+
+    def Status(self, message: str) -> None:
+        self.statuses.append(message)
 
     def Error(self, message: str) -> None:
         self.errors.append(message)
