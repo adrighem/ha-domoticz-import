@@ -10,6 +10,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .bridge import DomoticzBridgeManager, DomoticzBridgeView
 from .bridge_credentials import async_ensure_bridge_credentials
+from .bridge_reconciliation import HomeAssistantExportApplication
 from .const import (
     CONFIG_ENTRY_MINOR_VERSION,
     CONFIG_ENTRY_VERSION,
@@ -33,7 +34,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if DATA_BRIDGE_MANAGER in domain_data:
         return True
 
-    manager = DomoticzBridgeManager()
+    manager = DomoticzBridgeManager(HomeAssistantExportApplication(hass))
     domain_data[DATA_BRIDGE_MANAGER] = manager
     hass.http.register_view(DomoticzBridgeView(manager))
 

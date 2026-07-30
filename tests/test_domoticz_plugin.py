@@ -1,4 +1,4 @@
-"""Connection-only tests for the root Domoticz plugin."""
+"""Tests for the root Domoticz companion plugin."""
 
 from __future__ import annotations
 
@@ -47,6 +47,75 @@ class FakeConnection:
         self.disconnected = True
 
 
+class FakeUnit:
+    """In-memory DomoticzEx unit with observable persistence calls."""
+
+    def __init__(self, domoticz, **kwargs):
+        self._domoticz = domoticz
+        self.Name = kwargs.get("Name")
+        self.DeviceID = kwargs.get("DeviceID")
+        self.Unit = kwargs.get("Unit", 1)
+        self.Type = kwargs.get("Type", 0)
+        self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
+        self.Options = dict(kwargs.get("Options", {}))
+        self.Used = kwargs.get("Used", 0)
+        self.nValue = kwargs.get("nValue", 0)
+        self.sValue = kwargs.get("sValue", "")
+        self.updates = []
+        self.refreshes = 0
+        self.deleted = False
+
+    def Update(self, **kwargs):
+        self.updates.append(dict(kwargs))
+
+    def Refresh(self):
+        self.refreshes += 1
+        if self._domoticz.corrupt_refreshes:
+            self.sValue = "not-persisted"
+
+    def Delete(self):
+        self.deleted = True
+        device = self._domoticz.devices.get(self.DeviceID)
+        if device is not None:
+            device.Units.pop(self.Unit, None)
+
+
+class FakeDevice:
+    """Container matching DomoticzEx's extended device model."""
+
+    def __init__(self, domoticz):
+        self._domoticz = domoticz
+        self._timed_out = 0
+        self.Units = {}
+
+    @property
+    def TimedOut(self):
+        return self._timed_out
+
+    @TimedOut.setter
+    def TimedOut(self, value):
+        self._timed_out = value
+
+
+class FakeUnitCreator:
+    """Deferred DomoticzEx Unit creator."""
+
+    def __init__(self, domoticz, kwargs):
+        self._domoticz = domoticz
+        self._kwargs = kwargs
+
+    def Create(self):
+        self._domoticz.create_calls.append(dict(self._kwargs))
+        unit = FakeUnit(self._domoticz, **self._kwargs)
+        if self._domoticz.persist_creates:
+            device = self._domoticz.devices.setdefault(
+                unit.DeviceID,
+                FakeDevice(self._domoticz),
+            )
+            device.Units[unit.Unit] = unit
+        return unit
+
+
 class FakeDomoticz(ModuleType):
     """DomoticzEx module with in-memory configuration and connections."""
 
@@ -55,6 +124,10 @@ class FakeDomoticz(ModuleType):
         self.configuration = {}
         self.configuration_writes = []
         self.connections = []
+        self.devices = {}
+        self.create_calls = []
+        self.persist_creates = True
+        self.corrupt_refreshes = False
         self.logs = []
         self.errors = []
         self.heartbeat_seconds = None
@@ -72,6 +145,9 @@ class FakeDomoticz(ModuleType):
 
     def Heartbeat(self, seconds):
         self.heartbeat_seconds = seconds
+
+    def Unit(self, **kwargs):
+        return FakeUnitCreator(self, kwargs)
 
     def Log(self, message):
         self.logs.append(message)
@@ -101,6 +177,7 @@ def loaded_plugin(monkeypatch):
         "Mode3": module.wire_protocol.generate_pairing_key(),
         "HomeFolder": str(ROOT),
     }
+    module.Devices = fake_domoticz.devices
     return module, fake_domoticz
 
 
@@ -187,6 +264,77 @@ def _complete_handshake(module, plugin, connection):
     )
     assert plugin.phase == module.PHASE_READY
     return session_key, session_id
+
+
+def _numeric_action(
+    protocol,
+    *,
+    kind="create",
+    target_id=None,
+    value=12.5,
+    availability="available",
+    stale=False,
+    name="Outdoor temperature",
+    unit="deg C",
+):
+    """Build one representative neutral numeric action."""
+    source = protocol.SourceIdentity(
+        system="home_assistant",
+        instance_id="instance-1",
+        object_id="sensor.outdoor_temperature",
+        capability_id="state",
+    )
+    capability = protocol.Capability(
+        source=source,
+        kind=protocol.CapabilityKind.NUMERIC,
+        name=name,
+        value=value,
+        availability=protocol.Availability(availability),
+        unit=unit,
+    )
+    return protocol.ReconciliationAction(
+        kind=protocol.ReconciliationActionKind(kind),
+        capability=capability,
+        target_id=target_id,
+        stale=stale,
+    )
+
+
+def _send_apply(
+    module,
+    plugin,
+    connection,
+    session_key,
+    session_id,
+    *,
+    request_id,
+    action=None,
+    payload=None,
+):
+    """Send one signed apply payload and parse its signed response."""
+    protocol = module.wire_protocol
+    if payload is None:
+        payload = protocol.build_apply(request_id, action)
+    previous_out_sequence = plugin._out_sequence
+    envelope = protocol.sign_envelope(
+        session_key,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload=payload,
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(envelope)},
+    )
+    response = protocol.verify_envelope(
+        session_key,
+        protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
+        expected_session_id=session_id,
+        last_sequence=previous_out_sequence,
+    )
+    return protocol.parse_apply_result(response.payload)
 
 
 def test_plugin_metadata_supports_direct_repository_clone():
@@ -370,6 +518,351 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
         {"Payload": protocol.canonical_json_dumps(inbound_pong)},
     )
     assert plugin._pending_ping_id is None
+
+
+def test_signed_create_uses_stable_custom_sensor_and_survives_lost_ack(
+    loaded_plugin,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _numeric_action(protocol)
+
+    first = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-1",
+        action=action,
+    )
+    second = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-1",
+        action=action,
+    )
+
+    expected_id = "HAYNEMTCVS4EAV2SYARQERJIL"
+    assert first.status is protocol.ApplyResultStatus.CONFIRMED
+    assert first.target_id == expected_id
+    assert first.source == action.capability.source
+    assert second == first
+    assert len(expected_id) == 25
+    assert len(domoticz.create_calls) == 1
+    unit = domoticz.devices[expected_id].Units[1]
+    assert unit.Name == "Outdoor temperature"
+    assert unit.Type == 243
+    assert unit.SubType == 31
+    assert unit.Options == {"Custom": "1;deg C"}
+    assert unit.Used == 1
+    assert unit.nValue == 0
+    assert unit.sValue == "12.5"
+    assert domoticz.devices[expected_id].TimedOut == 0
+    assert len(unit.updates) == 1
+    assert unit.refreshes == 2
+
+
+def test_create_adopts_matching_existing_custom_sensor(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _numeric_action(protocol)
+    device_id = module._device_id_for_source(action.capability.source)
+    module.Domoticz.Unit(
+        Name="Old name",
+        DeviceID=device_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Options={"Custom": "1;old"},
+    ).Create()
+    existing = domoticz.devices[device_id].Units[1]
+    existing.nValue = 9
+    existing.sValue = "99"
+    domoticz.devices[device_id].TimedOut = 1
+    created_before = len(domoticz.create_calls)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="adopt-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert result.target_id == device_id
+    assert len(domoticz.create_calls) == created_before
+    assert domoticz.devices[device_id].Units[1] is existing
+    assert existing.Name == action.capability.name
+    assert existing.Options == {"Custom": "1;deg C"}
+    assert existing.Used == 1
+    assert existing.nValue == 0
+    assert existing.sValue == "12.5"
+    assert domoticz.devices[device_id].TimedOut == 0
+
+
+def test_update_converges_complete_numeric_state(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    source_action = _numeric_action(protocol)
+    device_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Old name",
+        DeviceID=device_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Options={"Custom": "1;old"},
+    ).Create()
+    created_before = len(domoticz.create_calls)
+    action = _numeric_action(
+        protocol,
+        kind="update",
+        target_id=device_id,
+        value=18,
+        name="Garden temperature",
+        unit="C",
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="update-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == created_before
+    unit = domoticz.devices[device_id].Units[1]
+    assert unit.Name == "Garden temperature"
+    assert unit.Options == {"Custom": "1;C"}
+    assert unit.Used == 1
+    assert unit.nValue == 0
+    assert unit.sValue == "18"
+    assert domoticz.devices[device_id].TimedOut == 0
+    assert unit.updates[-1] == {
+        "Log": False,
+        "UpdateOptions": True,
+        "UpdateProperties": True,
+    }
+
+
+def test_available_update_recreates_a_missing_expected_sensor(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    source_action = _numeric_action(protocol)
+    device_id = module._device_id_for_source(source_action.capability.source)
+    action = _numeric_action(
+        protocol,
+        kind="update",
+        target_id=device_id,
+        value=19.25,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="repair-update-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert result.target_id == device_id
+    assert len(domoticz.create_calls) == 1
+    unit = domoticz.devices[device_id].Units[1]
+    assert unit.Type == 243
+    assert unit.SubType == 31
+    assert unit.Used == 1
+    assert unit.sValue == "19.25"
+
+
+def test_unavailable_retains_value_and_sets_timed_out(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    source_action = _numeric_action(protocol)
+    device_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Outdoor temperature",
+        DeviceID=device_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Options={"Custom": "1;deg C"},
+    ).Create()
+    unit = domoticz.devices[device_id].Units[1]
+    unit.nValue = 0
+    unit.sValue = "21.75"
+    domoticz.devices[device_id].TimedOut = 0
+    action = _numeric_action(
+        protocol,
+        kind="mark_unavailable",
+        target_id=device_id,
+        value=None,
+        availability="unavailable",
+        stale=True,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="unavailable-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert unit.nValue == 0
+    assert unit.sValue == "21.75"
+    assert domoticz.devices[device_id].TimedOut == 1
+    assert not unit.deleted
+
+
+def test_unsupported_action_is_rejected_and_malformed_action_closes(
+    loaded_plugin,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    numeric = _numeric_action(protocol)
+    binary = protocol.ReconciliationAction(
+        kind=protocol.ReconciliationActionKind.CREATE,
+        capability=protocol.Capability(
+            source=numeric.capability.source,
+            kind=protocol.CapabilityKind.BINARY,
+            name="Door",
+            value=True,
+        ),
+    )
+
+    unsupported = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="unsupported-1",
+        action=binary,
+    )
+    malformed_payload = protocol.build_apply("malformed-1", numeric)
+    malformed_payload["action"]["kind"] = "delete"
+    malformed_envelope = protocol.sign_envelope(
+        session_key,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload=malformed_payload,
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(malformed_envelope)},
+    )
+
+    assert unsupported.status is protocol.ApplyResultStatus.REJECTED
+    assert unsupported.target_id is None
+    assert unsupported.source is None
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert connection.sent[-1]["Operation"] == "Close"
+    logs = "\n".join(domoticz.logs + domoticz.errors)
+    assert module.Parameters["Mode3"] not in logs
+    assert "delete" not in logs
+
+
+def test_apply_rejects_wrong_target_or_incompatible_existing_device(
+    loaded_plugin,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    create = _numeric_action(protocol)
+    device_id = module._device_id_for_source(create.capability.source)
+    module.Domoticz.Unit(
+        Name="Do not replace",
+        DeviceID=device_id,
+        Unit=1,
+        Type=244,
+        Subtype=73,
+    ).Create()
+    incompatible = domoticz.devices[device_id].Units[1]
+
+    collision = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="collision-1",
+        action=create,
+    )
+    wrong_target = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="wrong-target-1",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id="HAWRONGTARGET",
+            value=19,
+        ),
+    )
+
+    assert collision.status is protocol.ApplyResultStatus.REJECTED
+    assert wrong_target.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.devices[device_id].Units[1] is incompatible
+    assert incompatible.Name == "Do not replace"
+    assert not incompatible.deleted
+
+
+def test_apply_confirms_only_after_refresh_and_reread(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    domoticz.corrupt_refreshes = True
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="not-confirmed-1",
+        action=_numeric_action(protocol),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert result.target_id is None
+    assert result.source is None
 
 
 @pytest.mark.parametrize("continuation_type", [bytes, bytearray])

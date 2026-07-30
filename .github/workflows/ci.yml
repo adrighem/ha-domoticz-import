@@ -105,6 +105,8 @@ jobs:
           env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
             python -m pytest \
             tests/test_bridge.py \
+            tests/test_bridge_reconciliation.py \
+            tests/test_catalog_storage.py \
             tests/test_config_flow.py \
             tests/test_diagnostics.py \
             tests/test_export_label.py \

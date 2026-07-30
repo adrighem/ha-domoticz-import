@@ -9,8 +9,8 @@
     <description>
         <h2>Home Assistant Domoticz Sync</h2>
         Clone the complete repository into the Domoticz plugins directory
-        and restart Domoticz. This first version establishes an authenticated
-        connection only. It does not create devices.
+        and restart Domoticz. The plugin establishes an authenticated
+        connection and mirrors supported Home Assistant entities.
     </description>
     <params>
         <param
@@ -46,6 +46,7 @@ import base64
 import hashlib
 import hmac
 import importlib.util
+import math
 import os
 import secrets
 import sys
@@ -63,6 +64,9 @@ _HANDSHAKE_TIMEOUT_TICKS = 2
 _PING_INTERVAL_TICKS = 6
 _PING_TIMEOUT_TICKS = 3
 _MAX_RECONNECT_TICKS = 32
+_CUSTOM_SENSOR_TYPE = 243
+_CUSTOM_SENSOR_SUBTYPE = 31
+_CUSTOM_SENSOR_UNIT = 1
 
 PHASE_STOPPED = "stopped"
 PHASE_DISCONNECTED = "disconnected"
@@ -109,7 +113,9 @@ def _load_wire_protocol():
                 )
 
             specification = importlib.util.spec_from_file_location(
-                module_name, protocol_file
+                module_name,
+                protocol_file,
+                submodule_search_locations=[os.path.dirname(protocol_file)],
             )
             if specification is None or specification.loader is None:
                 raise RuntimeError(
@@ -136,6 +142,10 @@ class PluginConfigurationError(Exception):
     """Raised for unusable local plugin configuration."""
 
 
+class DomoticzApplyError(Exception):
+    """Raised when a requested target state cannot be confirmed."""
+
+
 def _canonical_destination_id(value):
     if not isinstance(value, str):
         raise PluginConfigurationError
@@ -160,6 +170,36 @@ def _header_value(headers, name):
                 return ",".join(value)
             return None
     return None
+
+
+def _source_document(source):
+    """Return the exact canonical identity document used for target IDs."""
+    return {
+        "system": source.system,
+        "instance_id": source.instance_id,
+        "object_id": source.object_id,
+        "capability_id": source.capability_id,
+    }
+
+
+def _device_id_for_source(source):
+    """Derive one stable Domoticz DeviceID from a complete source identity."""
+    identity = wire_protocol.canonical_json_bytes(_source_document(source))
+    digest = hashlib.sha256(identity).digest()
+    encoded = base64.b32encode(digest).decode("ascii").rstrip("=")
+    return "HA" + encoded[:23]
+
+
+def _numeric_s_value(value):
+    """Format one finite protocol number without lossy rounding."""
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise DomoticzApplyError
+    return str(value)
+
+
+def _custom_sensor_options(unit):
+    """Build Domoticz's Custom Sensor options for an optional source unit."""
+    return {"Custom": "1;" + (unit if unit is not None else "")}
 
 
 class DomoticzSyncPlugin:
@@ -495,6 +535,10 @@ class DomoticzSyncPlugin:
         if not isinstance(payload, dict):
             raise wire_protocol.ProtocolFormatError
         message_type = payload.get("type")
+        if message_type == "apply":
+            self._handle_apply_payload(payload)
+            return
+
         message_id = payload.get("id")
         if set(payload) != {"type", "id"}:
             raise wire_protocol.ProtocolFormatError
@@ -507,6 +551,189 @@ class DomoticzSyncPlugin:
             self._last_ping_tick = self._heartbeat_tick
             return
         raise wire_protocol.ProtocolFormatError
+
+    def _handle_apply_payload(self, payload):
+        """Apply one correlated request and return only a sanitized result."""
+        request = wire_protocol.parse_apply(payload)
+
+        try:
+            target_id = self._apply_action(request.action)
+        except Exception:
+            result = wire_protocol.build_apply_result(
+                request.request_id,
+                wire_protocol.ApplyResultStatus.REJECTED,
+                None,
+                None,
+            )
+        else:
+            result = wire_protocol.build_apply_result(
+                request.request_id,
+                wire_protocol.ApplyResultStatus.CONFIRMED,
+                target_id,
+                request.action.capability.source,
+            )
+        self._send_signed(result)
+
+    def _apply_action(self, action):
+        """Idempotently converge and re-read one numeric Custom Sensor."""
+        capability = action.capability
+        if capability.kind.value != "numeric":
+            raise DomoticzApplyError
+
+        action_kind = action.kind.value
+        if action_kind not in {"create", "update", "mark_unavailable"}:
+            raise DomoticzApplyError
+
+        device_id = _device_id_for_source(capability.source)
+        if action_kind != "create" and action.target_id != device_id:
+            raise DomoticzApplyError
+
+        available = capability.availability.value == "available"
+        desired_s_value = _numeric_s_value(capability.value) if available else None
+        options = _custom_sensor_options(capability.unit)
+        device = self._get_device(device_id)
+        unit = self._get_unit(device)
+
+        if unit is None:
+            if action_kind != "create" and not (action_kind == "update" and available):
+                raise DomoticzApplyError
+            Domoticz.Unit(
+                Name=capability.name,
+                DeviceID=device_id,
+                Unit=_CUSTOM_SENSOR_UNIT,
+                Type=_CUSTOM_SENSOR_TYPE,
+                Subtype=_CUSTOM_SENSOR_SUBTYPE,
+                Options=options,
+                Used=1,
+            ).Create()
+            device = self._get_device(device_id)
+            unit = self._get_unit(device)
+
+        if not self._is_custom_sensor(unit):
+            raise DomoticzApplyError
+
+        self._converge_custom_sensor(
+            device,
+            unit,
+            name=capability.name,
+            options=options,
+            available=available,
+            s_value=desired_s_value,
+        )
+        confirmed_device = self._get_device(device_id)
+        confirmed_unit = self._get_unit(confirmed_device)
+        if confirmed_unit is None:
+            raise DomoticzApplyError
+        confirmed_unit.Refresh()
+        confirmed_device = self._get_device(device_id)
+        confirmed_unit = self._get_unit(confirmed_device)
+        if not self._custom_sensor_matches(
+            confirmed_device,
+            confirmed_unit,
+            name=capability.name,
+            options=options,
+            available=available,
+            s_value=desired_s_value,
+        ):
+            raise DomoticzApplyError
+        return device_id
+
+    @staticmethod
+    def _get_device(device_id):
+        """Read a device container from Domoticz's current registry."""
+        devices = globals().get("Devices")
+        if devices is None or device_id not in devices:
+            return None
+        return devices[device_id]
+
+    @staticmethod
+    def _get_unit(device):
+        """Read Unit 1 from a current extended device container."""
+        if device is None:
+            return None
+        units = getattr(device, "Units", None)
+        if units is None or _CUSTOM_SENSOR_UNIT not in units:
+            return None
+        return units[_CUSTOM_SENSOR_UNIT]
+
+    @staticmethod
+    def _is_custom_sensor(unit):
+        return (
+            unit is not None
+            and getattr(unit, "Type", None) == _CUSTOM_SENSOR_TYPE
+            and getattr(unit, "SubType", None) == _CUSTOM_SENSOR_SUBTYPE
+        )
+
+    @staticmethod
+    def _converge_custom_sensor(
+        device,
+        unit,
+        *,
+        name,
+        options,
+        available,
+        s_value,
+    ):
+        """Set the complete desired state while retaining unavailable values."""
+        properties_changed = (
+            getattr(unit, "Name", None) != name
+            or getattr(unit, "Options", None) != options
+            or getattr(unit, "Used", None) != 1
+        )
+        timed_out = 0 if available else 1
+        timeout_changed = getattr(device, "TimedOut", None) != timed_out
+        values_changed = False
+        if available:
+            values_changed = (
+                getattr(unit, "nValue", None) != 0
+                or getattr(unit, "sValue", None) != s_value
+            )
+        if not properties_changed and not values_changed and not timeout_changed:
+            return
+
+        unit.Name = name
+        unit.Options = dict(options)
+        unit.Used = 1
+        # Extended Domoticz exposes timeout on the parent Device. It is
+        # runtime-only state read directly by CPlugin::HasNodeFailed.
+        device.TimedOut = timed_out
+        if available:
+            unit.nValue = 0
+            unit.sValue = s_value
+
+        if properties_changed or values_changed:
+            update = {"Log": False}
+            if properties_changed:
+                update["UpdateProperties"] = True
+                update["UpdateOptions"] = True
+            unit.Update(**update)
+
+    @classmethod
+    def _custom_sensor_matches(
+        cls,
+        device,
+        unit,
+        *,
+        name,
+        options,
+        available,
+        s_value,
+    ):
+        """Confirm desired state from a fresh registry lookup."""
+        if (
+            not cls._is_custom_sensor(unit)
+            or getattr(unit, "Name", None) != name
+            or getattr(unit, "Options", None) != options
+            or getattr(unit, "Used", None) != 1
+            or getattr(device, "TimedOut", None) != (0 if available else 1)
+        ):
+            return False
+        if not available:
+            return True
+        return (
+            getattr(unit, "nValue", None) == 0
+            and getattr(unit, "sValue", None) == s_value
+        )
 
     def _send_document(self, document):
         if self.connection is None:
