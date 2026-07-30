@@ -123,6 +123,11 @@ persisted across a Domoticz restart. If the source remains unavailable, this
 connect-time version may not reassert the unchanged flag until the source state
 changes; full remote-state repair is planned for later.
 
+Home Assistant logs one warning when a directly labelled entity cannot be
+exported, including its entity ID and a fixed reason. Unchanged reconnects do
+not repeat the warning. Numeric entities exported successfully as Custom
+Sensors do not produce warning-level logs.
+
 Install the whole repository as one Domoticz plugin directory. The plugin uses
 the shared neutral core shipped elsewhere in the repository, so copying only
 `plugin.py` is not sufficient. The companion plugin and shared core support

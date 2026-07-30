@@ -74,7 +74,7 @@ monoxide to Smoke Detector or occupancy to Motion Sensor.
 ## Selection Diagnostics
 
 Directly labelled numeric entities that use Custom Sensor are exported
-successfully and should not produce warning-level logs. Directly labelled
-entities that cannot be exported at all should produce a safe, deduplicated
-warning containing only the entity ID and a fixed reason. That diagnostic work
-is tracked separately from the mapping table.
+successfully and do not produce warning-level logs. Directly labelled entities
+that cannot be exported produce a safe, deduplicated warning containing only
+the entity ID and a fixed reason. If the issue is resolved and later recurs,
+Home Assistant reports it again.

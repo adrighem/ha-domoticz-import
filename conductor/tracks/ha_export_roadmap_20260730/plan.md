@@ -18,24 +18,27 @@
   - [x] Install the released version on the test Domoticz instance
   - [ ] Confirm representative native devices and fallback sensors
   - [x] Confirm a fallback sensor reconnects without duplicates
-- [~] Task 1.5: Audit and complete safe native numeric mapping coverage
-  - [~] Compare every Home Assistant numeric sensor device class with current
+- [x] Task 1.5: Audit and complete safe native numeric mapping coverage
+  (`05a8b5f`)
+  - [x] Compare every Home Assistant numeric sensor device class with current
     Domoticz native device profiles
-  - [ ] Add every missing mapping that preserves meaning, unit, state class,
+  - [x] Add every missing mapping that preserves meaning, unit, state class,
     and value encoding
-  - [ ] Document why remaining classes deliberately use Custom Sensor fallback
-- [ ] Task 1.6: Make directly labelled but unmapped entities visible
+  - [x] Document why remaining classes deliberately use Custom Sensor fallback
+- [~] Task 1.6: Make directly labelled exclusions visible
+  - [ ] Return structured, side-effect-free exclusion reasons
   - [ ] Warn when a directly labelled entity is skipped entirely, with a safe
     reason and entity ID
-  - [ ] Report when a numeric entity uses Custom Sensor because no safe native
-    profile exists
   - [ ] Aggregate or deduplicate diagnostics so reconnects do not create noisy
     logs
   - [ ] Test that diagnostics never include entity values or secret material
+  - [x] Keep successful Custom Sensor fallbacks out of warning-level logs
+    (`05a8b5f`)
 
 ## Phase 2: Passive Binary Sensors
 
-- [ ] Task 2.1: Define safe binary device-class mappings and fallback behavior
+- [x] Task 2.1: Define safe binary device-class mappings and fallback behavior
+  (`05a8b5f`)
 - [ ] Task 2.2: Extend the catalog and plugin with passive binary profiles
 - [ ] Task 2.3: Test creation, adoption, state changes, and unavailable state
 - [ ] Task 2.4: Document and manually verify representative binary sensors
@@ -55,10 +58,13 @@
 ## Phase 4: First Export Release
 
 - [x] Task 4.1: Run complete Home Assistant and Domoticz compatibility suites
+  (`e5d3575`, `7ac1e0f`)
 - [x] Task 4.2: Review setup, security, upgrade, and limitation documentation
+  (`e5d3575`)
 - [x] Task 4.3: Merge the feature and refresh the Release Please pull request
+  (`e5d3575`)
 - [x] Task 4.4: Manually validate release artifacts and publish versions 0.3.0
-  and 0.3.1
+  and 0.3.1 (`e5d3575`, `7d599ae`)
 
 ## Phase 5: Domoticz Inventory and Drift Repair
 

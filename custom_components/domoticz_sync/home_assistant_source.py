@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
+from dataclasses import dataclass
+from enum import StrEnum
 from math import isfinite
 from typing import Any
 
@@ -74,17 +77,47 @@ class ExportLabelNotFoundError(LookupError):
     """Raised when the configured Home Assistant export label was deleted."""
 
 
+class ExportExclusionReason(StrEnum):
+    """Fixed, log-safe reason why one directly labelled entity was excluded."""
+
+    DISABLED = "entity is disabled"
+    UNSUPPORTED_DOMAIN = "entity domain is not supported"
+    DOMOTICZ_MIRROR = "Domoticz-origin entity cannot be exported back"
+    NON_NUMERIC_DEVICE_CLASS = "sensor device class is not numeric"
+    INVALID_NUMERIC_STATE = "sensor state is not a finite number"
+    MISSING_NUMERIC_METADATA = "unknown or unavailable sensor lacks numeric metadata"
+    INVALID_BINARY_STATE = "binary sensor state is invalid"
+    CAPABILITY_KIND_NOT_ENABLED = "entity type is not enabled for export"
+
+
+@dataclass(frozen=True, slots=True)
+class ExportExclusion:
+    """One actionable exclusion without source state or attribute data."""
+
+    entity_id: str
+    reason: ExportExclusionReason
+
+
+@dataclass(frozen=True, slots=True)
+class ExportCollection:
+    """Exportable capabilities and safe diagnostics for one label snapshot."""
+
+    capabilities: tuple[Capability, ...]
+    exclusions: tuple[ExportExclusion, ...]
+
+
 async def async_collect_export_capabilities(
     hass: HomeAssistant,
     *,
     label_id: str | None = None,
 ) -> list[Capability]:
     """Collect capabilities using Home Assistant's stable instance ID."""
-    return collect_export_capabilities(
+    collection = collect_export_selection(
         hass,
         instance_id=await async_get_instance_id(hass),
         label_id=label_id,
     )
+    return list(collection.capabilities)
 
 
 @callback
@@ -95,6 +128,24 @@ def collect_export_capabilities(
     label_id: str | None = None,
 ) -> list[Capability]:
     """Collect labelled numeric and binary entities without side effects."""
+    return list(
+        collect_export_selection(
+            hass,
+            instance_id=instance_id,
+            label_id=label_id,
+        ).capabilities
+    )
+
+
+@callback
+def collect_export_selection(
+    hass: HomeAssistant,
+    *,
+    instance_id: str,
+    label_id: str | None = None,
+    included_kinds: Collection[CapabilityKind] | None = None,
+) -> ExportCollection:
+    """Collect labelled entities and explain every direct exclusion."""
     if label_id is None:
         label_id = async_get_export_label_id(hass)
     if label_id is None:
@@ -111,29 +162,61 @@ def collect_export_capabilities(
         key=lambda entry: entry.id,
     )
 
+    if included_kinds is None:
+        included_kinds = frozenset(CapabilityKind)
+
     capabilities: list[Capability] = []
+    exclusions: list[ExportExclusion] = []
     for entry in entries:
-        if entry.disabled or entry.domain not in {
+        if entry.disabled:
+            exclusions.append(
+                ExportExclusion(entry.entity_id, ExportExclusionReason.DISABLED)
+            )
+            continue
+        if entry.domain not in {
             _BINARY_SENSOR_DOMAIN,
             _SENSOR_DOMAIN,
         }:
+            exclusions.append(
+                ExportExclusion(
+                    entry.entity_id,
+                    ExportExclusionReason.UNSUPPORTED_DOMAIN,
+                )
+            )
             continue
 
         state = hass.states.get(entry.entity_id)
         attributes = state.attributes if state is not None else {}
         if is_domoticz_mirror(platform=entry.platform, attributes=attributes):
+            exclusions.append(
+                ExportExclusion(
+                    entry.entity_id,
+                    ExportExclusionReason.DOMOTICZ_MIRROR,
+                )
+            )
             continue
 
-        capability = _capability_from_entry(
+        capability, reason = _capability_from_entry(
             hass,
             entry,
             state,
             instance_id=instance_id,
         )
-        if capability is not None:
-            capabilities.append(capability)
+        if reason is not None:
+            exclusions.append(ExportExclusion(entry.entity_id, reason))
+            continue
+        assert capability is not None
+        if capability.kind not in included_kinds:
+            exclusions.append(
+                ExportExclusion(
+                    entry.entity_id,
+                    ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED,
+                )
+            )
+            continue
+        capabilities.append(capability)
 
-    return capabilities
+    return ExportCollection(tuple(capabilities), tuple(exclusions))
 
 
 def _capability_from_entry(
@@ -142,7 +225,7 @@ def _capability_from_entry(
     state: State | None,
     *,
     instance_id: str,
-) -> Capability | None:
+) -> tuple[Capability | None, ExportExclusionReason | None]:
     """Convert one registry entry and current state."""
     attributes = state.attributes if state is not None else {}
     device_class = _first_string(
@@ -190,7 +273,7 @@ def _binary_capability(
     name: str,
     semantic: str | None,
     state: State | None,
-) -> Capability | None:
+) -> tuple[Capability | None, ExportExclusionReason | None]:
     """Convert a binary sensor state."""
     if state is None or state.state == STATE_UNAVAILABLE:
         availability = Availability.UNAVAILABLE
@@ -205,15 +288,18 @@ def _binary_capability(
         availability = Availability.AVAILABLE
         value = False
     else:
-        return None
+        return None, ExportExclusionReason.INVALID_BINARY_STATE
 
-    return Capability(
-        source=source,
-        kind=CapabilityKind.BINARY,
-        name=name,
-        value=value,
-        availability=availability,
-        semantic=semantic,
+    return (
+        Capability(
+            source=source,
+            kind=CapabilityKind.BINARY,
+            name=name,
+            value=value,
+            availability=availability,
+            semantic=semantic,
+        ),
+        None,
     )
 
 
@@ -224,45 +310,51 @@ def _numeric_capability(
     unit: str | None,
     state_class: str | None,
     state: State | None,
-) -> Capability | None:
+) -> tuple[Capability | None, ExportExclusionReason | None]:
     """Convert a numeric sensor state."""
     if semantic in _NON_NUMERIC_SENSOR_DEVICE_CLASSES:
-        return None
+        return None, ExportExclusionReason.NON_NUMERIC_DEVICE_CLASS
 
     if state is None or state.state in {STATE_UNKNOWN, STATE_UNAVAILABLE}:
         if not _has_numeric_metadata(semantic, unit, state_class):
-            return None
+            return None, ExportExclusionReason.MISSING_NUMERIC_METADATA
         availability = (
             Availability.UNKNOWN
             if state is not None and state.state == STATE_UNKNOWN
             else Availability.UNAVAILABLE
         )
-        return Capability(
-            source=source,
-            kind=CapabilityKind.NUMERIC,
-            name=name,
-            value=None,
-            availability=availability,
-            semantic=semantic,
-            unit=unit,
-            state_class=state_class,
+        return (
+            Capability(
+                source=source,
+                kind=CapabilityKind.NUMERIC,
+                name=name,
+                value=None,
+                availability=availability,
+                semantic=semantic,
+                unit=unit,
+                state_class=state_class,
+            ),
+            None,
         )
 
     try:
         value = float(state.state)
     except ValueError:
-        return None
+        return None, ExportExclusionReason.INVALID_NUMERIC_STATE
     if not isfinite(value):
-        return None
+        return None, ExportExclusionReason.INVALID_NUMERIC_STATE
 
-    return Capability(
-        source=source,
-        kind=CapabilityKind.NUMERIC,
-        name=name,
-        value=value,
-        semantic=semantic,
-        unit=unit,
-        state_class=state_class,
+    return (
+        Capability(
+            source=source,
+            kind=CapabilityKind.NUMERIC,
+            name=name,
+            value=value,
+            semantic=semantic,
+            unit=unit,
+            state_class=state_class,
+        ),
+        None,
     )
 
 

@@ -42,9 +42,11 @@ from custom_components.domoticz_sync.core import (  # noqa: E402
     CapabilityKind,
 )
 from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E402
+    ExportExclusionReason,
     ExportLabelNotFoundError,
     async_collect_export_capabilities,
     collect_export_capabilities,
+    collect_export_selection,
 )
 
 
@@ -180,6 +182,67 @@ def test_selection_excludes_unlabelled_disabled_and_mirrored_entities(
     capabilities = collect_export_capabilities(hass, instance_id="ha-instance")
 
     assert [capability.source.object_id for capability in capabilities] == [selected.id]
+
+
+def test_selection_explains_every_directly_labelled_exclusion(
+    hass: HomeAssistant,
+) -> None:
+    """Diagnostics contain only actionable entity IDs and fixed reasons."""
+    selected = _register_entity(hass, "sensor", "selected")
+    disabled = _register_entity(hass, "sensor", "disabled", disabled=True)
+    unsupported = _register_entity(hass, "input_text", "unsupported")
+    mirror = _register_entity(
+        hass,
+        "sensor",
+        "mirror",
+        platform="domoticz_sync",
+    )
+    enum = _register_entity(
+        hass,
+        "sensor",
+        "enum",
+        device_class=SensorDeviceClass.ENUM,
+    )
+    invalid_numeric = _register_entity(hass, "sensor", "invalid_numeric")
+    unknown_generic = _register_entity(hass, "sensor", "unknown_generic")
+    invalid_binary = _register_entity(hass, "binary_sensor", "invalid_binary")
+    valid_binary = _register_entity(hass, "binary_sensor", "valid_binary")
+
+    hass.states.async_set(selected.entity_id, "1")
+    hass.states.async_set(disabled.entity_id, "private-disabled-value")
+    hass.states.async_set(unsupported.entity_id, "private-unsupported-value")
+    hass.states.async_set(mirror.entity_id, "1")
+    hass.states.async_set(enum.entity_id, "private-enum-value")
+    hass.states.async_set(invalid_numeric.entity_id, "private-invalid-value")
+    hass.states.async_set(unknown_generic.entity_id, STATE_UNKNOWN)
+    hass.states.async_set(invalid_binary.entity_id, "private-binary-value")
+    hass.states.async_set(valid_binary.entity_id, STATE_ON)
+
+    collection = collect_export_selection(
+        hass,
+        instance_id="ha-instance",
+        included_kinds=frozenset({CapabilityKind.NUMERIC}),
+    )
+
+    assert [item.source.object_id for item in collection.capabilities] == [selected.id]
+    assert {
+        exclusion.entity_id: exclusion.reason for exclusion in collection.exclusions
+    } == {
+        disabled.entity_id: ExportExclusionReason.DISABLED,
+        unsupported.entity_id: ExportExclusionReason.UNSUPPORTED_DOMAIN,
+        mirror.entity_id: ExportExclusionReason.DOMOTICZ_MIRROR,
+        enum.entity_id: ExportExclusionReason.NON_NUMERIC_DEVICE_CLASS,
+        invalid_numeric.entity_id: ExportExclusionReason.INVALID_NUMERIC_STATE,
+        unknown_generic.entity_id: ExportExclusionReason.MISSING_NUMERIC_METADATA,
+        invalid_binary.entity_id: ExportExclusionReason.INVALID_BINARY_STATE,
+        valid_binary.entity_id: ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED,
+    }
+    diagnostic_text = repr(collection.exclusions)
+    assert "private-disabled-value" not in diagnostic_text
+    assert "private-unsupported-value" not in diagnostic_text
+    assert "private-enum-value" not in diagnostic_text
+    assert "private-invalid-value" not in diagnostic_text
+    assert "private-binary-value" not in diagnostic_text
 
 
 def test_distinguishes_missing_label_from_valid_empty_selection(

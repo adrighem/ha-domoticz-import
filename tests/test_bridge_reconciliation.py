@@ -51,6 +51,11 @@ from custom_components.domoticz_sync.core.reconciliation import (  # noqa: E402
     ReconciliationAction,
     ReconciliationActionKind,
 )
+from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E402
+    ExportCollection,
+    ExportExclusion,
+    ExportExclusionReason,
+)
 
 _SELECTION = ProtocolSelection(
     version=PROTOCOL_VERSION_V2,
@@ -182,20 +187,25 @@ def _configure_application(
     monkeypatch: pytest.MonkeyPatch,
     capabilities: list[Capability],
     storage: _MemoryStorage,
+    exclusions: list[ExportExclusion] | None = None,
 ) -> None:
     """Inject deterministic source collection and catalog storage."""
+    if exclusions is None:
+        exclusions = []
+
     monkeypatch.setattr(
         app_module,
         "async_get_instance_id",
         AsyncMock(return_value="instance-1"),
     )
 
-    def collect(_hass, *, instance_id: str, label_id: str):
+    def collect(_hass, *, instance_id: str, label_id: str, included_kinds):
         assert instance_id == "instance-1"
         assert label_id == "export-label"
-        return capabilities
+        assert included_kinds == frozenset({CapabilityKind.NUMERIC})
+        return ExportCollection(tuple(capabilities), tuple(exclusions))
 
-    monkeypatch.setattr(app_module, "collect_export_capabilities", collect)
+    monkeypatch.setattr(app_module, "collect_export_selection", collect)
 
     def make_storage(_hass, *, entry_id: str, destination_id: str):
         assert entry_id == "entry-1"
@@ -223,12 +233,16 @@ async def test_application_is_inert_without_negotiated_numeric_feature() -> None
 @pytest.mark.asyncio
 async def test_application_filters_binary_and_commits_numeric(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Only numeric capabilities are applied and committed."""
+    """Only numeric capabilities are applied and binary exclusion is visible."""
     numeric = _capability("numeric-source")
-    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
     storage = _MemoryStorage()
-    _configure_application(monkeypatch, [binary, numeric], storage)
+    exclusion = ExportExclusion(
+        "binary_sensor.binary_source",
+        ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED,
+    )
+    _configure_application(monkeypatch, [numeric], storage, [exclusion])
     session = _Session(_confirmed_response)
 
     await HomeAssistantExportApplication(_Hass()).async_connected(session)
@@ -243,6 +257,48 @@ async def test_application_filters_binary_and_commits_numeric(
     assert len(catalog.records) == 1
     assert catalog.records[0].capability == numeric
     assert len(storage.saved_documents) == 1
+    assert "binary_sensor.binary_source" in caplog.text
+    assert ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED.value in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_exclusion_warnings_are_safe_deduplicated_and_can_recur(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unchanged reconnects stay quiet, while a resolved issue may recur."""
+    exclusions = [
+        ExportExclusion(
+            "sensor.actionable_entity",
+            ExportExclusionReason.INVALID_NUMERIC_STATE,
+        )
+    ]
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [], storage, exclusions)
+    application = HomeAssistantExportApplication(_Hass())
+    session = _Session(_confirmed_response)
+
+    await application.async_connected(session)
+    await application.async_connected(session)
+
+    warning = (
+        "Domoticz export skipped directly labelled entity "
+        "sensor.actionable_entity: sensor state is not a finite number"
+    )
+    assert caplog.text.count(warning) == 1
+    assert "private-state-value" not in caplog.text
+
+    exclusions.clear()
+    await application.async_connected(session)
+    exclusions.append(
+        ExportExclusion(
+            "sensor.actionable_entity",
+            ExportExclusionReason.INVALID_NUMERIC_STATE,
+        )
+    )
+    await application.async_connected(session)
+
+    assert caplog.text.count(warning) == 2
 
 
 @pytest.mark.asyncio

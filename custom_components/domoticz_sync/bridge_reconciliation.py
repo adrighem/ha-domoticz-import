@@ -36,8 +36,9 @@ from .core.reconciliation import (
     SourceScope,
 )
 from .home_assistant_source import (
+    ExportExclusion,
     ExportLabelNotFoundError,
-    collect_export_capabilities,
+    collect_export_selection,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +100,9 @@ class HomeAssistantExportApplication:
     def __init__(self, hass: HomeAssistant) -> None:
         """Store the Home Assistant instance used for source collection."""
         self._hass = hass
+        self._reported_exclusions: dict[
+            tuple[str, str], frozenset[ExportExclusion]
+        ] = {}
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
         """Run one fail-closed numeric reconciliation for a ready session."""
@@ -115,15 +119,13 @@ class HomeAssistantExportApplication:
 
         try:
             instance_id = await async_get_instance_id(self._hass)
-            current = tuple(
-                capability
-                for capability in collect_export_capabilities(
-                    self._hass,
-                    instance_id=instance_id,
-                    label_id=label_id,
-                )
-                if capability.kind is CapabilityKind.NUMERIC
+            collection = collect_export_selection(
+                self._hass,
+                instance_id=instance_id,
+                label_id=label_id,
+                included_kinds=frozenset({CapabilityKind.NUMERIC}),
             )
+            self._report_exclusions(session, collection.exclusions)
             executor = ReconciliationExecutor(
                 DomoticzSessionTargetAdapter(session),
                 HomeAssistantCatalogStorage(
@@ -134,7 +136,7 @@ class HomeAssistantExportApplication:
             )
             report = await executor.async_reconcile(
                 SourceScope(_SOURCE_SYSTEM, instance_id),
-                current,
+                collection.capabilities,
             )
         except (
             CatalogFormatError,
@@ -165,6 +167,26 @@ class HomeAssistantExportApplication:
             committed,
             rejected,
         )
+
+    def _report_exclusions(
+        self,
+        session: BridgeApplicationSession,
+        exclusions: tuple[ExportExclusion, ...],
+    ) -> None:
+        """Warn once for each current safe exclusion diagnostic."""
+        key = (session.entry_id, session.destination_id)
+        current = frozenset(exclusions)
+        previous = self._reported_exclusions.get(key, frozenset())
+        for exclusion in sorted(
+            current - previous,
+            key=lambda item: (item.entity_id, item.reason.value),
+        ):
+            _LOGGER.warning(
+                "Domoticz export skipped directly labelled entity %s: %s",
+                exclusion.entity_id,
+                exclusion.reason.value,
+            )
+        self._reported_exclusions[key] = current
 
 
 def _parse_ping(payload: dict[str, object]) -> str:

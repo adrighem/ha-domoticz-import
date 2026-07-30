@@ -2,13 +2,10 @@
 
 ## Background
 
-The companion Domoticz plugin can authenticate to Home Assistant and receive a
-connect-time catalog of directly labeled numeric sensors. It currently creates
-every exported value as a Domoticz Custom Sensor.
-
-This export feature has not been used in a released installation. Native device
-selection can therefore be implemented directly without migration or legacy
-compatibility behavior.
+The companion Domoticz plugin authenticates to Home Assistant and receives a
+connect-time catalog of directly labelled numeric sensors. Version 0.3.1 uses
+conservative native Domoticz profiles with a Custom Sensor fallback. The first
+live fallback device was verified to reconnect without duplication.
 
 ## Requirements
 
@@ -18,6 +15,10 @@ compatibility behavior.
   label.
 - Do not inherit a device label for export.
 - Keep unsupported entities out of the exported catalog.
+- Log a safe, deduplicated warning when a directly labelled entity cannot be
+  exported.
+- Do not warn for a numeric entity that is successfully exported as a Custom
+  Sensor.
 
 ### Identity and Lifecycle
 
@@ -50,13 +51,14 @@ compatibility behavior.
 ## Accepted Implementation Order
 
 1. Native numeric sensors.
-2. Passive binary sensors.
-3. Validate and release version 0.3.0.
-4. Real Domoticz inventory and drift repair.
-5. Continuous synchronization.
-6. Multi-capability read-only entities.
-7. Signed reverse command protocol.
-8. Interactive entities.
+2. Export selection diagnostics.
+3. Passive binary sensors.
+4. Validate and release the first export version.
+5. Real Domoticz inventory and drift repair.
+6. Continuous synchronization.
+7. Multi-capability read-only entities.
+8. Signed reverse command protocol.
+9. Interactive entities.
 
 ## Constraints
 
@@ -73,6 +75,8 @@ compatibility behavior.
 - Numeric sensor device class, unit, and state class produce conservative,
   documented Domoticz target profiles.
 - Unknown combinations remain functional through a Custom Sensor fallback.
+- Directly labelled exclusions produce actionable, log-safe warnings without
+  reconnect noise.
 - Both current Python and Python 3.9 compatibility suites pass.
 - The user can validate the plugin against a real Domoticz and Home Assistant
   installation before phase completion.
