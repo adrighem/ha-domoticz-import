@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.4.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.3.1...v0.4.0) (2026-07-30)
+
+
+### Features
+
+* complete numeric export mapping coverage ([05a8b5f](https://github.com/adrighem/ha-domoticz-sync/commit/05a8b5f08b901356eadfc96c259d0a4d5dff39c5))
+* warn for excluded export labels ([b5b9cdc](https://github.com/adrighem/ha-domoticz-sync/commit/b5b9cdc2b195e1fbc5dd96a5b770729e03df6ffe))
+
+
+### Documentation
+
+* update export roadmap progress ([00af771](https://github.com/adrighem/ha-domoticz-sync/commit/00af7715b350a8defde6b228be1f5c3bd6e0c44e))
+
 ## [0.3.1](https://github.com/adrighem/ha-domoticz-sync/compare/v0.3.0...v0.3.1) (2026-07-30)
 
 
