@@ -29,3 +29,18 @@ def test_readme_serves_both_sync_directions() -> None:
     assert "## Update Both Installations" in readme
     assert "| Domoticz -> Home Assistant |" in readme
     assert "| Home Assistant -> Domoticz |" in readme
+
+
+def test_readme_recommends_pypluginstore_with_manual_fallback() -> None:
+    """Domoticz users see the managed path before manual file installation."""
+    readme = README.read_text(encoding="utf-8")
+    recommended_install = "#### Install with PyPluginStore (recommended)"
+    manual_install = "#### Install manually"
+    recommended_update = "#### Update with PyPluginStore (recommended)"
+    manual_update = "#### Update a manual installation"
+
+    assert "https://github.com/adrighem/PyPluginStore" in readme
+    assert "https://wiki.domoticz.com/Using_Python_plugins" in readme
+    assert "`ha-domoticz-sync`" in readme
+    assert readme.index(recommended_install) < readme.index(manual_install)
+    assert readme.index(recommended_update) < readme.index(manual_update)

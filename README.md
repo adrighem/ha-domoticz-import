@@ -30,9 +30,9 @@ There is no export-only setup flow yet.
 - A trusted local network or VPN. See [Security](#security) before choosing
   WS or WSS.
 
-Use matching release tags for the Home Assistant and Domoticz installations.
-The two halves negotiate shared features safely, but matching versions are the
-tested combination.
+Keep the Home Assistant integration and Domoticz plugin on matching released
+versions when possible. The two halves negotiate shared features safely during
+a rolling update, but matching versions are the tested combination.
 
 ## Install the Home Assistant Integration
 
@@ -134,6 +134,52 @@ Assistant.
 
 ### Install the Domoticz plugin
 
+#### Install with PyPluginStore (recommended)
+
+[PyPluginStore](https://github.com/adrighem/PyPluginStore) manages Domoticz
+Python plugin installation and updates from the Domoticz interface.
+
+If PyPluginStore is not installed yet:
+
+1. In Domoticz, open **Setup** -> **About** and confirm that Python support is
+   listed.
+2. Follow the
+   [PyPluginStore installation guide](https://github.com/adrighem/PyPluginStore#installation).
+   A typical Linux installation is:
+
+   ```bash
+   cd /path/to/domoticz/plugins
+   git clone https://github.com/adrighem/PyPluginStore.git 00-PyPluginStore
+   sudo systemctl restart domoticz.service
+   ```
+
+3. Go to **Setup** -> **Hardware** and add hardware of type
+   **PyPluginStore**.
+4. Go to **Setup** -> **Users**, edit your Domoticz user, and enable the
+   **Custom** menu.
+5. Open **Custom** -> **pypluginstore**.
+
+Install Domoticz Sync from the store:
+
+1. Open **Custom** -> **pypluginstore**.
+2. Search for `ha-domoticz-sync`.
+3. Select **Install**.
+4. Select **Restart Domoticz**, or restart the Domoticz service manually if
+   the store does not have permission to restart it.
+5. Go to **Setup** -> **Hardware** and confirm that
+   **Home Assistant Domoticz Sync** is available.
+
+PyPluginStore chooses the managed Release or Git delivery path available in
+its registry. A new release can take some time to enter its reviewed release
+index. Rolling updates remain safe, and matching released versions remain the
+tested setup.
+
+#### Install manually
+
+Use this fallback if PyPluginStore is unavailable or you prefer to manage the
+plugin files directly. It follows the
+[standard Domoticz Python plugin installation](https://wiki.domoticz.com/Using_Python_plugins).
+
 Install the whole repository as one directory directly below the Domoticz
 plugins directory. The root `plugin.py` loads the shared protocol code from
 `custom_components/domoticz_sync/core`, so copying only `plugin.py` is not
@@ -145,6 +191,7 @@ Install a matching tagged release:
 ```bash
 cd /path/to/domoticz/plugins
 git clone --branch v0.4.0 https://github.com/adrighem/ha-domoticz-sync.git
+chmod +x ha-domoticz-sync/plugin.py
 ```
 <!-- x-release-please-end -->
 
@@ -287,6 +334,18 @@ Updating one does not update the other.
 
 ### Update Domoticz
 
+#### Update with PyPluginStore (recommended)
+
+1. Open **Custom** -> **pypluginstore**.
+2. Search for `ha-domoticz-sync`, or filter the list to installed plugins.
+3. Select **Refresh status** if needed, then select **Update** when an update
+   is offered.
+4. Select **Restart Domoticz**, or restart the service manually.
+5. Reopen PyPluginStore and confirm that the plugin no longer reports a
+   pending update or restart.
+
+#### Update a manual installation
+
 For a Git checkout, select the matching tag and restart Domoticz:
 
 <!-- x-release-please-start-version -->
@@ -321,7 +380,8 @@ mixed-version and feature-negotiation rules.
 | Domoticz -> Home Assistant | The integration cannot be added | Confirm that Home Assistant can reach the Domoticz URL, the credentials are correct, the URL uses HTTP or HTTPS, and the import SSL setting matches the certificate. Do not put credentials in the URL. |
 | Domoticz -> Home Assistant | Expected entities are missing | Check that the Domoticz devices are active and used, visible to the configured user, and allowed by the hidden and favorite options. |
 | Domoticz -> Home Assistant | A newly created Domoticz device is missing | Reload the integration so Home Assistant can create entities for the new device or metric. |
-| Home Assistant -> Domoticz | The plugin is not listed under Hardware | Confirm the complete repository is one direct child of the Domoticz plugins directory, `plugin.py` is at its root, files are readable by Domoticz, Python plugins are available, and Domoticz was restarted. |
+| Home Assistant -> Domoticz | PyPluginStore is missing from the Custom menu | Confirm that PyPluginStore was added under Hardware, the current user has the Custom menu enabled, its web folders are writable, and Domoticz was restarted. Then hard-refresh the browser. |
+| Home Assistant -> Domoticz | The plugin is not listed under Hardware | For PyPluginStore, confirm that `ha-domoticz-sync` is installed, then restart Domoticz. For a manual installation, confirm that the complete repository is one direct child of the plugins directory and that its root `plugin.py` is executable. In both cases, confirm Python plugin support under Setup -> About. |
 | Home Assistant -> Domoticz | The plugin reports invalid configuration | Enter a host without a scheme or path, a numeric port from 1 to 65535, WS or WSS, and the exact Link ID and Pairing key shown in Home Assistant. |
 | Home Assistant -> Domoticz | The plugin cannot connect | Confirm Domoticz can resolve and reach the Home Assistant host and port, the Home Assistant integration entry is loaded, and WS/WSS matches the endpoint. A reverse proxy must forward WebSocket traffic and the `Sec-WebSocket-Protocol` header. |
 | Home Assistant -> Domoticz | The connection is ready but export is disabled | Check the reported protocol and features. Install the same release tag on both systems. A v1 compatibility connection is intentionally heartbeat-only. |
