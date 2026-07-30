@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from http import HTTPStatus
 
 import pytest
 
 pytest.importorskip("homeassistant")
 pytest.importorskip("pytest_homeassistant_custom_component")
 
-from aiohttp import WSCloseCode, WSMsgType  # noqa: E402
+from aiohttp import WSCloseCode, WSMsgType, WSServerHandshakeError  # noqa: E402
 from aiohttp.test_utils import TestClient  # noqa: E402
 from homeassistant.core import HomeAssistant  # noqa: E402
 from homeassistant.setup import async_setup_component  # noqa: E402
@@ -30,21 +31,36 @@ from custom_components.domoticz_sync.bridge import (  # noqa: E402
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_NUMERIC_V1,
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_V2,
+    SUPPORTED_V2_FEATURES,
+    SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+    WEBSOCKET_SUBPROTOCOL_V2,
     ProtocolError,
+    ProtocolSelection,
     accept_challenge,
+    accept_v2_challenge,
+    build_application_ready,
     build_authenticate,
     build_hello,
+    build_v2_authenticate,
+    build_v2_hello,
     canonical_json_dumps,
     canonical_json_loads,
     derive_session_key,
+    derive_v2_session_key,
     generate_destination_id,
     generate_link_id,
     generate_nonce,
     generate_pairing_key,
+    parse_application_ready,
     parse_hello,
+    parse_v2_hello,
     sign_envelope,
     verify_envelope,
     verify_ready,
+    verify_v2_ready,
 )
 
 
@@ -55,6 +71,8 @@ class AuthenticatedClient:
     websocket: object
     session_key: bytes
     session_id: str
+    protocol_version: int = PROTOCOL_VERSION
+    selection: ProtocolSelection | None = None
     client_sequence: int = 1
     server_sequence: int = 1
 
@@ -65,6 +83,7 @@ class AuthenticatedClient:
             canonical_json_dumps(
                 sign_envelope(
                     self.session_key,
+                    protocol_version=self.protocol_version,
                     direction=DIRECTION_DOMOTICZ_TO_HA,
                     session_id=self.session_id,
                     sequence=self.client_sequence,
@@ -79,6 +98,7 @@ class AuthenticatedClient:
         verified = verify_envelope(
             self.session_key,
             document,
+            protocol_version=self.protocol_version,
             expected_direction=DIRECTION_HA_TO_DOMOTICZ,
             expected_session_id=self.session_id,
             last_sequence=self.server_sequence,
@@ -96,11 +116,13 @@ class ExchangingApplication:
         self.completed = asyncio.Event()
         self.entry_id: str | None = None
         self.destination_id: str | None = None
+        self.selection: ProtocolSelection | None = None
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
         """Record identifiers and exchange one application payload."""
         self.entry_id = session.entry_id
         self.destination_id = session.destination_id
+        self.selection = session.selection
         self.called.set()
         payload = await session.async_receive()
         assert payload == {"type": "application-request", "value": 42}
@@ -160,6 +182,41 @@ async def _async_start_handshake(
     return websocket, context, session_key
 
 
+async def _async_start_v2_handshake(
+    client: TestClient,
+    *,
+    link_id: str,
+    pairing_key: str,
+    destination_id: str | None = None,
+    client_features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+):
+    """Start and authenticate one negotiated v2 WebSocket."""
+    client_protocols = SUPPORTED_WEBSOCKET_SUBPROTOCOLS
+    websocket = await client.ws_connect(
+        BRIDGE_WEBSOCKET_PATH,
+        protocols=client_protocols,
+    )
+    assert websocket.protocol == WEBSOCKET_SUBPROTOCOL_V2
+    hello_document = build_v2_hello(
+        link_id,
+        destination_id or generate_destination_id(),
+        generate_nonce(),
+        client_protocols=client_protocols,
+        selected_protocol=websocket.protocol,
+        client_features=client_features,
+    )
+    hello = parse_v2_hello(hello_document)
+    await websocket.send_str(canonical_json_dumps(hello_document))
+
+    challenge = canonical_json_loads(await websocket.receive_str())
+    context = accept_v2_challenge(pairing_key, hello, challenge)
+    await websocket.send_str(
+        canonical_json_dumps(build_v2_authenticate(pairing_key, context))
+    )
+    session_key = derive_v2_session_key(pairing_key, context)
+    return websocket, context, session_key
+
+
 async def _async_connect(
     client: TestClient,
     *,
@@ -181,6 +238,7 @@ async def _async_connect(
         canonical_json_dumps(
             sign_envelope(
                 session_key,
+                protocol_version=PROTOCOL_VERSION,
                 direction=DIRECTION_DOMOTICZ_TO_HA,
                 session_id=session_id,
                 sequence=1,
@@ -192,12 +250,64 @@ async def _async_connect(
     verified = verify_envelope(
         session_key,
         server_ready,
+        protocol_version=PROTOCOL_VERSION,
         expected_direction=DIRECTION_HA_TO_DOMOTICZ,
         expected_session_id=session_id,
         last_sequence=0,
     )
     assert verified.payload == {"type": "ready"}
     return AuthenticatedClient(websocket, session_key, session_id)
+
+
+async def _async_connect_v2(
+    client: TestClient,
+    *,
+    link_id: str,
+    pairing_key: str,
+    destination_id: str | None = None,
+    client_features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+) -> AuthenticatedClient:
+    """Complete v2 authentication and signed application readiness."""
+    websocket, context, session_key = await _async_start_v2_handshake(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        destination_id=destination_id,
+        client_features=client_features,
+    )
+    ready = canonical_json_loads(await websocket.receive_str())
+    session_id = verify_v2_ready(session_key, context, ready)
+    selection = context.selection
+
+    await websocket.send_str(
+        canonical_json_dumps(
+            sign_envelope(
+                session_key,
+                protocol_version=PROTOCOL_VERSION_V2,
+                direction=DIRECTION_DOMOTICZ_TO_HA,
+                session_id=session_id,
+                sequence=1,
+                payload=build_application_ready(selection),
+            )
+        )
+    )
+    server_ready = canonical_json_loads(await websocket.receive_str())
+    verified = verify_envelope(
+        session_key,
+        server_ready,
+        protocol_version=PROTOCOL_VERSION_V2,
+        expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+        expected_session_id=session_id,
+        last_sequence=0,
+    )
+    parse_application_ready(selection, verified.payload)
+    return AuthenticatedClient(
+        websocket,
+        session_key,
+        session_id,
+        protocol_version=PROTOCOL_VERSION_V2,
+        selection=selection,
+    )
 
 
 @pytest.mark.asyncio
@@ -218,7 +328,7 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
     )
     client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
 
-    connection = await _async_connect(
+    connection = await _async_connect_v2(
         client,
         link_id=link_id,
         pairing_key=pairing_key,
@@ -230,6 +340,9 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
     assert await manager.async_is_ready(link_id)
     assert application.entry_id == "entry-application"
     assert application.destination_id == destination_id
+    assert application.selection == connection.selection
+    assert application.selection is not None
+    assert application.selection.supports(FEATURE_HA_EXPORT_NUMERIC_V1)
 
     await connection.async_send({"type": "application-request", "value": 42})
     assert await connection.async_receive() == {
@@ -243,6 +356,132 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
     await connection.async_send({"id": ping_id, "type": "ping"})
     assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
     await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_remains_heartbeat_only_without_application_side_effects(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A released no-subprotocol client never enters the export application."""
+    application = FailingApplication(AssertionError("must not be called"))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-legacy",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    connection = await _async_connect(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    await asyncio.sleep(0)
+
+    assert connection.websocket.protocol is None
+    assert not application.called.is_set()
+    ping_id = generate_nonce()
+    await connection.async_send({"id": ping_id, "type": "ping"})
+    assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_without_numeric_feature_remains_heartbeat_only(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A v2 peer receives only behavior present in the feature intersection."""
+    application = FailingApplication(AssertionError("must not be called"))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-no-feature",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(),
+    )
+    await asyncio.sleep(0)
+
+    assert connection.selection is not None
+    assert connection.selection.features == ()
+    assert not application.called.is_set()
+    ping_id = generate_nonce()
+    await connection.async_send({"id": ping_id, "type": "ping"})
+    assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_offer_without_common_protocol_is_rejected_before_upgrade(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """An explicit incompatible offer cannot silently downgrade to v1."""
+    manager = DomoticzBridgeManager()
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    with pytest.raises(WSServerHandshakeError) as raised:
+        await client.ws_connect(
+            BRIDGE_WEBSOCKET_PATH,
+            protocols=("ha-domoticz-sync.future",),
+        )
+
+    assert raised.value.status == HTTPStatus.BAD_REQUEST
+    assert await manager.async_active_session_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_hello_must_repeat_the_exact_http_protocol_offer(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Authenticated negotiation cannot differ from the HTTP transport offer."""
+    manager = DomoticzBridgeManager()
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-mismatch",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    websocket = await client.ws_connect(
+        BRIDGE_WEBSOCKET_PATH,
+        protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+    )
+    assert websocket.protocol == WEBSOCKET_SUBPROTOCOL_V2
+    tampered_hello = build_v2_hello(
+        link_id,
+        generate_destination_id(),
+        generate_nonce(),
+        client_protocols=(
+            "ha-domoticz-sync.future",
+            WEBSOCKET_SUBPROTOCOL_V2,
+        ),
+        selected_protocol=WEBSOCKET_SUBPROTOCOL_V2,
+        client_features=SUPPORTED_V2_FEATURES,
+    )
+    await websocket.send_str(canonical_json_dumps(tampered_hello))
+
+    close = await websocket.receive()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert websocket.close_code == WSCloseCode.POLICY_VIOLATION
+    assert await manager.async_active_session_count() == 0
+    await websocket.close()
 
 
 @pytest.mark.parametrize(
@@ -284,7 +523,7 @@ async def test_application_failure_closes_and_releases_session(
     )
     client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
 
-    connection = await _async_connect(
+    connection = await _async_connect_v2(
         client,
         link_id=link_id,
         pairing_key=pairing_key,
@@ -480,6 +719,7 @@ async def test_non_empty_inventory_is_rejected_for_connection_spike(
         canonical_json_dumps(
             sign_envelope(
                 session_key,
+                protocol_version=PROTOCOL_VERSION,
                 direction=DIRECTION_DOMOTICZ_TO_HA,
                 session_id=session_id,
                 sequence=1,

@@ -182,7 +182,13 @@ def loaded_plugin(monkeypatch):
     return module, fake_domoticz
 
 
-def _upgrade_response(connection, *, extensions=None, valid_accept=True):
+def _upgrade_response(
+    connection,
+    *,
+    extensions=None,
+    valid_accept=True,
+    subprotocol=MISSING,
+):
     request = connection.sent[0]
     key = request["Headers"]["Sec-WebSocket-Key"]
     accept = base64.b64encode(
@@ -197,26 +203,56 @@ def _upgrade_response(connection, *, extensions=None, valid_accept=True):
     }
     if extensions is not None:
         headers["Sec-WebSocket-Extensions"] = extensions
+    if subprotocol is MISSING:
+        subprotocol = request["Headers"]["Sec-WebSocket-Protocol"].split(",")[0].strip()
+    if subprotocol is not None:
+        headers["Sec-WebSocket-Protocol"] = subprotocol
     return {"Status": "101", "Headers": headers}
 
 
-def _start_and_upgrade(module):
+def _start_and_upgrade(module, *, subprotocol=MISSING):
     plugin = module.DomoticzSyncPlugin()
     plugin.onStart()
     connection = plugin.connection
     connection.connecting = False
     connection.connected = True
     plugin.onConnect(connection, 0, "ignored")
-    plugin.onMessage(connection, _upgrade_response(connection))
+    plugin.onMessage(
+        connection,
+        _upgrade_response(connection, subprotocol=subprotocol),
+    )
     return plugin, connection
 
 
-def _complete_handshake(module, plugin, connection):
+def _complete_handshake(
+    module,
+    plugin,
+    connection,
+    *,
+    server_features=None,
+):
     protocol = module.wire_protocol
     hello_document = protocol.canonical_json_loads(connection.sent[-1]["Payload"])
-    hello = protocol.parse_hello(hello_document)
-    context = protocol.make_handshake_context(hello, protocol.generate_nonce())
-    challenge = protocol.build_challenge(module.Parameters["Mode3"], context)
+    if plugin._protocol_version == protocol.PROTOCOL_VERSION_V2:
+        hello = protocol.parse_v2_hello(hello_document)
+        context = protocol.make_v2_handshake_context(
+            hello,
+            protocol.generate_nonce(),
+            server_protocols=protocol.SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+            server_features=(
+                protocol.SUPPORTED_V2_FEATURES
+                if server_features is None
+                else server_features
+            ),
+        )
+        challenge = protocol.build_v2_challenge(
+            module.Parameters["Mode3"],
+            context,
+        )
+    else:
+        hello = protocol.parse_hello(hello_document)
+        context = protocol.make_handshake_context(hello, protocol.generate_nonce())
+        challenge = protocol.build_challenge(module.Parameters["Mode3"], context)
     challenge_text = protocol.canonical_json_dumps(challenge)
 
     midpoint = len(challenge_text) // 2
@@ -232,32 +268,56 @@ def _complete_handshake(module, plugin, connection):
     assert len(connection.sent) == sent_before_final_fragment + 1
 
     authenticate = protocol.canonical_json_loads(connection.sent[-1]["Payload"])
-    protocol.verify_authenticate(module.Parameters["Mode3"], context, authenticate)
-    session_key = protocol.derive_session_key(module.Parameters["Mode3"], context)
+    if plugin._protocol_version == protocol.PROTOCOL_VERSION_V2:
+        protocol.verify_v2_authenticate(
+            module.Parameters["Mode3"],
+            context,
+            authenticate,
+        )
+        session_key = protocol.derive_v2_session_key(
+            module.Parameters["Mode3"],
+            context,
+        )
+        ready = protocol.build_v2_ready(session_key, context)
+        session_id = protocol.derive_v2_session_id(session_key, context)
+    else:
+        protocol.verify_authenticate(
+            module.Parameters["Mode3"],
+            context,
+            authenticate,
+        )
+        session_key = protocol.derive_session_key(
+            module.Parameters["Mode3"],
+            context,
+        )
+        ready = protocol.build_ready(session_key, context)
+        session_id = protocol.derive_session_id(session_key, context)
     plugin.onMessage(
         connection,
-        {
-            "Payload": protocol.canonical_json_dumps(
-                protocol.build_ready(session_key, context)
-            )
-        },
+        {"Payload": protocol.canonical_json_dumps(ready)},
     )
-    session_id = protocol.derive_session_id(session_key, context)
-    inventory = protocol.verify_envelope(
+    initial_message = protocol.verify_envelope(
         session_key,
         protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
         expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=0,
     )
-    assert inventory.payload == {"type": "inventory", "targets": []}
+    if plugin._protocol_version == protocol.PROTOCOL_VERSION_V2:
+        protocol.parse_application_ready(context.selection, initial_message.payload)
+        ready_payload = protocol.build_application_ready(context.selection)
+    else:
+        assert initial_message.payload == {"type": "inventory", "targets": []}
+        ready_payload = {"type": "ready"}
 
     application_ready = protocol.sign_envelope(
         session_key,
+        protocol_version=plugin._protocol_version,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=1,
-        payload={"type": "ready"},
+        payload=ready_payload,
     )
     plugin.onMessage(
         connection,
@@ -423,10 +483,15 @@ def _send_apply(
     """Send one signed apply payload and parse its signed response."""
     protocol = module.wire_protocol
     if payload is None:
-        payload = protocol.build_apply(request_id, action)
+        payload = protocol.build_apply(
+            plugin._protocol_selection,
+            request_id,
+            action,
+        )
     previous_out_sequence = plugin._out_sequence
     envelope = protocol.sign_envelope(
         session_key,
+        protocol_version=plugin._protocol_version,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=plugin._in_sequence + 1,
@@ -439,11 +504,15 @@ def _send_apply(
     response = protocol.verify_envelope(
         session_key,
         protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
         expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=previous_out_sequence,
     )
-    return protocol.parse_apply_result(response.payload)
+    return protocol.parse_apply_result(
+        plugin._protocol_selection,
+        response.payload,
+    )
 
 
 def test_plugin_metadata_supports_direct_repository_clone():
@@ -535,6 +604,9 @@ def test_upgrade_suppresses_compression_and_validates_response(loaded_plugin):
     request = connection.sent[0]
     assert request["URL"] == "/api/domoticz_sync/websocket"
     assert request["Headers"]["Sec-WebSocket-Extensions"] is None
+    assert request["Headers"]["Sec-WebSocket-Protocol"] == (
+        module.wire_protocol.WEBSOCKET_SUBPROTOCOL_V2
+    )
     assert "Authorization" not in request["Headers"]
 
     plugin.onMessage(
@@ -567,7 +639,71 @@ def test_upgrade_rejects_invalid_websocket_accept(loaded_plugin):
     )
 
 
-def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
+@pytest.mark.parametrize(
+    "selected_protocol",
+    [
+        "",
+        "ha-domoticz-sync.v2 ",
+        "HA-DOMOTICZ-SYNC.V2",
+        "ha-domoticz-sync.v2, other",
+        "unknown.example",
+        2,
+    ],
+)
+def test_upgrade_rejects_non_exact_or_unknown_protocol_selection(
+    loaded_plugin,
+    selected_protocol,
+):
+    module, _domoticz = loaded_plugin
+    plugin = module.DomoticzSyncPlugin()
+    plugin.onStart()
+    connection = plugin.connection
+    plugin.onConnect(connection, 0, "ignored")
+
+    plugin.onMessage(
+        connection,
+        _upgrade_response(connection, subprotocol=selected_protocol),
+    )
+
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert not any("Payload" in message for message in connection.sent)
+
+
+def test_upgrade_rejects_duplicate_protocol_selection_headers(loaded_plugin):
+    module, _domoticz = loaded_plugin
+    plugin = module.DomoticzSyncPlugin()
+    plugin.onStart()
+    connection = plugin.connection
+    plugin.onConnect(connection, 0, "ignored")
+    response = _upgrade_response(connection)
+    response["Headers"]["sec-websocket-protocol"] = (
+        module.wire_protocol.WEBSOCKET_SUBPROTOCOL_V2
+    )
+
+    plugin.onMessage(connection, response)
+
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert not any("Payload" in message for message in connection.sent)
+
+
+def test_v2_hello_repeats_http_selection_offer_and_features(loaded_plugin):
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+
+    hello = protocol.parse_v2_hello(
+        protocol.canonical_json_loads(connection.sent[-1]["Payload"])
+    )
+
+    assert hello.client_protocols == protocol.SUPPORTED_WEBSOCKET_SUBPROTOCOLS
+    assert hello.selected_protocol == protocol.WEBSOCKET_SUBPROTOCOL_V2
+    assert hello.client_features == protocol.SUPPORTED_V2_FEATURES
+    assert plugin._protocol_version == protocol.PROTOCOL_VERSION_V2
+
+
+def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
     plugin, connection = _start_and_upgrade(module)
@@ -576,6 +712,7 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
     server_ping_id = protocol.generate_nonce()
     inbound_ping = protocol.sign_envelope(
         session_key,
+        protocol_version=plugin._protocol_version,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=2,
@@ -588,6 +725,7 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
     outbound_pong = protocol.verify_envelope(
         session_key,
         protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
         expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=1,
@@ -608,6 +746,7 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
     outbound_ping = protocol.verify_envelope(
         session_key,
         protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
         expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=2,
@@ -617,6 +756,7 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
 
     inbound_pong = protocol.sign_envelope(
         session_key,
+        protocol_version=plugin._protocol_version,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=3,
@@ -627,6 +767,135 @@ def test_mutual_handshake_inventory_and_signed_ping_pong(loaded_plugin):
         {"Payload": protocol.canonical_json_dumps(inbound_pong)},
     )
     assert plugin._pending_ping_id is None
+
+
+def test_v1_fallback_is_heartbeat_only_and_never_applies(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module, subprotocol=None)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    ping_id = protocol.generate_nonce()
+    legacy_ping = protocol.sign_envelope(
+        session_key,
+        protocol_version=protocol.PROTOCOL_VERSION,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=2,
+        payload={"type": "ping", "id": ping_id},
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(legacy_ping)},
+    )
+    pong = protocol.verify_envelope(
+        session_key,
+        protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=protocol.PROTOCOL_VERSION,
+        expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
+        expected_session_id=session_id,
+        last_sequence=1,
+    )
+    assert pong.payload == {"type": "pong", "id": ping_id}
+    sent_before_apply = len(connection.sent)
+
+    legacy_apply = protocol.sign_envelope(
+        session_key,
+        protocol_version=protocol.PROTOCOL_VERSION,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=3,
+        payload={"type": "apply"},
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(legacy_apply)},
+    )
+
+    assert plugin._protocol_selection is None
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert len(connection.sent) == sent_before_apply + 1
+    assert connection.sent[-1]["Operation"] == "Close"
+    assert any("v1 compatibility mode" in message for message in domoticz.logs)
+
+
+def test_v2_without_numeric_feature_does_not_parse_or_apply(
+    loaded_plugin,
+    monkeypatch,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=(),
+    )
+    assert plugin._protocol_selection.features == ()
+    parse_calls = []
+
+    def record_parse(*args, **kwargs):
+        parse_calls.append((args, kwargs))
+        raise AssertionError
+
+    monkeypatch.setattr(protocol, "parse_apply", record_parse)
+    apply = protocol.sign_envelope(
+        session_key,
+        protocol_version=protocol.PROTOCOL_VERSION_V2,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=2,
+        payload={"schema": 1, "type": "apply"},
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(apply)},
+    )
+
+    assert parse_calls == []
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+
+
+@pytest.mark.parametrize(
+    ("selected_protocol", "wrong_version"),
+    [
+        (MISSING, 1),
+        (None, 2),
+    ],
+)
+def test_authenticated_envelope_from_wrong_protocol_version_is_rejected(
+    loaded_plugin,
+    selected_protocol,
+    wrong_version,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(
+        module,
+        subprotocol=selected_protocol,
+    )
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    wrong_envelope = protocol.sign_envelope(
+        session_key,
+        protocol_version=wrong_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=2,
+        payload={"type": "ping", "id": protocol.generate_nonce()},
+    )
+
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(wrong_envelope)},
+    )
+
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
 
 
 def test_signed_create_uses_stable_custom_sensor_and_survives_lost_ack(
@@ -1141,7 +1410,7 @@ def test_unavailable_retains_value_and_sets_timed_out(loaded_plugin):
     assert not unit.deleted
 
 
-def test_unsupported_action_is_rejected_and_malformed_action_closes(
+def test_unsupported_action_is_rejected_locally_and_malformed_action_closes(
     loaded_plugin,
 ):
     module, domoticz = loaded_plugin
@@ -1159,19 +1428,18 @@ def test_unsupported_action_is_rejected_and_malformed_action_closes(
         ),
     )
 
-    unsupported = _send_apply(
-        module,
-        plugin,
-        connection,
-        session_key,
-        session_id,
-        request_id="unsupported-1",
-        action=binary,
+    with pytest.raises(module.DomoticzApplyError):
+        plugin._apply_action(binary)
+
+    malformed_payload = protocol.build_apply(
+        plugin._protocol_selection,
+        "malformed-1",
+        numeric,
     )
-    malformed_payload = protocol.build_apply("malformed-1", numeric)
     malformed_payload["action"]["kind"] = "delete"
     malformed_envelope = protocol.sign_envelope(
         session_key,
+        protocol_version=plugin._protocol_version,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=plugin._in_sequence + 1,
@@ -1182,9 +1450,6 @@ def test_unsupported_action_is_rejected_and_malformed_action_closes(
         {"Payload": protocol.canonical_json_dumps(malformed_envelope)},
     )
 
-    assert unsupported.status is protocol.ApplyResultStatus.REJECTED
-    assert unsupported.target_id is None
-    assert unsupported.source is None
     assert domoticz.devices == {}
     assert plugin.phase == module.PHASE_DISCONNECTED
     assert connection.disconnected
@@ -1271,7 +1536,7 @@ def test_legacy_mixed_fragmentation_survives_interleaved_ping(
 ):
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
-    plugin, connection = _start_and_upgrade(module)
+    plugin, connection = _start_and_upgrade(module, subprotocol=None)
     hello = protocol.parse_hello(
         protocol.canonical_json_loads(connection.sent[-1]["Payload"])
     )
@@ -1310,7 +1575,7 @@ def test_legacy_mixed_fragmentation_survives_interleaved_ping(
 def test_each_protocol_phase_gets_its_own_timeout_window(loaded_plugin):
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
-    plugin, connection = _start_and_upgrade(module)
+    plugin, connection = _start_and_upgrade(module, subprotocol=None)
     hello = protocol.parse_hello(
         protocol.canonical_json_loads(connection.sent[-1]["Payload"])
     )
@@ -1347,6 +1612,7 @@ def test_each_protocol_phase_gets_its_own_timeout_window(loaded_plugin):
     assert plugin.phase == module.PHASE_WAIT_APPLICATION_READY
     application_ready = protocol.sign_envelope(
         session_key,
+        protocol_version=protocol.PROTOCOL_VERSION,
         direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
         session_id=protocol.derive_session_id(session_key, context),
         sequence=1,
@@ -1363,11 +1629,16 @@ def test_invalid_proof_is_rejected_without_logging_sensitive_data(loaded_plugin)
     module, domoticz = loaded_plugin
     protocol = module.wire_protocol
     plugin, connection = _start_and_upgrade(module)
-    hello = protocol.parse_hello(
+    hello = protocol.parse_v2_hello(
         protocol.canonical_json_loads(connection.sent[-1]["Payload"])
     )
-    context = protocol.make_handshake_context(hello, protocol.generate_nonce())
-    challenge = protocol.build_challenge(module.Parameters["Mode3"], context)
+    context = protocol.make_v2_handshake_context(
+        hello,
+        protocol.generate_nonce(),
+        server_protocols=protocol.SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+        server_features=protocol.SUPPORTED_V2_FEATURES,
+    )
+    challenge = protocol.build_v2_challenge(module.Parameters["Mode3"], context)
     challenge["server_proof"] = protocol.generate_pairing_key()
 
     plugin.onMessage(

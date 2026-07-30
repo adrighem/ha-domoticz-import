@@ -203,12 +203,12 @@ def test_catalog_deliberately_has_no_removal_api() -> None:
     assert not hasattr(TargetCatalog, "discard")
 
 
-def test_v1_serialization_contains_the_complete_record() -> None:
+def test_v2_serialization_contains_the_complete_record() -> None:
     """All identity, value, metadata, target, and stale fields are persisted."""
     record = _record("sensor-1")
 
     assert catalog_to_document(TargetCatalog([record])) == {
-        "version": CATALOG_SCHEMA_VERSION,
+        "version": 2,
         "targets": [
             {
                 "target_id": "target-sensor-1",
@@ -233,7 +233,7 @@ def test_v1_serialization_contains_the_complete_record() -> None:
     }
 
 
-def test_v1_serialization_preserves_absent_state_class_as_null() -> None:
+def test_v2_serialization_preserves_absent_state_class_as_null() -> None:
     """The strict schema retains an explicit nullable metadata field."""
     capability = _capability("sensor-1", state_class=None)
     catalog = TargetCatalog([_record("sensor-1", capability=capability)])
@@ -245,7 +245,7 @@ def test_v1_serialization_preserves_absent_state_class_as_null() -> None:
 
 
 def test_all_capability_shapes_round_trip_through_json() -> None:
-    """Schema v1 preserves each value kind and availability state exactly."""
+    """Schema v2 preserves each value kind and availability state exactly."""
     stale_capability = _capability(
         "stale",
         value=None,
@@ -311,14 +311,38 @@ def test_none_alone_represents_no_persisted_catalog() -> None:
         catalog_from_document({})
 
 
+def test_released_v1_is_rejected_without_mutating_the_document() -> None:
+    """The released pre-state-class schema is not silently reinterpreted."""
+    document = TargetCatalog([_record("sensor-1")]).to_dict()
+    document["version"] = 1
+    document["targets"][0]["capability"].pop("state_class")
+    original = deepcopy(document)
+
+    with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
+        TargetCatalog.from_dict(document)
+
+    assert document == original
+
+
+def test_unknown_future_version_is_rejected_without_mutating_the_document() -> None:
+    """An older reader leaves a future catalog available to newer software."""
+    document = TargetCatalog([_record("sensor-1")]).to_dict()
+    document["version"] = CATALOG_SCHEMA_VERSION + 1
+    original = deepcopy(document)
+
+    with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
+        TargetCatalog.from_dict(document)
+
+    assert document == original
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
         lambda data: data.pop("version"),
-        lambda data: data.update(version=2),
         lambda data: data.update(version=0),
         lambda data: data.update(version=True),
-        lambda data: data.update(version=1.0),
+        lambda data: data.update(version=2.0),
         lambda data: data.update(extra=True),
         lambda data: data.update(targets={}),
         lambda data: data["targets"].append("not-a-record"),
@@ -354,7 +378,9 @@ def test_nonfinite_values_raise_safe_format_error(value: float) -> None:
     record["capability"]["value"] = value
 
     with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
-        TargetCatalog.from_dict({"version": 1, "targets": [record]})
+        TargetCatalog.from_dict(
+            {"version": CATALOG_SCHEMA_VERSION, "targets": [record]}
+        )
 
 
 def test_deserialization_wraps_duplicate_source_identity() -> None:
@@ -364,7 +390,12 @@ def test_deserialization_wraps_duplicate_source_identity() -> None:
     duplicate["target_id"] = "target-2"
 
     with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
-        TargetCatalog.from_dict({"version": 1, "targets": [record, duplicate]})
+        TargetCatalog.from_dict(
+            {
+                "version": CATALOG_SCHEMA_VERSION,
+                "targets": [record, duplicate],
+            }
+        )
 
 
 def test_deserialization_wraps_duplicate_target_id() -> None:
@@ -374,4 +405,9 @@ def test_deserialization_wraps_duplicate_target_id() -> None:
     duplicate["capability"]["source"]["object_id"] = "sensor-2"
 
     with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
-        TargetCatalog.from_dict({"version": 1, "targets": [record, duplicate]})
+        TargetCatalog.from_dict(
+            {
+                "version": CATALOG_SCHEMA_VERSION,
+                "targets": [record, duplicate],
+            }
+        )

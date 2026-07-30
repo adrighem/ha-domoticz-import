@@ -14,23 +14,40 @@ from .const import DOMAIN
 from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_NUMERIC_V1,
+    PROTOCOL_VERSION,
+    SUPPORTED_V2_FEATURES,
+    SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
     ProtocolAuthenticationError,
+    ProtocolCompatibilityError,
     ProtocolError,
+    ProtocolSelection,
+    build_application_ready,
     build_challenge,
     build_ready,
+    build_v2_challenge,
+    build_v2_ready,
     canonical_json_dumps,
     canonical_json_loads,
     derive_session_id,
     derive_session_key,
+    derive_v2_session_id,
+    derive_v2_session_key,
     generate_nonce,
     make_handshake_context,
+    make_v2_handshake_context,
+    parse_application_ready,
     parse_hello,
+    parse_v2_hello,
+    select_websocket_subprotocol,
     sign_envelope,
     validate_link_id,
     validate_nonce,
     validate_pairing_key,
+    validate_protocol_tokens,
     verify_authenticate,
     verify_envelope,
+    verify_v2_authenticate,
 )
 
 BRIDGE_WEBSOCKET_PATH: Final = "/api/domoticz_sync/websocket"
@@ -88,6 +105,7 @@ class BridgeSession:
     session_id: str
     websocket: web.WebSocketResponse = field(repr=False)
     session_key: bytes = field(repr=False)
+    selection: ProtocolSelection | None = None
     client_sequence: int = 0
     server_sequence: int = 0
     ready: bool = False
@@ -117,6 +135,18 @@ class BridgeApplicationSession:
     def destination_id(self) -> str:
         """Return the authenticated Domoticz destination identifier."""
         return self._session.destination_id
+
+    @property
+    def selection(self) -> ProtocolSelection:
+        """Return the authenticated protocol and feature selection."""
+        selection = self._session.selection
+        if selection is None:
+            raise ProtocolError("application session is unavailable")
+        return selection
+
+    def supports(self, feature: str) -> bool:
+        """Return whether the session negotiated one optional feature."""
+        return self.selection.supports(feature)
 
     async def async_send(self, payload: dict[str, object]) -> None:
         """Send one signed, in-order application payload."""
@@ -241,6 +271,9 @@ class DomoticzBridgeManager:
     async def async_handle_reserved(
         self,
         websocket: web.WebSocketResponse,
+        *,
+        client_protocols: tuple[str, ...],
+        selected_protocol: str | None,
     ) -> None:
         """Authenticate and run a connection with a reserved handshake slot."""
         session: BridgeSession | None = None
@@ -248,7 +281,11 @@ class DomoticzBridgeManager:
 
         try:
             async with asyncio.timeout(AUTHENTICATION_TIMEOUT):
-                session = await self._async_authenticate(websocket)
+                session = await self._async_authenticate(
+                    websocket,
+                    client_protocols=client_protocols,
+                    selected_protocol=selected_protocol,
+                )
 
             await self.async_release_handshake()
             reservation_released = True
@@ -292,10 +329,34 @@ class DomoticzBridgeManager:
     async def _async_authenticate(
         self,
         websocket: web.WebSocketResponse,
+        *,
+        client_protocols: tuple[str, ...],
+        selected_protocol: str | None,
     ) -> BridgeSession:
         """Perform mutual authentication and claim the configured link."""
         async with asyncio.timeout(FIRST_MESSAGE_TIMEOUT):
-            hello = parse_hello(await _async_receive_document(websocket))
+            hello_document = await _async_receive_document(websocket)
+
+        selection: ProtocolSelection | None = None
+        if selected_protocol is None:
+            if client_protocols:
+                raise ProtocolCompatibilityError("incompatible protocol")
+            hello = parse_hello(hello_document)
+        else:
+            if (
+                select_websocket_subprotocol(
+                    client_protocols,
+                    SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+                )
+                != selected_protocol
+            ):
+                raise ProtocolCompatibilityError("incompatible protocol")
+            hello = parse_v2_hello(hello_document)
+            if (
+                hello.client_protocols != client_protocols
+                or hello.selected_protocol != selected_protocol
+            ):
+                raise ProtocolAuthenticationError("protocol authentication failed")
 
         async with self._lock:
             link = self._links.get(hello.link_id)
@@ -306,24 +367,49 @@ class DomoticzBridgeManager:
             raise ProtocolAuthenticationError("protocol authentication failed")
         pairing_key = link.pairing_key
 
-        context = make_handshake_context(hello, generate_nonce())
-        await _async_send_document(
-            websocket,
-            build_challenge(pairing_key, context),
-        )
-        verify_authenticate(
-            pairing_key,
-            context,
-            await _async_receive_document(websocket),
-        )
-        session_key = derive_session_key(pairing_key, context)
+        if selected_protocol is None:
+            context = make_handshake_context(hello, generate_nonce())
+            await _async_send_document(
+                websocket,
+                build_challenge(pairing_key, context),
+            )
+            verify_authenticate(
+                pairing_key,
+                context,
+                await _async_receive_document(websocket),
+            )
+            session_key = derive_session_key(pairing_key, context)
+            session_id = derive_session_id(session_key, context)
+            ready_document = build_ready(session_key, context)
+        else:
+            context_v2 = make_v2_handshake_context(
+                hello,
+                generate_nonce(),
+                server_protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+                server_features=SUPPORTED_V2_FEATURES,
+            )
+            await _async_send_document(
+                websocket,
+                build_v2_challenge(pairing_key, context_v2),
+            )
+            verify_v2_authenticate(
+                pairing_key,
+                context_v2,
+                await _async_receive_document(websocket),
+            )
+            session_key = derive_v2_session_key(pairing_key, context_v2)
+            session_id = derive_v2_session_id(session_key, context_v2)
+            selection = context_v2.selection
+            ready_document = build_v2_ready(session_key, context_v2)
+
         session = BridgeSession(
             entry_id=link.entry_id,
             link_id=link.link_id,
             destination_id=hello.destination_id,
-            session_id=derive_session_id(session_key, context),
+            session_id=session_id,
             websocket=websocket,
             session_key=session_key,
+            selection=selection,
         )
 
         async with self._lock:
@@ -336,14 +422,21 @@ class DomoticzBridgeManager:
             self._sessions[session.link_id] = session
 
         try:
-            await _async_send_document(websocket, build_ready(session_key, context))
+            await _async_send_document(websocket, ready_document)
         except BaseException:
             await self._async_release_session(session)
             raise
         return session
 
     async def _async_run_session(self, session: BridgeSession) -> None:
-        """Accept initial inventory, announce readiness, then keep the link alive."""
+        """Complete the selected application startup and keep the link alive."""
+        if session.selection is None:
+            await self._async_run_legacy_session(session)
+        else:
+            await self._async_run_v2_session(session)
+
+    async def _async_run_legacy_session(self, session: BridgeSession) -> None:
+        """Preserve the released v1 inventory, ready, and heartbeat behavior."""
         async with asyncio.timeout(INVENTORY_TIMEOUT):
             inventory = await self._async_receive_payload(session)
         if inventory != {"targets": [], "type": "inventory"}:
@@ -352,13 +445,37 @@ class DomoticzBridgeManager:
         await self._async_send_payload(session, {"type": "ready"})
         session.ready = True
 
-        if self._application is not None:
+        await self._async_run_heartbeat(session)
+
+    async def _async_run_v2_session(self, session: BridgeSession) -> None:
+        """Exchange application readiness and run negotiated v2 behavior."""
+        selection = session.selection
+        assert selection is not None
+
+        async with asyncio.timeout(INVENTORY_TIMEOUT):
+            parse_application_ready(
+                selection,
+                await self._async_receive_payload(session),
+            )
+        await self._async_send_payload(
+            session,
+            build_application_ready(selection),
+        )
+        session.ready = True
+
+        if self._application is not None and selection.supports(
+            FEATURE_HA_EXPORT_NUMERIC_V1
+        ):
             application_session = BridgeApplicationSession(self, session)
             try:
                 await self._application.async_connected(application_session)
             finally:
                 application_session._deactivate()
 
+        await self._async_run_heartbeat(session)
+
+    async def _async_run_heartbeat(self, session: BridgeSession) -> None:
+        """Keep one application-ready session alive with signed heartbeats."""
         pending_ping_id: str | None = None
         pending_ping_deadline: float | None = None
         loop = asyncio.get_running_loop()
@@ -409,6 +526,11 @@ class DomoticzBridgeManager:
         verified = verify_envelope(
             session.session_key,
             await _async_receive_document(session.websocket),
+            protocol_version=(
+                session.selection.version
+                if session.selection is not None
+                else PROTOCOL_VERSION
+            ),
             expected_direction=DIRECTION_DOMOTICZ_TO_HA,
             expected_session_id=session.session_id,
             last_sequence=session.client_sequence,
@@ -425,6 +547,11 @@ class DomoticzBridgeManager:
         sequence = session.server_sequence + 1
         document = sign_envelope(
             session.session_key,
+            protocol_version=(
+                session.selection.version
+                if session.selection is not None
+                else PROTOCOL_VERSION
+            ),
             direction=DIRECTION_HA_TO_DOMOTICZ,
             session_id=session.session_id,
             sequence=sequence,
@@ -457,10 +584,27 @@ class DomoticzBridgeView(HomeAssistantView):
         if not await self._manager.async_reserve_handshake():
             return web.Response(status=HTTPStatus.SERVICE_UNAVAILABLE)
 
+        try:
+            client_protocols = _request_protocols(request)
+            if (
+                client_protocols
+                and select_websocket_subprotocol(
+                    client_protocols,
+                    SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+                )
+                is None
+            ):
+                await self._manager.async_release_handshake()
+                return web.Response(status=HTTPStatus.BAD_REQUEST)
+        except ProtocolError:
+            await self._manager.async_release_handshake()
+            return web.Response(status=HTTPStatus.BAD_REQUEST)
+
         websocket = web.WebSocketResponse(
             autoping=True,
             compress=False,
             max_msg_size=MAX_BRIDGE_MESSAGE_BYTES,
+            protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
         )
         try:
             async with asyncio.timeout(PREPARE_TIMEOUT):
@@ -469,7 +613,11 @@ class DomoticzBridgeView(HomeAssistantView):
             await self._manager.async_release_handshake()
             raise
 
-        await self._manager.async_handle_reserved(websocket)
+        await self._manager.async_handle_reserved(
+            websocket,
+            client_protocols=client_protocols,
+            selected_protocol=websocket.ws_protocol,
+        )
         return websocket
 
 
@@ -506,6 +654,19 @@ def _validate_heartbeat_payload(payload: dict[str, object]) -> str:
     validate_nonce(heartbeat_id)
     assert isinstance(heartbeat_id, str)
     return heartbeat_id
+
+
+def _request_protocols(request: web.Request) -> tuple[str, ...]:
+    """Normalize the ordered WebSocket protocol offer from HTTP headers."""
+    header_values = request.headers.getall("Sec-WebSocket-Protocol", ())
+    if not header_values:
+        return ()
+    tokens = [
+        token.strip()
+        for header_value in header_values
+        for token in header_value.split(",")
+    ]
+    return validate_protocol_tokens(tokens)
 
 
 async def _async_close(

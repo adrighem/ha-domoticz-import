@@ -19,50 +19,79 @@ from custom_components.domoticz_sync.core.capabilities import (
 from custom_components.domoticz_sync.core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_NUMERIC_V1,
     MAX_MESSAGE_BYTES,
     MAX_SAFE_INTEGER,
     PROTOCOL_VERSION,
+    PROTOCOL_VERSION_V1,
+    PROTOCOL_VERSION_V2,
+    SUPPORTED_V2_FEATURES,
+    SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+    WEBSOCKET_SUBPROTOCOL_V2,
     ApplyRequest,
     ApplyResult,
     ApplyResultStatus,
     ClientHello,
     HandshakeContext,
     ProtocolAuthenticationError,
+    ProtocolCompatibilityError,
     ProtocolFormatError,
+    ProtocolSelection,
     ProtocolSequenceError,
+    V2HandshakeContext,
     accept_challenge,
+    accept_v2_challenge,
+    build_application_ready,
     build_apply,
     build_apply_result,
     build_authenticate,
     build_challenge,
     build_hello,
     build_ready,
+    build_v2_authenticate,
+    build_v2_challenge,
+    build_v2_hello,
+    build_v2_ready,
     canonical_json_bytes,
     canonical_json_dumps,
     canonical_json_loads,
     create_client_proof,
     create_server_proof,
+    create_v2_client_proof,
+    create_v2_server_proof,
     derive_session_id,
     derive_session_key,
+    derive_v2_session_id,
+    derive_v2_session_key,
     generate_destination_id,
     generate_link_id,
     generate_nonce,
     generate_pairing_key,
     generate_request_id,
     make_handshake_context,
+    make_v2_handshake_context,
+    negotiate_features,
+    parse_application_ready,
     parse_apply,
     parse_apply_result,
     parse_hello,
+    parse_v2_hello,
+    select_websocket_subprotocol,
     sign_envelope,
     validate_destination_id,
+    validate_feature_ids,
     validate_link_id,
     validate_nonce,
     validate_pairing_key,
+    validate_protocol_tokens,
     verify_authenticate,
     verify_client_proof,
     verify_envelope,
     verify_ready,
     verify_server_proof,
+    verify_v2_authenticate,
+    verify_v2_client_proof,
+    verify_v2_ready,
 )
 from custom_components.domoticz_sync.core.reconciliation import (
     ReconciliationAction,
@@ -94,6 +123,48 @@ def _session() -> tuple[bytes, HandshakeContext, str]:
     context = _fixed_context()
     session_key = derive_session_key(_fixed_pairing_key(), context)
     return session_key, context, derive_session_id(session_key, context)
+
+
+def _selection(
+    features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+) -> ProtocolSelection:
+    return ProtocolSelection(
+        version=PROTOCOL_VERSION_V2,
+        websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+        features=features,
+    )
+
+
+def _fixed_v2_context(
+    *,
+    client_features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+    server_features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+) -> V2HandshakeContext:
+    hello = parse_v2_hello(
+        build_v2_hello(
+            "link_test",
+            "domoticz_test",
+            _token(bytes(range(32))),
+            client_protocols=(
+                "unknown.example.v9",
+                WEBSOCKET_SUBPROTOCOL_V2,
+            ),
+            selected_protocol=WEBSOCKET_SUBPROTOCOL_V2,
+            client_features=client_features,
+        )
+    )
+    return make_v2_handshake_context(
+        hello,
+        _token(bytes(range(32, 64))),
+        server_protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+        server_features=server_features,
+    )
+
+
+def _v2_session() -> tuple[bytes, V2HandshakeContext, str]:
+    context = _fixed_v2_context()
+    session_key = derive_v2_session_key(_fixed_pairing_key(), context)
+    return session_key, context, derive_v2_session_id(session_key, context)
 
 
 def _source_identity() -> SourceIdentity:
@@ -183,7 +254,7 @@ def test_generated_request_ids_prefix_problematic_raw_tokens(
         kind=ReconciliationActionKind.CREATE,
         capability=_numeric_capability(),
     )
-    assert build_apply(request_id, action)["request_id"] == request_id
+    assert build_apply(_selection(), request_id, action)["request_id"] == request_id
 
 
 @pytest.mark.parametrize(
@@ -370,6 +441,65 @@ def test_fixed_handshake_has_stable_cross_runtime_vectors() -> None:
     )
 
 
+def test_v1_wire_documents_remain_byte_for_byte_stable() -> None:
+    """Released v1 handshake and envelope bytes remain a frozen legacy codec."""
+    assert PROTOCOL_VERSION == PROTOCOL_VERSION_V1 == 1
+
+    pairing_key = _fixed_pairing_key()
+    context = _fixed_context()
+    hello = ClientHello(
+        context.link_id,
+        context.destination_id,
+        context.client_nonce,
+    )
+    session_key = derive_session_key(pairing_key, context)
+    session_id = derive_session_id(session_key, context)
+
+    assert canonical_json_dumps(
+        build_hello(hello.link_id, hello.destination_id, hello.client_nonce)
+    ) == canonical_json_dumps(
+        {
+            "version": 1,
+            "type": "hello",
+            "link_id": "link_test",
+            "destination_id": "domoticz_test",
+            "client_nonce": context.client_nonce,
+        }
+    )
+    assert build_challenge(pairing_key, context) == {
+        "version": 1,
+        "type": "challenge",
+        "server_nonce": context.server_nonce,
+        "server_proof": "hlsjlLvMtRRwtndj2bUfD0V9OkOS2LseWSwkebxDO-4",
+    }
+    assert build_authenticate(pairing_key, context) == {
+        "version": 1,
+        "type": "authenticate",
+        "client_proof": "w4fIO6FJ3wP3wWgiLKnRHdmJ8A7jt6vtzNpASyXm1p0",
+    }
+    assert build_ready(session_key, context) == {
+        "version": 1,
+        "type": "ready",
+        "session_id": session_id,
+    }
+    assert sign_envelope(
+        session_key,
+        protocol_version=PROTOCOL_VERSION,
+        direction=DIRECTION_DOMOTICZ_TO_HA,
+        session_id=session_id,
+        sequence=1,
+        payload={"type": "ping"},
+    ) == {
+        "version": 1,
+        "type": "message",
+        "session_id": session_id,
+        "direction": DIRECTION_DOMOTICZ_TO_HA,
+        "sequence": 1,
+        "payload": {"type": "ping"},
+        "signature": "RWOhPNBsaGUxU76MGSp8Fen2l3e5NEF3H7LTtB7iHwQ",
+    }
+
+
 def test_client_and_server_proofs_are_role_separated() -> None:
     """A valid proof for one peer cannot authenticate the other peer."""
     pairing_key = _fixed_pairing_key()
@@ -506,6 +636,247 @@ def test_ready_message_is_bound_to_the_secret_session_key() -> None:
         verify_ready(bytes(32), context, ready)
 
 
+def test_v2_protocol_and_feature_validators_are_bounded_and_deterministic() -> None:
+    """Negotiation permits future identifiers without permitting ambiguity."""
+    protocols = ("future.example.v9", WEBSOCKET_SUBPROTOCOL_V2)
+    features = ("future.feature", FEATURE_HA_EXPORT_NUMERIC_V1)
+
+    assert validate_protocol_tokens(protocols) == protocols
+    assert validate_feature_ids(features) == features
+    assert (
+        select_websocket_subprotocol(
+            protocols,
+            SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+        )
+        == WEBSOCKET_SUBPROTOCOL_V2
+    )
+    assert negotiate_features(
+        features,
+        (FEATURE_HA_EXPORT_NUMERIC_V1, "server.feature"),
+    ) == (FEATURE_HA_EXPORT_NUMERIC_V1,)
+
+    invalid_protocols = (
+        (),
+        (WEBSOCKET_SUBPROTOCOL_V2, WEBSOCKET_SUBPROTOCOL_V2),
+        ("contains space",),
+        tuple(f"protocol-{index}" for index in range(protocol.MAX_PROTOCOL_TOKENS + 1)),
+    )
+    for value in invalid_protocols:
+        with pytest.raises(ProtocolFormatError):
+            validate_protocol_tokens(value)
+
+    invalid_features = (
+        ("z.feature", "a.feature"),
+        ("same.feature", "same.feature"),
+        ("contains space",),
+        tuple(f"feature-{index:03d}" for index in range(protocol.MAX_FEATURE_IDS + 1)),
+    )
+    for value in invalid_features:
+        with pytest.raises(ProtocolFormatError):
+            validate_feature_ids(value)
+
+
+def test_complete_v2_handshake_negotiates_features_and_agrees_on_session() -> None:
+    """The v2 handshake authenticates the HTTP offer and feature intersection."""
+    pairing_key = _fixed_pairing_key()
+    hello_document = build_v2_hello(
+        "link_test",
+        "domoticz_test",
+        _fixed_context().client_nonce,
+        client_protocols=("future.example.v9", WEBSOCKET_SUBPROTOCOL_V2),
+        selected_protocol=WEBSOCKET_SUBPROTOCOL_V2,
+        client_features=(
+            "future.feature",
+            FEATURE_HA_EXPORT_NUMERIC_V1,
+        ),
+    )
+    assert hello_document == {
+        "version": 2,
+        "type": "hello",
+        "link_id": "link_test",
+        "destination_id": "domoticz_test",
+        "client_nonce": _fixed_context().client_nonce,
+        "client_protocols": [
+            "future.example.v9",
+            WEBSOCKET_SUBPROTOCOL_V2,
+        ],
+        "selected_protocol": WEBSOCKET_SUBPROTOCOL_V2,
+        "client_features": [
+            "future.feature",
+            FEATURE_HA_EXPORT_NUMERIC_V1,
+        ],
+    }
+    hello = parse_v2_hello(canonical_json_loads(canonical_json_dumps(hello_document)))
+    server_context = make_v2_handshake_context(
+        hello,
+        _fixed_context().server_nonce,
+        server_protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+        server_features=(
+            FEATURE_HA_EXPORT_NUMERIC_V1,
+            "server.feature",
+        ),
+    )
+    assert server_context.selection == _selection()
+
+    challenge = build_v2_challenge(pairing_key, server_context)
+    assert set(challenge) == {
+        "version",
+        "type",
+        "server_nonce",
+        "server_protocols",
+        "selected_protocol",
+        "server_features",
+        "selected_features",
+        "server_proof",
+    }
+    client_context = accept_v2_challenge(
+        pairing_key,
+        hello,
+        canonical_json_loads(canonical_json_dumps(challenge)),
+    )
+    assert client_context == server_context
+
+    authentication = build_v2_authenticate(pairing_key, client_context)
+    verify_v2_authenticate(pairing_key, server_context, authentication)
+    client_key = derive_v2_session_key(pairing_key, client_context)
+    server_key = derive_v2_session_key(pairing_key, server_context)
+    assert client_key == server_key
+
+    ready = build_v2_ready(server_key, server_context)
+    assert verify_v2_ready(client_key, client_context, ready) == ready["session_id"]
+
+
+def test_v2_fixed_handshake_has_stable_cross_runtime_vectors() -> None:
+    """V2 domains and the complete canonical negotiation cannot drift."""
+    pairing_key = _fixed_pairing_key()
+    context = _fixed_v2_context()
+
+    assert (
+        create_v2_client_proof(pairing_key, context)
+        == "iXesG4Fg1IV1Jy5RvwyA6ysgm2gXV7GoDRA3J9g0oTs"
+    )
+    assert (
+        create_v2_server_proof(pairing_key, context)
+        == "SA9Bf4xY1s_Hg7g7YZ4YLAC73SDwhnlQncDhZat_jKI"
+    )
+    session_key = derive_v2_session_key(pairing_key, context)
+    assert session_key.hex() == (
+        "7ab23a78a617784d031cf26800b5cd200316c4abde67cd3712520cbf4f73522f"
+    )
+    assert (
+        derive_v2_session_id(session_key, context)
+        == "q0lalHuXUc47TorXOZpdpOho3PppSuRGL8pydua5Jko"
+    )
+
+
+def test_v2_server_proof_binds_client_offer_and_complete_selection() -> None:
+    """Stripping offers or mutually changing selected values fails authentication."""
+    pairing_key = _fixed_pairing_key()
+    original_document = build_v2_hello(
+        "link_test",
+        "domoticz_test",
+        _fixed_context().client_nonce,
+        client_protocols=("future.example.v9", WEBSOCKET_SUBPROTOCOL_V2),
+        selected_protocol=WEBSOCKET_SUBPROTOCOL_V2,
+        client_features=SUPPORTED_V2_FEATURES,
+    )
+    original_hello = parse_v2_hello(original_document)
+    stripped_document = deepcopy(original_document)
+    stripped_document["client_protocols"] = [WEBSOCKET_SUBPROTOCOL_V2]
+    stripped_hello = parse_v2_hello(stripped_document)
+    stripped_context = make_v2_handshake_context(
+        stripped_hello,
+        _fixed_context().server_nonce,
+        server_protocols=SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+        server_features=SUPPORTED_V2_FEATURES,
+    )
+
+    with pytest.raises(ProtocolAuthenticationError):
+        accept_v2_challenge(
+            pairing_key,
+            original_hello,
+            build_v2_challenge(pairing_key, stripped_context),
+        )
+
+    context = _fixed_v2_context(
+        client_features=(
+            "future.feature",
+            FEATURE_HA_EXPORT_NUMERIC_V1,
+        )
+    )
+    challenge = build_v2_challenge(pairing_key, context)
+    changed = deepcopy(challenge)
+    changed["server_features"] = []
+    changed["selected_features"] = []
+    with pytest.raises(ProtocolAuthenticationError):
+        accept_v2_challenge(
+            pairing_key,
+            parse_v2_hello(
+                build_v2_hello(
+                    context.link_id,
+                    context.destination_id,
+                    context.client_nonce,
+                    client_protocols=context.client_protocols,
+                    selected_protocol=context.selected_protocol,
+                    client_features=context.client_features,
+                )
+            ),
+            changed,
+        )
+
+
+def test_v2_client_proof_and_session_key_bind_the_selected_features() -> None:
+    """The client confirmation and derived session cannot reuse another selection."""
+    pairing_key = _fixed_pairing_key()
+    feature_context = _fixed_v2_context()
+    heartbeat_only_context = _fixed_v2_context(
+        client_features=(),
+        server_features=(),
+    )
+    proof = create_v2_client_proof(pairing_key, feature_context)
+
+    with pytest.raises(ProtocolAuthenticationError):
+        verify_v2_client_proof(pairing_key, heartbeat_only_context, proof)
+    assert derive_v2_session_key(
+        pairing_key,
+        feature_context,
+    ) != derive_v2_session_key(pairing_key, heartbeat_only_context)
+
+
+def test_v2_handshake_rejects_non_deterministic_or_extended_schemas() -> None:
+    """Selected protocol, feature intersection, and exact keys cannot diverge."""
+    pairing_key = _fixed_pairing_key()
+    context = _fixed_v2_context()
+    hello = parse_v2_hello(
+        build_v2_hello(
+            context.link_id,
+            context.destination_id,
+            context.client_nonce,
+            client_protocols=context.client_protocols,
+            selected_protocol=context.selected_protocol,
+            client_features=context.client_features,
+        )
+    )
+    challenge = build_v2_challenge(pairing_key, context)
+    mutations = []
+    extra = deepcopy(challenge)
+    extra["unexpected"] = True
+    mutations.append(extra)
+    wrong_version = deepcopy(challenge)
+    wrong_version["version"] = 1
+    mutations.append(wrong_version)
+    wrong_selection = deepcopy(challenge)
+    wrong_selection["selected_features"] = []
+    mutations.append(wrong_selection)
+    wrong_protocol = deepcopy(challenge)
+    wrong_protocol["selected_protocol"] = "future.example.v9"
+    mutations.append(wrong_protocol)
+
+    for mutation in mutations:
+        with pytest.raises(ProtocolFormatError):
+            accept_v2_challenge(pairing_key, hello, mutation)
+
+
 def test_signed_envelope_round_trip_and_defensive_payload_copy() -> None:
     """A valid canonical frame returns its authenticated application fields."""
     session_key, _, session_id = _session()
@@ -515,6 +886,7 @@ def test_signed_envelope_round_trip_and_defensive_payload_copy() -> None:
     }
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -526,6 +898,7 @@ def test_signed_envelope_round_trip_and_defensive_payload_copy() -> None:
     verified = verify_envelope(
         session_key,
         decoded,
+        protocol_version=PROTOCOL_VERSION,
         expected_direction=DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=0,
@@ -538,6 +911,71 @@ def test_signed_envelope_round_trip_and_defensive_payload_copy() -> None:
         "type": "ping",
         "details": {"counter": 1},
     }
+
+
+def test_v2_envelope_uses_selected_version_and_domain() -> None:
+    """V2 messages round-trip only under the authenticated v2 MAC domain."""
+    session_key, context, session_id = _v2_session()
+    payload = build_application_ready(context.selection)
+    envelope = sign_envelope(
+        session_key,
+        protocol_version=context.selection.version,
+        direction=DIRECTION_DOMOTICZ_TO_HA,
+        session_id=session_id,
+        sequence=1,
+        payload=payload,
+    )
+
+    assert envelope["version"] == PROTOCOL_VERSION_V2
+    assert envelope["signature"] == ("dJWy7BtKBLFM8V3KGKwofZi1s1GBRkd6DRBpSlNedUQ")
+    assert (
+        verify_envelope(
+            session_key,
+            envelope,
+            protocol_version=PROTOCOL_VERSION_V2,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=session_id,
+            last_sequence=0,
+        ).payload
+        == payload
+    )
+
+    with pytest.raises(ProtocolFormatError):
+        verify_envelope(
+            session_key,
+            envelope,
+            protocol_version=PROTOCOL_VERSION,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=session_id,
+            last_sequence=0,
+        )
+
+    wrong_domain = deepcopy(envelope)
+    wrong_domain["version"] = PROTOCOL_VERSION
+    with pytest.raises(ProtocolAuthenticationError):
+        verify_envelope(
+            session_key,
+            wrong_domain,
+            protocol_version=PROTOCOL_VERSION,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=session_id,
+            last_sequence=0,
+        )
+
+
+def test_envelope_requires_an_explicit_supported_protocol_version() -> None:
+    """Callers cannot silently fall back to a global wire version."""
+    session_key, _, session_id = _session()
+
+    with pytest.raises(ProtocolFormatError):
+        sign_envelope(
+            session_key,
+            protocol_version=3,
+            direction=DIRECTION_DOMOTICZ_TO_HA,
+            session_id=session_id,
+            sequence=1,
+            payload={"type": "ping"},
+        )
 
 
 @pytest.mark.parametrize(
@@ -557,6 +995,7 @@ def test_envelope_signature_binds_every_routing_and_payload_field(
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -571,6 +1010,7 @@ def test_envelope_signature_binds_every_routing_and_payload_field(
         verify_envelope(
             session_key,
             envelope,
+            protocol_version=PROTOCOL_VERSION,
             expected_direction=DIRECTION_DOMOTICZ_TO_HA,
             expected_session_id=session_id,
             last_sequence=0,
@@ -582,6 +1022,7 @@ def test_envelope_rejects_wrong_session_key_direction_or_session() -> None:
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -597,6 +1038,7 @@ def test_envelope_rejects_wrong_session_key_direction_or_session() -> None:
             verify_envelope(
                 key,
                 envelope,
+                protocol_version=PROTOCOL_VERSION,
                 expected_direction=direction,
                 expected_session_id=expected_id,
                 last_sequence=0,
@@ -609,6 +1051,7 @@ def test_envelope_rejects_replay_and_sequence_gaps(last_sequence: int) -> None:
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -622,6 +1065,7 @@ def test_envelope_rejects_replay_and_sequence_gaps(last_sequence: int) -> None:
         verify_envelope(
             session_key,
             envelope,
+            protocol_version=PROTOCOL_VERSION,
             expected_direction=DIRECTION_DOMOTICZ_TO_HA,
             expected_session_id=session_id,
             last_sequence=last_sequence,
@@ -638,6 +1082,7 @@ def test_sign_envelope_requires_a_positive_safe_integer_sequence(
     with pytest.raises(ProtocolFormatError):
         sign_envelope(
             session_key,
+            protocol_version=PROTOCOL_VERSION,
             direction=DIRECTION_DOMOTICZ_TO_HA,
             session_id=session_id,
             sequence=sequence,
@@ -650,6 +1095,7 @@ def test_envelope_schema_and_payload_are_strict() -> None:
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -665,6 +1111,7 @@ def test_envelope_schema_and_payload_are_strict() -> None:
             verify_envelope(
                 session_key,
                 changed,
+                protocol_version=PROTOCOL_VERSION,
                 expected_direction=DIRECTION_DOMOTICZ_TO_HA,
                 expected_session_id=session_id,
                 last_sequence=0,
@@ -673,6 +1120,7 @@ def test_envelope_schema_and_payload_are_strict() -> None:
     with pytest.raises(ProtocolFormatError):
         sign_envelope(
             session_key,
+            protocol_version=PROTOCOL_VERSION,
             direction=DIRECTION_DOMOTICZ_TO_HA,
             session_id=session_id,
             sequence=1,
@@ -685,6 +1133,7 @@ def test_envelope_signature_is_checked_before_sequence() -> None:
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -696,6 +1145,7 @@ def test_envelope_signature_is_checked_before_sequence() -> None:
         verify_envelope(
             session_key,
             envelope,
+            protocol_version=PROTOCOL_VERSION,
             expected_direction=DIRECTION_DOMOTICZ_TO_HA,
             expected_session_id=session_id,
             last_sequence=1,
@@ -725,6 +1175,7 @@ def test_proof_and_signature_verification_use_constant_time_comparison(
     session_id = derive_session_id(session_key, context)
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -733,6 +1184,7 @@ def test_proof_and_signature_verification_use_constant_time_comparison(
     verify_envelope(
         session_key,
         envelope,
+        protocol_version=PROTOCOL_VERSION,
         expected_direction=DIRECTION_DOMOTICZ_TO_HA,
         expected_session_id=session_id,
         last_sequence=0,
@@ -765,6 +1217,7 @@ def test_mutating_an_envelope_copy_does_not_mutate_original() -> None:
     session_key, _, session_id = _session()
     envelope = sign_envelope(
         session_key,
+        protocol_version=PROTOCOL_VERSION,
         direction=DIRECTION_DOMOTICZ_TO_HA,
         session_id=session_id,
         sequence=1,
@@ -788,6 +1241,89 @@ def test_protocol_message_limit_matches_the_websocket_transport() -> None:
         canonical_json_loads(at_limit + " ")
     with pytest.raises(ProtocolFormatError):
         canonical_json_dumps("a" * (MAX_MESSAGE_BYTES - 1))
+
+
+def test_application_ready_is_exact_and_does_not_require_optional_features() -> None:
+    """A v2 session can reach heartbeat-only readiness without export support."""
+    selection = _selection(())
+    payload = build_application_ready(selection)
+
+    assert payload == {"schema": 1, "type": "application_ready"}
+    assert parse_application_ready(selection, payload) is None
+
+    mutations = []
+    extra = deepcopy(payload)
+    extra["unexpected"] = True
+    mutations.append(extra)
+    missing_schema = deepcopy(payload)
+    del missing_schema["schema"]
+    mutations.append(missing_schema)
+    wrong_schema = deepcopy(payload)
+    wrong_schema["schema"] = 2
+    mutations.append(wrong_schema)
+    boolean_schema = deepcopy(payload)
+    boolean_schema["schema"] = True
+    mutations.append(boolean_schema)
+
+    for mutation in mutations:
+        with pytest.raises(ProtocolFormatError):
+            parse_application_ready(selection, mutation)
+
+
+def test_apply_codecs_require_the_negotiated_numeric_feature() -> None:
+    """Unnegotiated export messages cannot be emitted or accepted."""
+    action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=_numeric_capability(),
+    )
+    payload = build_apply(_selection(), "request-1", action)
+
+    with pytest.raises(ProtocolCompatibilityError):
+        build_apply(_selection(()), "request-1", action)
+    with pytest.raises(ProtocolCompatibilityError):
+        parse_apply(_selection(()), payload)
+    with pytest.raises(ProtocolCompatibilityError):
+        build_apply_result(
+            _selection(()),
+            "request-1",
+            ApplyResultStatus.REJECTED,
+            None,
+            None,
+        )
+
+
+def test_apply_codec_rejects_non_numeric_capabilities() -> None:
+    """The negotiated numeric feature cannot transport a different entity kind."""
+    binary_action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=Capability(
+            source=_source_identity(),
+            kind=CapabilityKind.BINARY,
+            name="Living room motion",
+            value=True,
+        ),
+    )
+
+    with pytest.raises(ProtocolFormatError):
+        build_apply(_selection(), "request-1", binary_action)
+
+    payload = build_apply(
+        _selection(),
+        "request-1",
+        ReconciliationAction(
+            kind=ReconciliationActionKind.CREATE,
+            capability=_numeric_capability(),
+        ),
+    )
+    payload["action"]["capability"].update(
+        kind="binary",
+        value=True,
+        semantic=None,
+        unit=None,
+        state_class=None,
+    )
+    with pytest.raises(ProtocolFormatError):
+        parse_apply(_selection(), payload)
 
 
 @pytest.mark.parametrize(
@@ -817,9 +1353,11 @@ def test_apply_codec_round_trips_complete_reconciliation_actions(
     action: ReconciliationAction,
 ) -> None:
     """Every action and capability field survives the application wire format."""
-    payload = build_apply("request-42", action)
+    selection = _selection()
+    payload = build_apply(selection, "request-42", action)
 
     assert payload == {
+        "schema": 1,
         "type": "apply",
         "request_id": "request-42",
         "action": {
@@ -843,7 +1381,7 @@ def test_apply_codec_round_trips_complete_reconciliation_actions(
             "stale": action.stale,
         },
     }
-    assert parse_apply(payload) == ApplyRequest(
+    assert parse_apply(selection, payload) == ApplyRequest(
         request_id="request-42",
         action=action,
     )
@@ -851,28 +1389,31 @@ def test_apply_codec_round_trips_complete_reconciliation_actions(
 
 def test_apply_payload_can_be_signed_verified_and_parsed() -> None:
     """The strict request codec composes with authenticated envelopes."""
-    session_key, _, session_id = _session()
+    session_key, context, session_id = _v2_session()
+    selection = context.selection
     action = ReconciliationAction(
         kind=ReconciliationActionKind.CREATE,
         capability=_numeric_capability(),
     )
     envelope = sign_envelope(
         session_key,
+        protocol_version=selection.version,
         direction=DIRECTION_HA_TO_DOMOTICZ,
         session_id=session_id,
         sequence=1,
-        payload=build_apply("request-1", action),
+        payload=build_apply(selection, "request-1", action),
     )
 
     verified = verify_envelope(
         session_key,
         envelope,
+        protocol_version=selection.version,
         expected_direction=DIRECTION_HA_TO_DOMOTICZ,
         expected_session_id=session_id,
         last_sequence=0,
     )
 
-    assert parse_apply(verified.payload).action == action
+    assert parse_apply(selection, verified.payload).action == action
 
 
 def test_apply_codec_preserves_absent_state_class_as_null() -> None:
@@ -882,10 +1423,11 @@ def test_apply_codec_preserves_absent_state_class_as_null() -> None:
         capability=_numeric_capability(state_class=None),
     )
 
-    payload = build_apply("request-1", action)
+    selection = _selection()
+    payload = build_apply(selection, "request-1", action)
 
     assert payload["action"]["capability"]["state_class"] is None
-    assert parse_apply(payload).action == action
+    assert parse_apply(selection, payload).action == action
 
 
 def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
@@ -894,7 +1436,8 @@ def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
         kind=ReconciliationActionKind.CREATE,
         capability=_numeric_capability(),
     )
-    payload = build_apply("request-1", action)
+    selection = _selection()
+    payload = build_apply(selection, "request-1", action)
     mutations = []
 
     for path in (
@@ -913,6 +1456,12 @@ def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
     missing_request_id = deepcopy(payload)
     del missing_request_id["request_id"]
     mutations.append(missing_request_id)
+    missing_schema = deepcopy(payload)
+    del missing_schema["schema"]
+    mutations.append(missing_schema)
+    wrong_schema = deepcopy(payload)
+    wrong_schema["schema"] = 2
+    mutations.append(wrong_schema)
     missing_action_field = deepcopy(payload)
     del missing_action_field["action"]["stale"]
     mutations.append(missing_action_field)
@@ -928,7 +1477,7 @@ def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
             ProtocolFormatError,
             match="^invalid protocol message$",
         ):
-            parse_apply(mutation)
+            parse_apply(selection, mutation)
 
 
 def test_apply_parser_rejects_malformed_action_semantics() -> None:
@@ -937,7 +1486,8 @@ def test_apply_parser_rejects_malformed_action_semantics() -> None:
         kind=ReconciliationActionKind.CREATE,
         capability=_numeric_capability(),
     )
-    payload = build_apply("request-1", action)
+    selection = _selection()
+    payload = build_apply(selection, "request-1", action)
     mutations = []
 
     create_with_target = deepcopy(payload)
@@ -980,7 +1530,7 @@ def test_apply_parser_rejects_malformed_action_semantics() -> None:
             ProtocolFormatError,
             match="^invalid protocol message$",
         ):
-            parse_apply(mutation)
+            parse_apply(selection, mutation)
 
 
 @pytest.mark.parametrize("request_id", [None, True, "", "with space", "x" * 129])
@@ -997,20 +1547,22 @@ def test_apply_codec_rejects_invalid_request_identifiers(
         ProtocolFormatError,
         match="^invalid protocol message$",
     ):
-        build_apply(request_id, action)
+        build_apply(_selection(), request_id, action)
 
-    payload = build_apply("request-1", action)
+    selection = _selection()
+    payload = build_apply(selection, "request-1", action)
     payload["request_id"] = request_id
     with pytest.raises(
         ProtocolFormatError,
         match="^invalid protocol message$",
     ):
-        parse_apply(payload)
+        parse_apply(selection, payload)
 
 
 def test_confirmed_apply_result_round_trips_exact_identity() -> None:
     """A confirmation binds its target to the action's source identity."""
     payload = build_apply_result(
+        _selection(),
         "request-42",
         ApplyResultStatus.CONFIRMED,
         "123",
@@ -1018,6 +1570,7 @@ def test_confirmed_apply_result_round_trips_exact_identity() -> None:
     )
 
     assert payload == {
+        "schema": 1,
         "type": "apply_result",
         "request_id": "request-42",
         "status": "confirmed",
@@ -1029,7 +1582,7 @@ def test_confirmed_apply_result_round_trips_exact_identity() -> None:
             "capability_id": "state",
         },
     }
-    assert parse_apply_result(payload) == ApplyResult(
+    assert parse_apply_result(_selection(), payload) == ApplyResult(
         request_id="request-42",
         status=ApplyResultStatus.CONFIRMED,
         target_id="123",
@@ -1040,6 +1593,7 @@ def test_confirmed_apply_result_round_trips_exact_identity() -> None:
 def test_rejected_apply_result_has_no_remote_details() -> None:
     """A rejection carries only its correlation and sanitized status."""
     payload = build_apply_result(
+        _selection(),
         "request-42",
         ApplyResultStatus.REJECTED,
         None,
@@ -1047,13 +1601,14 @@ def test_rejected_apply_result_has_no_remote_details() -> None:
     )
 
     assert payload == {
+        "schema": 1,
         "type": "apply_result",
         "request_id": "request-42",
         "status": "rejected",
         "target_id": None,
         "source": None,
     }
-    assert parse_apply_result(payload) == ApplyResult(
+    assert parse_apply_result(_selection(), payload) == ApplyResult(
         request_id="request-42",
         status=ApplyResultStatus.REJECTED,
         target_id=None,
@@ -1064,12 +1619,14 @@ def test_rejected_apply_result_has_no_remote_details() -> None:
 def test_apply_result_parser_rejects_extensions_and_malformed_results() -> None:
     """Results cannot add error details or contradict their status."""
     confirmed = build_apply_result(
+        _selection(),
         "request-42",
         ApplyResultStatus.CONFIRMED,
         "123",
         _source_identity(),
     )
     rejected = build_apply_result(
+        _selection(),
         "request-42",
         ApplyResultStatus.REJECTED,
         None,
@@ -1083,6 +1640,9 @@ def test_apply_result_parser_rejects_extensions_and_malformed_results() -> None:
     missing_result_field = deepcopy(rejected)
     del missing_result_field["source"]
     mutations.append(missing_result_field)
+    wrong_schema = deepcopy(rejected)
+    wrong_schema["schema"] = 2
+    mutations.append(wrong_schema)
     unknown_status = deepcopy(rejected)
     unknown_status["status"] = "failed"
     mutations.append(unknown_status)
@@ -1110,7 +1670,7 @@ def test_apply_result_parser_rejects_extensions_and_malformed_results() -> None:
             ProtocolFormatError,
             match="^invalid protocol message$",
         ):
-            parse_apply_result(mutation)
+            parse_apply_result(_selection(), mutation)
 
 
 def test_apply_result_builder_requires_enum_and_consistent_fields() -> None:
@@ -1129,6 +1689,7 @@ def test_apply_result_builder_requires_enum_and_consistent_fields() -> None:
             match="^invalid protocol message$",
         ):
             build_apply_result(
+                _selection(),
                 "request-42",
                 status,
                 target_id,

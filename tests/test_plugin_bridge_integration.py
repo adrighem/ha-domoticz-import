@@ -339,6 +339,11 @@ async def _open_plugin_connection(
     assert isinstance(request_headers, dict)
     upgrade_key = request_headers["Sec-WebSocket-Key"]
     assert isinstance(upgrade_key, str)
+    protocol_header = request_headers["Sec-WebSocket-Protocol"]
+    assert isinstance(protocol_header, str)
+    protocols = tuple(
+        protocol.strip() for protocol in protocol_header.split(",") if protocol.strip()
+    )
     decoded_upgrade_key = base64.b64decode(upgrade_key, validate=True)
 
     with monkeypatch.context() as websocket_key_patch:
@@ -350,6 +355,7 @@ async def _open_plugin_connection(
         websocket = await client.ws_connect(
             upgrade_request["URL"],
             origin=request_headers["Origin"],
+            protocols=protocols,
             compress=0,
         )
 
@@ -472,6 +478,11 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
     assert isinstance(request_headers, dict)
     upgrade_key = request_headers["Sec-WebSocket-Key"]
     assert isinstance(upgrade_key, str)
+    protocol_header = request_headers["Sec-WebSocket-Protocol"]
+    assert isinstance(protocol_header, str)
+    protocols = tuple(
+        protocol.strip() for protocol in protocol_header.split(",") if protocol.strip()
+    )
     decoded_upgrade_key = base64.b64decode(upgrade_key, validate=True)
 
     # aiohttp normally generates its own key. Supplying the plugin's key here
@@ -485,6 +496,7 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
         websocket = await client.ws_connect(
             upgrade_request["URL"],
             origin=request_headers["Origin"],
+            protocols=protocols,
             compress=0,
         )
 

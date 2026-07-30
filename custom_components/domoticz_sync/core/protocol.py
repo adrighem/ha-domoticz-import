@@ -15,12 +15,21 @@ import re
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
 from .reconciliation import ReconciliationAction, ReconciliationActionKind
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION_V1 = 1
+# Backward-compatible public name retained for the frozen legacy v1 codec.
+# It deliberately does not mean "latest protocol version."
+PROTOCOL_VERSION = PROTOCOL_VERSION_V1
+PROTOCOL_VERSION_V2 = 2
+
+WEBSOCKET_SUBPROTOCOL_V2 = "ha-domoticz-sync.v2"
+FEATURE_HA_EXPORT_NUMERIC_V1 = "ha-export.numeric.v1"
+SUPPORTED_WEBSOCKET_SUBPROTOCOLS = (WEBSOCKET_SUBPROTOCOL_V2,)
+SUPPORTED_V2_FEATURES = (FEATURE_HA_EXPORT_NUMERIC_V1,)
 
 DIRECTION_DOMOTICZ_TO_HA = "domoticz_to_home_assistant"
 DIRECTION_HA_TO_DOMOTICZ = "home_assistant_to_domoticz"
@@ -31,12 +40,15 @@ MAX_MESSAGE_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 32
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEQUENCE = MAX_SAFE_INTEGER
+MAX_PROTOCOL_TOKENS = 16
+MAX_FEATURE_IDS = 64
 
 _SECRET_BYTES = PAIRING_KEY_BITS // 8
 _NONCE_BYTES = NONCE_BITS // 8
 _TOKEN_BYTES = 32
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_WEBSOCKET_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
 _TOKEN_DECODE_ERRORS = (UnicodeError, TypeError, ValueError)
 _DIRECTIONS = {
     DIRECTION_DOMOTICZ_TO_HA,
@@ -47,8 +59,30 @@ _HELLO_KEYS = {"version", "type", "link_id", "destination_id", "client_nonce"}
 _CHALLENGE_KEYS = {"version", "type", "server_nonce", "server_proof"}
 _AUTHENTICATE_KEYS = {"version", "type", "client_proof"}
 _READY_KEYS = {"version", "type", "session_id"}
-_APPLY_KEYS = {"type", "request_id", "action"}
+_V2_HELLO_KEYS = {
+    "version",
+    "type",
+    "link_id",
+    "destination_id",
+    "client_nonce",
+    "client_protocols",
+    "selected_protocol",
+    "client_features",
+}
+_V2_CHALLENGE_KEYS = {
+    "version",
+    "type",
+    "server_nonce",
+    "server_protocols",
+    "selected_protocol",
+    "server_features",
+    "selected_features",
+    "server_proof",
+}
+_APPLICATION_READY_KEYS = {"schema", "type"}
+_APPLY_KEYS = {"schema", "type", "request_id", "action"}
 _APPLY_RESULT_KEYS = {
+    "schema",
     "type",
     "request_id",
     "status",
@@ -85,13 +119,21 @@ _SESSION_KEY_DOMAIN = _PROTOCOL_DOMAIN + b"session-key\x00"
 _SESSION_ID_DOMAIN = _PROTOCOL_DOMAIN + b"session-id\x00"
 _ENVELOPE_DOMAIN = _PROTOCOL_DOMAIN + b"envelope\x00"
 
+_V2_PROTOCOL_DOMAIN = b"ha-domoticz-sync/protocol/v2/"
+_V2_CLIENT_PROOF_DOMAIN = _V2_PROTOCOL_DOMAIN + b"client-proof\x00"
+_V2_SERVER_PROOF_DOMAIN = _V2_PROTOCOL_DOMAIN + b"server-proof\x00"
+_V2_SESSION_SALT_DOMAIN = _V2_PROTOCOL_DOMAIN + b"session-salt\x00"
+_V2_SESSION_KEY_DOMAIN = _V2_PROTOCOL_DOMAIN + b"session-key\x00"
+_V2_SESSION_ID_DOMAIN = _V2_PROTOCOL_DOMAIN + b"session-id\x00"
+_V2_ENVELOPE_DOMAIN = _V2_PROTOCOL_DOMAIN + b"envelope\x00"
+
 
 class ProtocolError(ValueError):
     """Base class for safe protocol failures."""
 
 
 class ProtocolFormatError(ProtocolError):
-    """A protocol document or value does not match the v1 format."""
+    """A protocol document or value does not match its selected format."""
 
 
 class ProtocolAuthenticationError(ProtocolError):
@@ -100,6 +142,10 @@ class ProtocolAuthenticationError(ProtocolError):
 
 class ProtocolSequenceError(ProtocolError):
     """An authenticated envelope is replayed, missing, or out of order."""
+
+
+class ProtocolCompatibilityError(ProtocolError):
+    """The peers have no mutually supported authenticated behavior."""
 
 
 class ApplyResultStatus(str, Enum):
@@ -139,6 +185,118 @@ class HandshakeContext:
         validate_destination_id(self.destination_id)
         validate_nonce(self.client_nonce)
         validate_nonce(self.server_nonce)
+
+
+@dataclass(frozen=True)
+class ProtocolSelection:
+    """One authenticated wire version and its negotiated optional features."""
+
+    version: int
+    websocket_subprotocol: str
+    features: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as strictly as handshake selection."""
+        if self.version != PROTOCOL_VERSION_V2:
+            raise ProtocolFormatError("invalid protocol message")
+        if self.websocket_subprotocol != WEBSOCKET_SUBPROTOCOL_V2:
+            raise ProtocolFormatError("invalid protocol message")
+        if type(self.features) is not tuple:
+            raise ProtocolFormatError("invalid protocol message")
+        validate_feature_ids(self.features)
+
+    def supports(self, feature: str) -> bool:
+        """Return whether one optional behavior was mutually negotiated."""
+        _validate_feature_id(feature)
+        return feature in self.features
+
+
+@dataclass(frozen=True)
+class V2ClientHello:
+    """The authenticated repeat of the HTTP WebSocket negotiation offer."""
+
+    link_id: str
+    destination_id: str
+    client_nonce: str
+    client_protocols: Tuple[str, ...]
+    selected_protocol: str
+    client_features: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as strictly as parsed input."""
+        validate_link_id(self.link_id)
+        validate_destination_id(self.destination_id)
+        validate_nonce(self.client_nonce)
+        if (
+            type(self.client_protocols) is not tuple
+            or type(self.client_features) is not tuple
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+        protocols = validate_protocol_tokens(self.client_protocols)
+        if (
+            self.selected_protocol != WEBSOCKET_SUBPROTOCOL_V2
+            or self.selected_protocol not in protocols
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+        validate_feature_ids(self.client_features)
+
+
+@dataclass(frozen=True)
+class V2HandshakeContext:
+    """Every public v2 negotiation value bound into authentication and KDF."""
+
+    link_id: str
+    destination_id: str
+    client_nonce: str
+    server_nonce: str
+    client_protocols: Tuple[str, ...]
+    server_protocols: Tuple[str, ...]
+    selected_protocol: str
+    client_features: Tuple[str, ...]
+    server_features: Tuple[str, ...]
+    selected_features: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Require one complete deterministic negotiation transcript."""
+        validate_link_id(self.link_id)
+        validate_destination_id(self.destination_id)
+        validate_nonce(self.client_nonce)
+        validate_nonce(self.server_nonce)
+        if any(
+            type(value) is not tuple
+            for value in (
+                self.client_protocols,
+                self.server_protocols,
+                self.client_features,
+                self.server_features,
+                self.selected_features,
+            )
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+        expected_protocol = select_websocket_subprotocol(
+            self.client_protocols,
+            self.server_protocols,
+        )
+        if (
+            self.selected_protocol != WEBSOCKET_SUBPROTOCOL_V2
+            or self.selected_protocol != expected_protocol
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+        expected_features = negotiate_features(
+            self.client_features,
+            self.server_features,
+        )
+        if self.selected_features != expected_features:
+            raise ProtocolFormatError("invalid protocol message")
+
+    @property
+    def selection(self) -> ProtocolSelection:
+        """Return the immutable application contract selected by this context."""
+        return ProtocolSelection(
+            version=PROTOCOL_VERSION_V2,
+            websocket_subprotocol=self.selected_protocol,
+            features=self.selected_features,
+        )
 
 
 @dataclass(frozen=True)
@@ -217,7 +375,7 @@ def canonical_json_bytes(value: object) -> bytes:
 
 
 def canonical_json_loads(value: Union[str, bytes]) -> object:
-    """Parse a document only when its complete encoding is canonical v1 JSON."""
+    """Parse a document only when its complete encoding is canonical JSON."""
     try:
         if type(value) is bytes:
             if len(value) > MAX_MESSAGE_BYTES:
@@ -294,6 +452,62 @@ def generate_destination_id() -> str:
 def validate_destination_id(value: object) -> None:
     """Require one conservative, log-safe destination identifier."""
     _validate_identifier(value)
+
+
+def validate_protocol_tokens(value: object) -> Tuple[str, ...]:
+    """Return one bounded, ordered, duplicate-free WebSocket protocol offer."""
+    if type(value) not in {list, tuple}:
+        raise ProtocolFormatError("invalid protocol message")
+    if not 1 <= len(value) <= MAX_PROTOCOL_TOKENS:
+        raise ProtocolFormatError("invalid protocol message")
+
+    result: List[str] = []
+    seen = set()
+    for token in value:
+        if (
+            type(token) is not str
+            or _WEBSOCKET_TOKEN_RE.fullmatch(token) is None
+            or token in seen
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+        seen.add(token)
+        result.append(token)
+    return tuple(result)
+
+
+def validate_feature_ids(value: object) -> Tuple[str, ...]:
+    """Return one bounded, sorted, duplicate-free optional feature list."""
+    if type(value) not in {list, tuple} or len(value) > MAX_FEATURE_IDS:
+        raise ProtocolFormatError("invalid protocol message")
+
+    result: List[str] = []
+    for feature in value:
+        _validate_feature_id(feature)
+        result.append(feature)
+    if result != sorted(result) or len(result) != len(set(result)):
+        raise ProtocolFormatError("invalid protocol message")
+    return tuple(result)
+
+
+def select_websocket_subprotocol(
+    client_protocols: object,
+    server_protocols: object,
+) -> Optional[str]:
+    """Select the first client-preferred protocol supported by the server."""
+    client = validate_protocol_tokens(client_protocols)
+    server = validate_protocol_tokens(server_protocols)
+    supported = set(server)
+    return next((token for token in client if token in supported), None)
+
+
+def negotiate_features(
+    client_features: object,
+    server_features: object,
+) -> Tuple[str, ...]:
+    """Return the deterministic sorted feature intersection."""
+    client = validate_feature_ids(client_features)
+    server = validate_feature_ids(server_features)
+    return tuple(sorted(set(client).intersection(server)))
 
 
 def build_hello(
@@ -482,9 +696,267 @@ def verify_ready(
     return expected_id
 
 
+def build_v2_hello(
+    link_id: str,
+    destination_id: str,
+    client_nonce: str,
+    *,
+    client_protocols: Sequence[str],
+    selected_protocol: str,
+    client_features: Sequence[str],
+) -> Dict[str, object]:
+    """Build the authenticated repeat of the HTTP protocol negotiation."""
+    hello = V2ClientHello(
+        link_id=link_id,
+        destination_id=destination_id,
+        client_nonce=client_nonce,
+        client_protocols=validate_protocol_tokens(client_protocols),
+        selected_protocol=selected_protocol,
+        client_features=validate_feature_ids(client_features),
+    )
+    return {
+        "version": PROTOCOL_VERSION_V2,
+        "type": "hello",
+        "link_id": hello.link_id,
+        "destination_id": hello.destination_id,
+        "client_nonce": hello.client_nonce,
+        "client_protocols": list(hello.client_protocols),
+        "selected_protocol": hello.selected_protocol,
+        "client_features": list(hello.client_features),
+    }
+
+
+def parse_v2_hello(document: object) -> V2ClientHello:
+    """Parse one exact v2 client hello."""
+    data = _require_versioned_message(
+        document,
+        _V2_HELLO_KEYS,
+        "hello",
+        PROTOCOL_VERSION_V2,
+    )
+    return V2ClientHello(
+        link_id=_require_string(data["link_id"]),
+        destination_id=_require_string(data["destination_id"]),
+        client_nonce=_require_string(data["client_nonce"]),
+        client_protocols=_require_wire_protocol_tokens(data["client_protocols"]),
+        selected_protocol=_require_string(data["selected_protocol"]),
+        client_features=_require_wire_feature_ids(data["client_features"]),
+    )
+
+
+def make_v2_handshake_context(
+    hello: V2ClientHello,
+    server_nonce: str,
+    *,
+    server_protocols: Sequence[str],
+    server_features: Sequence[str],
+) -> V2HandshakeContext:
+    """Select and bind one deterministic v2 protocol and feature intersection."""
+    if not isinstance(hello, V2ClientHello):
+        raise ProtocolFormatError("invalid protocol message")
+    protocols = validate_protocol_tokens(server_protocols)
+    selected_protocol = select_websocket_subprotocol(
+        hello.client_protocols,
+        protocols,
+    )
+    if selected_protocol is None:
+        raise ProtocolCompatibilityError("incompatible protocol")
+    if selected_protocol != hello.selected_protocol:
+        raise ProtocolFormatError("invalid protocol message")
+
+    features = validate_feature_ids(server_features)
+    selected_features = negotiate_features(hello.client_features, features)
+    return V2HandshakeContext(
+        link_id=hello.link_id,
+        destination_id=hello.destination_id,
+        client_nonce=hello.client_nonce,
+        server_nonce=server_nonce,
+        client_protocols=hello.client_protocols,
+        server_protocols=protocols,
+        selected_protocol=selected_protocol,
+        client_features=hello.client_features,
+        server_features=features,
+        selected_features=selected_features,
+    )
+
+
+def create_v2_client_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+) -> str:
+    """Create the v2 Domoticz proof for the complete negotiation transcript."""
+    return _create_v2_proof(pairing_key, context, _V2_CLIENT_PROOF_DOMAIN)
+
+
+def verify_v2_client_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+    proof: object,
+) -> None:
+    """Verify the v2 Domoticz proof in constant time."""
+    _verify_v2_proof(pairing_key, context, proof, _V2_CLIENT_PROOF_DOMAIN)
+
+
+def create_v2_server_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+) -> str:
+    """Create the v2 Home Assistant proof for the complete transcript."""
+    return _create_v2_proof(pairing_key, context, _V2_SERVER_PROOF_DOMAIN)
+
+
+def verify_v2_server_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+    proof: object,
+) -> None:
+    """Verify the v2 Home Assistant proof in constant time."""
+    _verify_v2_proof(pairing_key, context, proof, _V2_SERVER_PROOF_DOMAIN)
+
+
+def build_v2_challenge(
+    pairing_key: str,
+    context: V2HandshakeContext,
+) -> Dict[str, object]:
+    """Build the exact v2 server selection and transcript-bound proof."""
+    validated = _require_v2_context(context)
+    return {
+        "version": PROTOCOL_VERSION_V2,
+        "type": "challenge",
+        "server_nonce": validated.server_nonce,
+        "server_protocols": list(validated.server_protocols),
+        "selected_protocol": validated.selected_protocol,
+        "server_features": list(validated.server_features),
+        "selected_features": list(validated.selected_features),
+        "server_proof": create_v2_server_proof(pairing_key, validated),
+    }
+
+
+def accept_v2_challenge(
+    pairing_key: str,
+    hello: V2ClientHello,
+    document: object,
+) -> V2HandshakeContext:
+    """Parse and authenticate one deterministic v2 server selection."""
+    if not isinstance(hello, V2ClientHello):
+        raise ProtocolFormatError("invalid protocol message")
+    data = _require_versioned_message(
+        document,
+        _V2_CHALLENGE_KEYS,
+        "challenge",
+        PROTOCOL_VERSION_V2,
+    )
+    context = make_v2_handshake_context(
+        hello,
+        _require_string(data["server_nonce"]),
+        server_protocols=_require_wire_protocol_tokens(data["server_protocols"]),
+        server_features=_require_wire_feature_ids(data["server_features"]),
+    )
+    selected_features = _require_wire_feature_ids(data["selected_features"])
+    if (
+        data["selected_protocol"] != context.selected_protocol
+        or selected_features != context.selected_features
+    ):
+        raise ProtocolFormatError("invalid protocol message")
+    verify_v2_server_proof(pairing_key, context, data["server_proof"])
+    return context
+
+
+def build_v2_authenticate(
+    pairing_key: str,
+    context: V2HandshakeContext,
+) -> Dict[str, object]:
+    """Build the v2 client's proof of the authenticated selection."""
+    validated = _require_v2_context(context)
+    return {
+        "version": PROTOCOL_VERSION_V2,
+        "type": "authenticate",
+        "client_proof": create_v2_client_proof(pairing_key, validated),
+    }
+
+
+def verify_v2_authenticate(
+    pairing_key: str,
+    context: V2HandshakeContext,
+    document: object,
+) -> None:
+    """Parse and authenticate the v2 client's response."""
+    validated = _require_v2_context(context)
+    data = _require_versioned_message(
+        document,
+        _AUTHENTICATE_KEYS,
+        "authenticate",
+        PROTOCOL_VERSION_V2,
+    )
+    verify_v2_client_proof(pairing_key, validated, data["client_proof"])
+
+
+def derive_v2_session_key(
+    pairing_key: str,
+    context: V2HandshakeContext,
+) -> bytes:
+    """Derive a v2 session key bound to protocol and feature negotiation."""
+    key = _pairing_key_bytes(pairing_key)
+    transcript = _v2_transcript_bytes(context)
+    salt = hashlib.sha256(_V2_SESSION_SALT_DOMAIN + transcript).digest()
+    extracted = hmac.new(salt, key, hashlib.sha256).digest()
+    return hmac.new(
+        extracted,
+        _V2_SESSION_KEY_DOMAIN + transcript + b"\x01",
+        hashlib.sha256,
+    ).digest()
+
+
+def derive_v2_session_id(
+    session_key: bytes,
+    context: V2HandshakeContext,
+) -> str:
+    """Derive the v2 secret-bound identifier for one negotiated session."""
+    key = _validate_session_key(session_key)
+    digest = hmac.new(
+        key,
+        _V2_SESSION_ID_DOMAIN + _v2_transcript_bytes(context),
+        hashlib.sha256,
+    ).digest()
+    return _encode_token(digest)
+
+
+def build_v2_ready(
+    session_key: bytes,
+    context: V2HandshakeContext,
+) -> Dict[str, object]:
+    """Build the final v2 server handshake message."""
+    return {
+        "version": PROTOCOL_VERSION_V2,
+        "type": "ready",
+        "session_id": derive_v2_session_id(session_key, context),
+    }
+
+
+def verify_v2_ready(
+    session_key: bytes,
+    context: V2HandshakeContext,
+    document: object,
+) -> str:
+    """Verify the final v2 secret-bound session identifier."""
+    data = _require_versioned_message(
+        document,
+        _READY_KEYS,
+        "ready",
+        PROTOCOL_VERSION_V2,
+    )
+    received = _token_bytes(data["session_id"])
+    expected_id = derive_v2_session_id(session_key, context)
+    expected = _token_bytes(expected_id)
+    if not hmac.compare_digest(received, expected):
+        raise ProtocolAuthenticationError("protocol authentication failed")
+    return expected_id
+
+
 def sign_envelope(
     session_key: bytes,
     *,
+    protocol_version: int,
     direction: str,
     session_id: str,
     sequence: int,
@@ -492,11 +964,13 @@ def sign_envelope(
 ) -> Dict[str, object]:
     """Build and sign one directional application envelope."""
     key = _validate_session_key(session_key)
+    domain = _envelope_domain(protocol_version)
     _validate_direction(direction)
     _token_bytes(session_id)
     _validate_positive_sequence(sequence)
     normalized_payload = _normalize_payload(payload)
     unsigned = _unsigned_envelope(
+        protocol_version,
         direction,
         session_id,
         sequence,
@@ -504,7 +978,7 @@ def sign_envelope(
     )
     signature = hmac.new(
         key,
-        _ENVELOPE_DOMAIN + canonical_json_bytes(unsigned),
+        domain + canonical_json_bytes(unsigned),
         hashlib.sha256,
     ).digest()
     envelope = dict(unsigned)
@@ -516,17 +990,24 @@ def verify_envelope(
     session_key: bytes,
     document: object,
     *,
+    protocol_version: int,
     expected_direction: str,
     expected_session_id: str,
     last_sequence: int,
 ) -> VerifiedEnvelope:
     """Authenticate one envelope and require the exact next sequence number."""
     key = _validate_session_key(session_key)
+    domain = _envelope_domain(protocol_version)
     _validate_direction(expected_direction)
     expected_session = _token_bytes(expected_session_id)
     _validate_last_sequence(last_sequence)
 
-    data = _require_message(document, _ENVELOPE_KEYS, "message")
+    data = _require_versioned_message(
+        document,
+        _ENVELOPE_KEYS,
+        "message",
+        protocol_version,
+    )
     direction = _require_string(data["direction"])
     _validate_direction(direction)
     session_id = _require_string(data["session_id"])
@@ -536,10 +1017,16 @@ def verify_envelope(
     payload = _normalize_payload(data["payload"])
     signature = _token_bytes(data["signature"])
 
-    unsigned = _unsigned_envelope(direction, session_id, sequence, payload)
+    unsigned = _unsigned_envelope(
+        protocol_version,
+        direction,
+        session_id,
+        sequence,
+        payload,
+    )
     expected_signature = hmac.new(
         key,
-        _ENVELOPE_DOMAIN + canonical_json_bytes(unsigned),
+        domain + canonical_json_bytes(unsigned),
         hashlib.sha256,
     ).digest()
     if not hmac.compare_digest(signature, expected_signature):
@@ -560,14 +1047,40 @@ def verify_envelope(
     )
 
 
+def build_application_ready(
+    selection: ProtocolSelection,
+) -> Dict[str, object]:
+    """Build the feature-independent v2 application lifecycle message."""
+    _require_v2_selection(selection)
+    return {"schema": 1, "type": "application_ready"}
+
+
+def parse_application_ready(
+    selection: ProtocolSelection,
+    document: object,
+) -> None:
+    """Parse the exact feature-independent v2 lifecycle message."""
+    _require_v2_selection(selection)
+    _require_application_message(
+        _normalize_payload(document),
+        _APPLICATION_READY_KEYS,
+        "application_ready",
+    )
+
+
 def build_apply(
+    selection: ProtocolSelection,
     request_id: str,
     action: ReconciliationAction,
 ) -> Dict[str, object]:
     """Build one strict Home Assistant-to-Domoticz application request."""
+    _require_numeric_export_selection(selection)
     request = ApplyRequest(request_id=request_id, action=action)
+    if request.action.capability.kind is not CapabilityKind.NUMERIC:
+        raise ProtocolFormatError("invalid protocol message")
     return _normalize_payload(
         {
+            "schema": 1,
             "type": "apply",
             "request_id": request.request_id,
             "action": _action_to_dict(request.action),
@@ -575,29 +1088,38 @@ def build_apply(
     )
 
 
-def parse_apply(document: object) -> ApplyRequest:
+def parse_apply(
+    selection: ProtocolSelection,
+    document: object,
+) -> ApplyRequest:
     """Parse one exact application request into the neutral action model."""
+    _require_numeric_export_selection(selection)
     try:
         data = _require_application_message(
             _normalize_payload(document),
             _APPLY_KEYS,
             "apply",
         )
-        return ApplyRequest(
+        request = ApplyRequest(
             request_id=_require_string(data["request_id"]),
             action=_action_from_dict(data["action"]),
         )
+        if request.action.capability.kind is not CapabilityKind.NUMERIC:
+            raise ProtocolFormatError("invalid protocol message")
+        return request
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ProtocolFormatError("invalid protocol message") from None
 
 
 def build_apply_result(
+    selection: ProtocolSelection,
     request_id: str,
     status: ApplyResultStatus,
     target_id: Optional[str],
     source: Optional[SourceIdentity],
 ) -> Dict[str, object]:
     """Build one strict Domoticz-to-Home Assistant action result."""
+    _require_numeric_export_selection(selection)
     result = ApplyResult(
         request_id=request_id,
         status=status,
@@ -606,6 +1128,7 @@ def build_apply_result(
     )
     return _normalize_payload(
         {
+            "schema": 1,
             "type": "apply_result",
             "request_id": result.request_id,
             "status": result.status.value,
@@ -617,8 +1140,12 @@ def build_apply_result(
     )
 
 
-def parse_apply_result(document: object) -> ApplyResult:
+def parse_apply_result(
+    selection: ProtocolSelection,
+    document: object,
+) -> ApplyResult:
     """Parse one exact action result without accepting remote error details."""
+    _require_numeric_export_selection(selection)
     try:
         data = _require_application_message(
             _normalize_payload(document),
@@ -697,6 +1224,11 @@ def _validate_identifier(value: object) -> None:
         raise ProtocolFormatError("invalid protocol message")
 
 
+def _validate_feature_id(value: object) -> None:
+    """Require one conservative feature identifier safe for diagnostics."""
+    _validate_identifier(value)
+
+
 def _validate_request_id(value: object) -> None:
     """Require a bounded, log-safe request correlation identifier."""
     _validate_identifier(value)
@@ -733,6 +1265,20 @@ def _require_string(value: object) -> str:
     return value
 
 
+def _require_wire_protocol_tokens(value: object) -> Tuple[str, ...]:
+    """Parse a JSON array containing an ordered WebSocket protocol offer."""
+    if type(value) is not list:
+        raise ProtocolFormatError("invalid protocol message")
+    return validate_protocol_tokens(value)
+
+
+def _require_wire_feature_ids(value: object) -> Tuple[str, ...]:
+    """Parse a JSON array containing sorted optional feature identifiers."""
+    if type(value) is not list:
+        raise ProtocolFormatError("invalid protocol message")
+    return validate_feature_ids(value)
+
+
 def _require_message(
     document: object,
     expected_keys: set,
@@ -750,6 +1296,24 @@ def _require_message(
     return document
 
 
+def _require_versioned_message(
+    document: object,
+    expected_keys: set,
+    expected_type: str,
+    expected_version: int,
+) -> Dict[str, object]:
+    """Require exact keys and one explicitly selected supported wire version."""
+    if expected_version not in {PROTOCOL_VERSION, PROTOCOL_VERSION_V2}:
+        raise ProtocolFormatError("invalid protocol message")
+    if type(document) is not dict or set(document) != expected_keys:
+        raise ProtocolFormatError("invalid protocol message")
+    if type(document["version"]) is not int or document["version"] != expected_version:
+        raise ProtocolFormatError("invalid protocol message")
+    if type(document["type"]) is not str or document["type"] != expected_type:
+        raise ProtocolFormatError("invalid protocol message")
+    return document
+
+
 def _require_application_message(
     document: object,
     expected_keys: set,
@@ -757,6 +1321,8 @@ def _require_application_message(
 ) -> Dict[str, object]:
     """Require one exact application payload and its discriminator."""
     if type(document) is not dict or set(document) != expected_keys:
+        raise ProtocolFormatError("invalid protocol message")
+    if type(document["schema"]) is not int or document["schema"] != 1:
         raise ProtocolFormatError("invalid protocol message")
     if type(document["type"]) is not str or document["type"] != expected_type:
         raise ProtocolFormatError("invalid protocol message")
@@ -770,6 +1336,35 @@ def _require_context(context: object) -> HandshakeContext:
     return context
 
 
+def _require_v2_context(context: object) -> V2HandshakeContext:
+    """Require one validated v2 handshake context."""
+    if not isinstance(context, V2HandshakeContext):
+        raise ProtocolFormatError("invalid protocol message")
+    return context
+
+
+def _require_v2_selection(selection: object) -> ProtocolSelection:
+    """Require an authenticated v2 protocol selection."""
+    if not isinstance(selection, ProtocolSelection):
+        raise ProtocolFormatError("invalid protocol message")
+    if (
+        selection.version != PROTOCOL_VERSION_V2
+        or selection.websocket_subprotocol != WEBSOCKET_SUBPROTOCOL_V2
+    ):
+        raise ProtocolFormatError("invalid protocol message")
+    return selection
+
+
+def _require_numeric_export_selection(
+    selection: object,
+) -> ProtocolSelection:
+    """Require the negotiated Home Assistant numeric export behavior."""
+    validated = _require_v2_selection(selection)
+    if not validated.supports(FEATURE_HA_EXPORT_NUMERIC_V1):
+        raise ProtocolCompatibilityError("incompatible protocol")
+    return validated
+
+
 def _transcript_bytes(context: HandshakeContext) -> bytes:
     """Return the canonical public handshake transcript."""
     validated = _require_context(context)
@@ -780,6 +1375,26 @@ def _transcript_bytes(context: HandshakeContext) -> bytes:
             "destination_id": validated.destination_id,
             "client_nonce": validated.client_nonce,
             "server_nonce": validated.server_nonce,
+        }
+    )
+
+
+def _v2_transcript_bytes(context: V2HandshakeContext) -> bytes:
+    """Return the canonical complete v2 negotiation transcript."""
+    validated = _require_v2_context(context)
+    return canonical_json_bytes(
+        {
+            "version": PROTOCOL_VERSION_V2,
+            "link_id": validated.link_id,
+            "destination_id": validated.destination_id,
+            "client_nonce": validated.client_nonce,
+            "server_nonce": validated.server_nonce,
+            "client_protocols": list(validated.client_protocols),
+            "server_protocols": list(validated.server_protocols),
+            "selected_protocol": validated.selected_protocol,
+            "client_features": list(validated.client_features),
+            "server_features": list(validated.server_features),
+            "selected_features": list(validated.selected_features),
         }
     )
 
@@ -810,6 +1425,43 @@ def _verify_proof(
     expected = _token_bytes(_create_proof(pairing_key, context, domain))
     if not hmac.compare_digest(received, expected):
         raise ProtocolAuthenticationError("protocol authentication failed")
+
+
+def _create_v2_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+    domain: bytes,
+) -> str:
+    """Create one role-separated v2 negotiation proof."""
+    key = _pairing_key_bytes(pairing_key)
+    proof = hmac.new(
+        key,
+        domain + _v2_transcript_bytes(context),
+        hashlib.sha256,
+    ).digest()
+    return _encode_token(proof)
+
+
+def _verify_v2_proof(
+    pairing_key: str,
+    context: V2HandshakeContext,
+    proof: object,
+    domain: bytes,
+) -> None:
+    """Authenticate one v2 proof in constant time."""
+    received = _token_bytes(proof)
+    expected = _token_bytes(_create_v2_proof(pairing_key, context, domain))
+    if not hmac.compare_digest(received, expected):
+        raise ProtocolAuthenticationError("protocol authentication failed")
+
+
+def _envelope_domain(protocol_version: object) -> bytes:
+    """Return the role-independent MAC domain for one supported wire version."""
+    if protocol_version == PROTOCOL_VERSION and type(protocol_version) is int:
+        return _ENVELOPE_DOMAIN
+    if protocol_version == PROTOCOL_VERSION_V2 and type(protocol_version) is int:
+        return _V2_ENVELOPE_DOMAIN
+    raise ProtocolFormatError("invalid protocol message")
 
 
 def _pairing_key_bytes(pairing_key: object) -> bytes:
@@ -946,6 +1598,7 @@ def _require_exact_object(document: object, expected_keys: set) -> None:
 
 
 def _unsigned_envelope(
+    protocol_version: int,
     direction: str,
     session_id: str,
     sequence: int,
@@ -953,7 +1606,7 @@ def _unsigned_envelope(
 ) -> Dict[str, object]:
     """Return the exact application fields covered by the envelope MAC."""
     return {
-        "version": PROTOCOL_VERSION,
+        "version": protocol_version,
         "type": "message",
         "session_id": session_id,
         "direction": direction,
@@ -965,52 +1618,85 @@ def _unsigned_envelope(
 __all__ = [
     "DIRECTION_DOMOTICZ_TO_HA",
     "DIRECTION_HA_TO_DOMOTICZ",
+    "FEATURE_HA_EXPORT_NUMERIC_V1",
+    "MAX_FEATURE_IDS",
     "MAX_MESSAGE_BYTES",
+    "MAX_PROTOCOL_TOKENS",
     "MAX_SEQUENCE",
     "NONCE_BITS",
     "PAIRING_KEY_BITS",
     "PROTOCOL_VERSION",
+    "PROTOCOL_VERSION_V1",
+    "PROTOCOL_VERSION_V2",
+    "SUPPORTED_V2_FEATURES",
+    "SUPPORTED_WEBSOCKET_SUBPROTOCOLS",
+    "WEBSOCKET_SUBPROTOCOL_V2",
     "ApplyRequest",
     "ApplyResult",
     "ApplyResultStatus",
     "ClientHello",
     "HandshakeContext",
     "ProtocolAuthenticationError",
+    "ProtocolCompatibilityError",
     "ProtocolError",
     "ProtocolFormatError",
+    "ProtocolSelection",
     "ProtocolSequenceError",
+    "V2ClientHello",
+    "V2HandshakeContext",
     "VerifiedEnvelope",
     "accept_challenge",
+    "accept_v2_challenge",
+    "build_application_ready",
     "build_apply",
     "build_apply_result",
     "build_authenticate",
     "build_challenge",
     "build_hello",
     "build_ready",
+    "build_v2_authenticate",
+    "build_v2_challenge",
+    "build_v2_hello",
+    "build_v2_ready",
     "canonical_json_bytes",
     "canonical_json_dumps",
     "canonical_json_loads",
     "create_client_proof",
     "create_server_proof",
+    "create_v2_client_proof",
+    "create_v2_server_proof",
     "derive_session_id",
     "derive_session_key",
+    "derive_v2_session_id",
+    "derive_v2_session_key",
     "generate_destination_id",
     "generate_link_id",
     "generate_nonce",
     "generate_pairing_key",
     "generate_request_id",
     "make_handshake_context",
-    "parse_hello",
+    "make_v2_handshake_context",
+    "negotiate_features",
     "parse_apply",
     "parse_apply_result",
+    "parse_application_ready",
+    "parse_hello",
+    "parse_v2_hello",
+    "select_websocket_subprotocol",
     "sign_envelope",
     "validate_destination_id",
+    "validate_feature_ids",
     "validate_link_id",
     "validate_nonce",
     "validate_pairing_key",
+    "validate_protocol_tokens",
     "verify_authenticate",
     "verify_client_proof",
     "verify_envelope",
     "verify_ready",
     "verify_server_proof",
+    "verify_v2_authenticate",
+    "verify_v2_client_proof",
+    "verify_v2_ready",
+    "verify_v2_server_proof",
 ]
