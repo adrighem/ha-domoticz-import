@@ -115,6 +115,42 @@ Matching release tags remain the recommended installation because they provide
 the same tested feature set on both sides. Negotiation makes rolling upgrades
 safe; it is not a reason to run unrelated versions indefinitely.
 
+## Rolling Upgrade Verification
+
+Exercise intentional mixed-version states on a test pair. Before each sequence,
+select representative directly labelled entities and record the number of
+sync-owned Domoticz targets. Do not record Link IDs, pairing keys, or other
+credentials.
+
+### Home Assistant first
+
+1. Keep the Domoticz plugin on the starting release and update Home Assistant.
+2. After Home Assistant restarts, confirm that the existing plugin reconnects.
+3. Verify that a v1-only overlap remains heartbeat-only, or that a v2 overlap
+   advertises and uses only the feature intersection.
+4. Update the plugin to the target release, restart Domoticz, and confirm that
+   protocol v2 selects the expected features.
+5. Reconnect again and verify that existing source identities were reused
+   without duplicate targets.
+
+### Domoticz plugin first
+
+1. Keep Home Assistant on the starting release and update the Domoticz plugin.
+2. After Domoticz restarts, confirm the same safe intermediate behavior:
+   heartbeat-only v1 or only mutually selected v2 features.
+3. Update Home Assistant to the target release and restart Home Assistant.
+4. Confirm protocol v2 and the expected feature set.
+5. Reconnect again and verify that existing source identities were reused
+   without duplicate targets.
+
+### Matching release
+
+Finish both sequences on the same matching release tag. Confirm the installed
+tag in HACS and PyPluginStore, or in both manual installations. The ready status
+must report protocol v2 and the expected numeric and binary features. Verify a
+representative native numeric device, Custom Sensor fallback, and passive binary
+device, then reconnect once more and confirm that the target count is unchanged.
+
 ## Future Compatibility Rules
 
 Future protocol changes must follow these rules:

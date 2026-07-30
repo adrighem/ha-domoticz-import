@@ -370,6 +370,46 @@ Pairing details normally survive an update. Removing and adding the Home
 Assistant integration creates new pairing details, which must then be copied
 to the Domoticz hardware settings.
 
+### Verify a rolling update
+
+Use a test installation when deliberately exercising mixed versions. Before
+each order, note the target release tag and the number of sync-owned Domoticz
+devices. Keep Link IDs, pairing keys, and other credentials out of notes and
+logs.
+
+#### Home Assistant first
+
+1. Leave the Domoticz plugin on the starting version.
+2. Update Home Assistant to the target release and restart Home Assistant.
+3. Confirm that the plugin reconnects safely. A v1-only overlap must remain
+   heartbeat-only. A v2 overlap may use only the features reported by both
+   peers.
+4. Update the Domoticz plugin to the target release and restart Domoticz.
+5. Confirm that the ready status reports protocol v2 and the expected export
+   features, then check that reconnecting did not create duplicate devices.
+
+#### Domoticz plugin first
+
+1. Leave Home Assistant on the starting version.
+2. Update the Domoticz plugin to the target release and restart Domoticz.
+3. Confirm the same safe intermediate behavior: heartbeat-only for v1, or only
+   the common negotiated v2 features.
+4. Update Home Assistant to the target release and restart Home Assistant.
+5. Confirm protocol v2, the expected features, and an unchanged count of
+   existing sync-owned devices after reconnect.
+
+#### Confirm matching tags
+
+1. Confirm that HACS and PyPluginStore report the same release, or that both
+   manual installations use the same Git tag or release archive.
+2. Confirm that the Domoticz log reports
+   `Authenticated Home Assistant connection is ready` with protocol v2 and the
+   expected numeric and binary feature names.
+3. Verify one native numeric target, one Custom Sensor fallback, and one passive
+   binary target when those representative entities are labelled.
+4. Reconnect once more and confirm that each source still has exactly one
+   Domoticz target.
+
 See the [protocol compatibility contract](docs/protocol.md) for the detailed
 mixed-version and feature-negotiation rules.
 

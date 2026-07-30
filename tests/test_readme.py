@@ -3,6 +3,7 @@
 from pathlib import Path
 
 README = Path(__file__).parents[1] / "README.md"
+PROTOCOL = Path(__file__).parents[1] / "docs" / "protocol.md"
 TOP_IMAGE = (
     '<p align="center">\n'
     '  <img src="custom_components/domoticz_sync/brand/icon@2x.png" '
@@ -44,3 +45,21 @@ def test_readme_recommends_pypluginstore_with_manual_fallback() -> None:
     assert "`ha-domoticz-sync`" in readme
     assert readme.index(recommended_install) < readme.index(manual_install)
     assert readme.index(recommended_update) < readme.index(manual_update)
+
+
+def test_upgrade_docs_cover_both_orders_and_matching_tags() -> None:
+    """Operators get explicit checks for every supported update sequence."""
+    readme = README.read_text(encoding="utf-8")
+    protocol = PROTOCOL.read_text(encoding="utf-8")
+    order_headings = (
+        "#### Home Assistant first",
+        "#### Domoticz plugin first",
+        "#### Confirm matching tags",
+    )
+
+    assert "### Verify a rolling update" in readme
+    assert all(heading in readme for heading in order_headings)
+    assert "## Rolling Upgrade Verification" in protocol
+    assert "Home Assistant first" in protocol
+    assert "Domoticz plugin first" in protocol
+    assert "matching release tag" in protocol
