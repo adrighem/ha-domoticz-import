@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.3.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.2.0...v0.3.0) (2026-07-30)
+
+
+### Features
+
+* map sensors to native Domoticz types ([#15](https://github.com/adrighem/ha-domoticz-sync/issues/15)) ([934a3bc](https://github.com/adrighem/ha-domoticz-sync/commit/934a3bcae0ad068173a7548e9e34da4e046b27ef))
+* negotiate compatible bridge protocols ([#16](https://github.com/adrighem/ha-domoticz-sync/issues/16)) ([0df41bd](https://github.com/adrighem/ha-domoticz-sync/commit/0df41bd388b352b2c05e52d96649048726829ccb))
+* sync numeric Home Assistant entities to Domoticz ([#13](https://github.com/adrighem/ha-domoticz-sync/issues/13)) ([f29f0cf](https://github.com/adrighem/ha-domoticz-sync/commit/f29f0cf07203a48e6e76a0f6078a7e4869e02f0f))
+
 ## [0.2.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.1.4...v0.2.0) (2026-07-29)
 
 
