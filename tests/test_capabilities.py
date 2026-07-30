@@ -104,9 +104,11 @@ def test_non_available_capability_has_no_value(
         availability,
         semantic="temperature",
         unit="celsius",
+        state_class="measurement",
     )
 
     assert capability.value is None
+    assert capability.state_class == "measurement"
     assert not capability.is_available
 
 
@@ -163,6 +165,63 @@ def test_unit_is_numeric_only(source: SourceIdentity) -> None:
             "Status",
             "ok",
             unit="celsius",
+        )
+
+
+def test_numeric_capability_preserves_sensor_state_class(
+    source: SourceIdentity,
+) -> None:
+    """Numeric sensor metadata participates in immutable snapshot equality."""
+    measurement = Capability(
+        source,
+        CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        state_class="measurement",
+    )
+
+    assert measurement.state_class == "measurement"
+    assert measurement == Capability(
+        source,
+        CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        state_class="measurement",
+    )
+    assert measurement != Capability(
+        source,
+        CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        state_class="total",
+    )
+
+
+@pytest.mark.parametrize("state_class", ("", " ", " measurement", "total ", 123))
+def test_capability_rejects_invalid_sensor_state_class(
+    source: SourceIdentity,
+    state_class: object,
+) -> None:
+    """State class metadata is either a meaningful string or absent."""
+    with pytest.raises((TypeError, ValueError), match="state_class"):
+        Capability(
+            source,
+            CapabilityKind.NUMERIC,
+            "Temperature",
+            21.5,
+            state_class=state_class,
+        )
+
+
+def test_state_class_is_numeric_only(source: SourceIdentity) -> None:
+    """Only numeric sensor capabilities can carry state class metadata."""
+    with pytest.raises(ValueError, match="only numeric"):
+        Capability(
+            source,
+            CapabilityKind.BINARY,
+            "Motion",
+            True,
+            state_class="measurement",
         )
 
 

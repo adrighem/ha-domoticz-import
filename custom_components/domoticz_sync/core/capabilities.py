@@ -70,6 +70,7 @@ class Capability:
     availability: Availability = Availability.AVAILABLE
     semantic: Optional[str] = None
     unit: Optional[str] = None
+    state_class: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Keep invalid or ambiguous values out of platform adapters."""
@@ -86,9 +87,17 @@ class Capability:
 
         self._validate_optional_label("semantic", self.semantic)
         self._validate_optional_label("unit", self.unit)
+        self._validate_optional_label("state_class", self.state_class)
+        if (
+            self.state_class is not None
+            and self.state_class != self.state_class.strip()
+        ):
+            raise ValueError("state_class must not have surrounding whitespace")
 
         if self.kind is not CapabilityKind.NUMERIC and self.unit is not None:
             raise ValueError("only numeric capabilities may have a unit")
+        if self.kind is not CapabilityKind.NUMERIC and self.state_class is not None:
+            raise ValueError("only numeric capabilities may have a state_class")
 
         if self.availability is not Availability.AVAILABLE:
             if self.value is not None:

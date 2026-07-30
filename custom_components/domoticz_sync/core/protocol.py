@@ -64,6 +64,7 @@ _CAPABILITY_KEYS = {
     "availability",
     "semantic",
     "unit",
+    "state_class",
 }
 _SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _ENVELOPE_KEYS = {
@@ -898,6 +899,7 @@ def _capability_to_dict(capability: Capability) -> Dict[str, object]:
         "availability": capability.availability.value,
         "semantic": capability.semantic,
         "unit": capability.unit,
+        "state_class": capability.state_class,
     }
 
 
@@ -912,6 +914,7 @@ def _capability_from_dict(document: object) -> Capability:
         availability=Availability(document["availability"]),
         semantic=document["semantic"],
         unit=document["unit"],
+        state_class=document["state_class"],
     )
 
 

@@ -109,6 +109,7 @@ def _numeric_capability(
     *,
     availability: Availability = Availability.AVAILABLE,
     value: object = 21.5,
+    state_class: str | None = "measurement",
 ) -> Capability:
     return Capability(
         source=_source_identity(),
@@ -118,6 +119,7 @@ def _numeric_capability(
         availability=availability,
         semantic="temperature",
         unit="\N{DEGREE SIGN}C",
+        state_class=state_class,
     )
 
 
@@ -835,6 +837,7 @@ def test_apply_codec_round_trips_complete_reconciliation_actions(
                 "availability": action.capability.availability.value,
                 "semantic": "temperature",
                 "unit": "\N{DEGREE SIGN}C",
+                "state_class": "measurement",
             },
             "target_id": action.target_id,
             "stale": action.stale,
@@ -872,6 +875,19 @@ def test_apply_payload_can_be_signed_verified_and_parsed() -> None:
     assert parse_apply(verified.payload).action == action
 
 
+def test_apply_codec_preserves_absent_state_class_as_null() -> None:
+    """The wire contract retains an explicit nullable metadata field."""
+    action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=_numeric_capability(state_class=None),
+    )
+
+    payload = build_apply("request-1", action)
+
+    assert payload["action"]["capability"]["state_class"] is None
+    assert parse_apply(payload).action == action
+
+
 def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
     """No unsigned extension point exists in an apply request."""
     action = ReconciliationAction(
@@ -901,7 +917,7 @@ def test_apply_parser_rejects_extra_or_missing_fields_at_every_level() -> None:
     del missing_action_field["action"]["stale"]
     mutations.append(missing_action_field)
     missing_capability_field = deepcopy(payload)
-    del missing_capability_field["action"]["capability"]["semantic"]
+    del missing_capability_field["action"]["capability"]["state_class"]
     mutations.append(missing_capability_field)
     missing_source_field = deepcopy(payload)
     del missing_source_field["action"]["capability"]["source"]["instance_id"]
@@ -949,6 +965,9 @@ def test_apply_parser_rejects_malformed_action_semantics() -> None:
     boolean_numeric_value = deepcopy(payload)
     boolean_numeric_value["action"]["capability"]["value"] = True
     mutations.append(boolean_numeric_value)
+    invalid_state_class = deepcopy(payload)
+    invalid_state_class["action"]["capability"]["state_class"] = 1
+    mutations.append(invalid_state_class)
     invalid_source = deepcopy(payload)
     invalid_source["action"]["capability"]["source"]["instance_id"] = " "
     mutations.append(invalid_source)

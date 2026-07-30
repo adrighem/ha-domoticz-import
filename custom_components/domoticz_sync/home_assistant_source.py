@@ -245,6 +245,7 @@ def _numeric_capability(
             availability=availability,
             semantic=semantic,
             unit=unit,
+            state_class=state_class,
         )
 
     try:
@@ -261,6 +262,7 @@ def _numeric_capability(
         value=value,
         semantic=semantic,
         unit=unit,
+        state_class=state_class,
     )
 
 

@@ -399,6 +399,7 @@ def test_current_state_metadata_overrides_registry_metadata(
         "sensor",
         "converted_value",
         device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.TOTAL_INCREASING,
         unit="W",
     )
     hass.states.async_set(
@@ -406,6 +407,7 @@ def test_current_state_metadata_overrides_registry_metadata(
         "20",
         {
             ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
+            ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT,
             ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
         },
     )
@@ -416,6 +418,7 @@ def test_current_state_metadata_overrides_registry_metadata(
     )[0]
 
     assert capability.semantic == "temperature"
+    assert capability.state_class == "measurement"
     assert capability.unit == "celsius"
 
 
@@ -428,6 +431,7 @@ def test_current_state_falls_back_to_registry_metadata(
         "sensor",
         "restored_temperature",
         device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
         unit=UnitOfTemperature.CELSIUS,
     )
     hass.states.async_set(entry.entity_id, "20")
@@ -438,7 +442,23 @@ def test_current_state_falls_back_to_registry_metadata(
     )[0]
 
     assert capability.semantic == "temperature"
+    assert capability.state_class == "measurement"
     assert capability.unit == "celsius"
+
+
+def test_numeric_sensor_without_state_class_preserves_absence(
+    hass: HomeAssistant,
+) -> None:
+    """A numeric value does not gain state-class semantics implicitly."""
+    entry = _register_entity(hass, "sensor", "unclassified_numeric")
+    hass.states.async_set(entry.entity_id, "20")
+
+    capability = collect_export_capabilities(
+        hass,
+        instance_id="ha-instance",
+    )[0]
+
+    assert capability.state_class is None
 
 
 def test_missing_state_uses_registry_state_class(
@@ -462,6 +482,7 @@ def test_missing_state_uses_registry_state_class(
     assert capability.availability is Availability.UNAVAILABLE
     assert capability.semantic is None
     assert capability.unit is None
+    assert capability.state_class == "measurement"
 
 
 @pytest.mark.asyncio
