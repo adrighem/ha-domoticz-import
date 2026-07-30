@@ -5,7 +5,16 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from aiohttp import BasicAuth, ClientError, ClientResponseError, ClientSession
+from aiohttp import ClientError, ClientResponseError, ClientSession
+
+try:
+    from aiohttp import encode_basic_auth as _aiohttp_encode_basic_auth
+except ImportError:
+    from aiohttp import BasicAuth as _legacy_basic_auth
+
+    _aiohttp_encode_basic_auth = None
+else:
+    _legacy_basic_auth = None
 
 from .models import DomoticzDevice
 
@@ -39,8 +48,15 @@ class DomoticzApi:
         """Initialize the API client."""
         self._session = session
         self.base_url = normalize_base_url(base_url)
-        self._auth = (
-            BasicAuth(username, password or "") if username or password else None
+        self._headers = (
+            {
+                "Authorization": _encode_basic_auth_header(
+                    username,
+                    password or "",
+                )
+            }
+            if username or password
+            else None
         )
 
     async def async_get_server_time(self) -> dict[str, Any]:
@@ -81,7 +97,11 @@ class DomoticzApi:
         """Perform a GET request against json.htm."""
         url = urljoin(f"{self.base_url}/", "json.htm")
         try:
-            async with self._session.get(url, params=params, auth=self._auth) as resp:
+            async with self._session.get(
+                url,
+                params=params,
+                headers=self._headers,
+            ) as resp:
                 if resp.status in (401, 403):
                     raise DomoticzAuthError("Invalid Domoticz credentials")
 
@@ -110,6 +130,20 @@ class DomoticzApi:
             raise DomoticzApiError(str(data.get("message") or "Domoticz API error"))
 
         return data
+
+
+def _encode_basic_auth_header(username: str | None, password: str) -> str:
+    """Encode credentials across supported aiohttp versions."""
+    login = username or ""
+    if _aiohttp_encode_basic_auth is not None:
+        return _aiohttp_encode_basic_auth(
+            login,
+            password,
+            encoding="latin1",
+        )
+    if _legacy_basic_auth is None:
+        raise RuntimeError("aiohttp does not provide a Basic Auth encoder")
+    return _legacy_basic_auth(login, password, encoding="latin1").encode()
 
 
 def normalize_base_url(base_url: str) -> str:

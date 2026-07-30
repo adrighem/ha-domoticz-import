@@ -22,6 +22,10 @@ from pytest_homeassistant_custom_component.common import (  # noqa: E402
 )
 
 from custom_components.domoticz_sync import async_migrate_entry  # noqa: E402
+from custom_components.domoticz_sync.api import (  # noqa: E402
+    DomoticzApiError,
+    DomoticzConnectionError,
+)
 from custom_components.domoticz_sync.config_flow import (  # noqa: E402
     DomoticzSyncConfigFlow,
 )
@@ -39,6 +43,39 @@ from custom_components.domoticz_sync.const import (  # noqa: E402
 
 TEST_LINK_ID = "link_test_pairing"
 TEST_PAIRING_KEY = "A" * 43
+
+
+@pytest.mark.parametrize(
+    "connection_error_type",
+    (DomoticzApiError, DomoticzConnectionError),
+)
+@pytest.mark.asyncio
+async def test_connection_errors_show_cannot_connect(
+    hass: HomeAssistant,
+    enable_custom_integrations: None,
+    connection_error_type: type[Exception],
+) -> None:
+    """Both expected connection failures keep the user in the setup flow."""
+    with patch(
+        "custom_components.domoticz_sync.config_flow.validate_input",
+        AsyncMock(side_effect=connection_error_type()),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_URL: "http://domoticz.test:8080",
+                CONF_USERNAME: "",
+                CONF_PASSWORD: "",
+                CONF_VERIFY_SSL: False,
+            },
+        )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}
 
 
 @pytest.mark.asyncio

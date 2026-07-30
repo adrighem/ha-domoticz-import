@@ -78,7 +78,7 @@ class TargetAdapter(Protocol):
         action: ReconciliationAction,
     ) -> ApplyConfirmation:
         """Apply or safely repeat one desired target state."""
-        ...
+        raise NotImplementedError
 
 
 class CatalogStorage(Protocol):
@@ -86,11 +86,11 @@ class CatalogStorage(Protocol):
 
     async def async_load(self) -> Optional[Mapping[str, object]]:
         """Load a complete catalog document, or None when never saved."""
-        ...
+        raise NotImplementedError
 
     async def async_save(self, document: Mapping[str, object]) -> None:
         """Atomically replace the complete catalog document."""
-        ...
+        raise NotImplementedError
 
 
 class ExecutionStatus(str, Enum):

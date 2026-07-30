@@ -1,11 +1,14 @@
 """Tests for the Domoticz API client."""
 
 import asyncio
+from base64 import b64encode
+from hmac import compare_digest
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import ClientResponseError
 
+import custom_components.domoticz_sync.api as api_module
 from custom_components.domoticz_sync.api import (
     DomoticzApi,
     DomoticzApiError,
@@ -13,6 +16,38 @@ from custom_components.domoticz_sync.api import (
     DomoticzConnectionError,
     normalize_base_url,
 )
+
+
+def test_legacy_basic_auth_encoder_fallback(monkeypatch):
+    """Use aiohttp's legacy encoder when the modern helper is unavailable."""
+    state = {"constructed": False, "encoded": False}
+
+    class LegacyBasicAuth:
+        """Test double for aiohttp.BasicAuth."""
+
+        def __init__(self, username, password, encoding):
+            if (
+                username != "placeholder-user"
+                or password != "placeholder-password"
+                or encoding != "latin1"
+            ):
+                raise AssertionError("Legacy Basic Auth arguments did not match")
+            state["constructed"] = True
+
+        def encode(self):
+            state["encoded"] = True
+            return "fallback-result"
+
+    monkeypatch.setattr(api_module, "_aiohttp_encode_basic_auth", None)
+    monkeypatch.setattr(api_module, "_legacy_basic_auth", LegacyBasicAuth)
+
+    result = api_module._encode_basic_auth_header(
+        "placeholder-user",
+        "placeholder-password",
+    )
+
+    assert result == "fallback-result"
+    assert state == {"constructed": True, "encoded": True}
 
 
 class MockResponse:
@@ -58,8 +93,8 @@ def test_normalize_base_url():
         == "https://domoticz.local:8443"
     )
     assert (
-        normalize_base_url("https://xmpp.vanadrighem.eu:8443/domoticz")
-        == "https://xmpp.vanadrighem.eu:8443/domoticz"
+        normalize_base_url("https://domoticz.example.com:8443/domoticz")
+        == "https://domoticz.example.com:8443/domoticz"
     )
 
 
@@ -88,7 +123,12 @@ def test_get_devices_sends_expected_params():
             ],
         }
     )
-    api = DomoticzApi(session, "http://domoticz.local:8080", "user", "secret")
+    api = DomoticzApi(
+        session,
+        "http://domoticz.local:8080",
+        "test-user",
+        "test-password",
+    )
 
     devices = asyncio.run(
         api.async_get_devices(include_hidden=True, favorite_only=True)
@@ -102,7 +142,17 @@ def test_get_devices_sends_expected_params():
     assert kwargs["params"]["param"] == "getdevices"
     assert kwargs["params"]["displayhidden"] == "1"
     assert kwargs["params"]["favorite"] == "1"
-    assert kwargs["auth"].login == "user"
+    assert "auth" not in kwargs
+    headers = kwargs["headers"]
+    assert set(headers) == {"Authorization"}
+    expected_header = "Basic " + b64encode(
+        b"test-user:test-password",
+    ).decode("ascii")
+    if not compare_digest(
+        headers["Authorization"],
+        expected_header,
+    ):
+        raise AssertionError("Authorization header encoding mismatch")
 
 
 def test_get_server_time_auth_error():
@@ -114,6 +164,9 @@ def test_get_server_time_auth_error():
     try:
         asyncio.run(api.async_get_server_time())
     except DomoticzAuthError:
+        kwargs = session.get.call_args.kwargs
+        assert "auth" not in kwargs
+        assert kwargs["headers"] is None
         return
     raise AssertionError("Expected DomoticzAuthError")
 

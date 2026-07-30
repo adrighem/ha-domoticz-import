@@ -22,11 +22,13 @@ from custom_components.domoticz_sync.core.catalog import (
 )
 from custom_components.domoticz_sync.core.execution import (
     ApplyConfirmation,
+    CatalogStorage,
     CatalogStorageError,
     ExecutionConflictError,
     ExecutionStatus,
     ReconciliationExecutor,
     TargetActionError,
+    TargetAdapter,
     TargetAdapterError,
     async_execute_reconciliation,
 )
@@ -193,6 +195,17 @@ class _FakeCatalogStorage:
     def catalog(self) -> TargetCatalog:
         """Decode currently durable state for assertions."""
         return catalog_from_document(self.document)
+
+
+@pytest.mark.asyncio
+async def test_protocol_method_bodies_fail_explicitly() -> None:
+    """Protocol placeholders never silently behave like implementations."""
+    with pytest.raises(NotImplementedError):
+        await TargetAdapter.async_apply(object(), object())
+    with pytest.raises(NotImplementedError):
+        await CatalogStorage.async_load(object())
+    with pytest.raises(NotImplementedError):
+        await CatalogStorage.async_save(object(), {})
 
 
 @pytest.mark.asyncio

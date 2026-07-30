@@ -42,6 +42,7 @@ from .core.protocol import ProtocolError
 
 _LOGGER = logging.getLogger(__name__)
 _UNAVAILABLE_PAIRING_CREDENTIAL = "Unavailable"
+_EXPECTED_CONNECTION_ERRORS = (DomoticzApiError, DomoticzConnectionError)
 
 
 def _user_schema(user_input: dict[str, Any] | None = None) -> vol.Schema:
@@ -122,7 +123,7 @@ class DomoticzSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             info = await validate_input(self.hass, user_input)
         except DomoticzAuthError:
             errors["base"] = "invalid_auth"
-        except DomoticzApiError, DomoticzConnectionError:
+        except _EXPECTED_CONNECTION_ERRORS:
             errors["base"] = "cannot_connect"
         except Exception:
             _LOGGER.exception("Unexpected error validating Domoticz connection")
