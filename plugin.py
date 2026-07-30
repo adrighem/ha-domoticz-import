@@ -8,9 +8,8 @@
     wikilink="https://github.com/adrighem/ha-domoticz-sync">
     <description>
         <h2>Home Assistant Domoticz Sync</h2>
-        Clone the complete repository into the Domoticz plugins directory
-        and restart Domoticz. The plugin establishes an authenticated
-        connection and mirrors supported Home Assistant entities.
+        Synchronizes selected Home Assistant entities to Domoticz over an
+        authenticated connection.
     </description>
     <params>
         <param
