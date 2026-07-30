@@ -2099,3 +2099,154 @@ def test_connecting_timeout_does_not_need_a_domoticz_callback(loaded_plugin):
 
     plugin.onHeartbeat()
     assert len(domoticz.connections) == 2
+
+
+@pytest.mark.parametrize("probe_name", ["Connected", "Connecting"])
+def test_probe_failure_closes_transport_before_replacement(
+    loaded_plugin,
+    monkeypatch,
+    probe_name,
+):
+    module, domoticz = loaded_plugin
+    plugin = module.DomoticzSyncPlugin()
+    plugin.onStart()
+    first = plugin.connection
+    original_connection_factory = domoticz.Connection
+    disconnected_before_replacement = []
+    failure_detail = f"sensitive {probe_name} failure detail"
+
+    def raise_probe_failure():
+        raise RuntimeError(failure_detail)
+
+    def create_replacement(**kwargs):
+        disconnected_before_replacement.append(first.disconnected)
+        return original_connection_factory(**kwargs)
+
+    monkeypatch.setattr(first, probe_name, raise_probe_failure)
+    monkeypatch.setattr(domoticz, "Connection", create_replacement)
+
+    plugin._connect()
+
+    assert first.disconnected
+    assert disconnected_before_replacement == [True]
+    assert plugin.connection is domoticz.connections[-1]
+    assert plugin.connection is not first
+    assert plugin.connection.connecting
+    assert len(domoticz.connections) == 2
+    assert domoticz.errors == [
+        "Could not inspect the existing Home Assistant sync connection."
+    ]
+    assert failure_detail not in "\n".join(domoticz.errors)
+
+
+def test_connect_failure_closes_new_transport_before_scheduling_reconnect(
+    loaded_plugin,
+    monkeypatch,
+):
+    module, domoticz = loaded_plugin
+    original_connection_factory = domoticz.Connection
+    failure_detail = "sensitive Connect failure detail"
+
+    def create_failing_connection(**kwargs):
+        connection = original_connection_factory(**kwargs)
+
+        def raise_connect_failure():
+            raise RuntimeError(failure_detail)
+
+        monkeypatch.setattr(connection, "Connect", raise_connect_failure)
+        return connection
+
+    monkeypatch.setattr(domoticz, "Connection", create_failing_connection)
+    plugin = module.DomoticzSyncPlugin()
+
+    plugin.onStart()
+
+    connection = domoticz.connections[0]
+    assert connection.disconnected
+    assert plugin.connection is None
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert domoticz.errors == ["Could not connect to Home Assistant."]
+    assert failure_detail not in "\n".join(domoticz.errors)
+
+
+def test_cleanup_failures_are_reported_without_exception_details(
+    loaded_plugin,
+    monkeypatch,
+):
+    module, domoticz = loaded_plugin
+    plugin = module.DomoticzSyncPlugin()
+    plugin.onStart()
+    connection = plugin.connection
+    calls = []
+    send_failure_detail = "sensitive close-send failure detail"
+    disconnect_failure_detail = "sensitive disconnect failure detail"
+
+    def raise_send_failure(document):
+        calls.append(("send", document["Operation"]))
+        raise RuntimeError(send_failure_detail)
+
+    def raise_disconnect_failure():
+        calls.append(("disconnect",))
+        raise RuntimeError(disconnect_failure_detail)
+
+    monkeypatch.setattr(connection, "Send", raise_send_failure)
+    monkeypatch.setattr(connection, "Disconnect", raise_disconnect_failure)
+
+    plugin.onStop()
+
+    assert calls == [("send", "Close"), ("disconnect",)]
+    assert plugin.connection is None
+    assert plugin.phase == module.PHASE_STOPPED
+    assert domoticz.errors == [
+        "A Home Assistant sync connection cleanup operation failed."
+    ]
+    all_errors = "\n".join(domoticz.errors)
+    assert send_failure_detail not in all_errors
+    assert disconnect_failure_detail not in all_errors
+
+
+def test_global_callbacks_do_not_forward_procedure_return_values(
+    loaded_plugin,
+    monkeypatch,
+):
+    module, _domoticz = loaded_plugin
+    marker = object()
+    direct_calls = []
+
+    def returning_handler(*args):
+        direct_calls.append(args)
+        return marker
+
+    assert module._callback("test", returning_handler, 1, 2) is None
+    assert direct_calls == [(1, 2)]
+
+    wrapper_calls = []
+
+    def returning_callback(*args):
+        wrapper_calls.append(args)
+        return marker
+
+    monkeypatch.setattr(module, "_callback", returning_callback)
+    connection = object()
+    data = object()
+
+    results = [
+        module.onStart(),
+        module.onStop(),
+        module.onConnect(connection, 0, "connected"),
+        module.onMessage(connection, data),
+        module.onDisconnect(connection),
+        module.onHeartbeat(),
+        module.onCommand("device", 1, "Off", 0, None),
+    ]
+
+    assert results == [None] * 7
+    assert [call[0] for call in wrapper_calls] == [
+        "start",
+        "stop",
+        "connect",
+        "message",
+        "disconnect",
+        "heartbeat",
+        "command",
+    ]

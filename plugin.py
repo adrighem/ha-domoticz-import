@@ -638,7 +638,12 @@ class DomoticzSyncPlugin:
                 if self.connection.Connected() or self.connection.Connecting():
                     return
             except Exception:
-                pass
+                Domoticz.Error(
+                    "Could not inspect the existing Home Assistant sync connection."
+                )
+                self._close_current_connection(send_close=False)
+            else:
+                self._close_current_connection(send_close=False)
 
         self._reset_session()
         self.phase = PHASE_CONNECTING
@@ -654,7 +659,7 @@ class DomoticzSyncPlugin:
             self.connection = connection
             connection.Connect()
         except Exception:
-            self.connection = None
+            self._close_current_connection(send_close=False)
             Domoticz.Error("Could not connect to Home Assistant.")
             self._schedule_reconnect()
 
@@ -664,7 +669,7 @@ class DomoticzSyncPlugin:
         if connection is not self.connection or self._stopping:
             return
         if status != 0:
-            self.connection = None
+            self._close_current_connection(send_close=False)
             Domoticz.Error("Could not connect to Home Assistant.")
             self._schedule_reconnect()
             return
@@ -1350,18 +1355,8 @@ class DomoticzSyncPlugin:
         """Close the connection without scheduling another attempt."""
         self._stopping = True
         self.phase = PHASE_STOPPED
-        connection = self.connection
-        self.connection = None
         self._reset_session()
-        if connection is not None:
-            try:
-                connection.Send({"Operation": "Close", "Mask": secrets.randbits(32)})
-            except Exception:
-                pass
-            try:
-                connection.Disconnect()
-            except Exception:
-                pass
+        self._close_current_connection(send_close=True)
 
     @staticmethod
     def onCommand(_device_id, _unit, _command, _level, _color):
@@ -1370,21 +1365,30 @@ class DomoticzSyncPlugin:
 
     def _reject_connection(self, message, *, send_close=True):
         Domoticz.Error(message)
+        self._close_current_connection(send_close=send_close)
+        self._schedule_reconnect()
+
+    def _close_current_connection(self, *, send_close):
+        """Detach and best-effort close the current transport."""
         connection = self.connection
         self.connection = None
-        self._schedule_reconnect()
-        if connection is not None:
-            if send_close:
-                try:
-                    connection.Send(
-                        {"Operation": "Close", "Mask": secrets.randbits(32)}
-                    )
-                except Exception:
-                    pass
+        if connection is None:
+            return
+
+        cleanup_failed = False
+        if send_close:
             try:
-                connection.Disconnect()
+                connection.Send({"Operation": "Close", "Mask": secrets.randbits(32)})
             except Exception:
-                pass
+                cleanup_failed = True
+
+        try:
+            connection.Disconnect()
+        except Exception:
+            cleanup_failed = True
+
+        if cleanup_failed:
+            Domoticz.Error("A Home Assistant sync connection cleanup operation failed.")
 
     def _schedule_reconnect(self):
         if self._stopping:
@@ -1420,38 +1424,37 @@ _plugin = DomoticzSyncPlugin()
 
 def _callback(name, function, *args):
     try:
-        return function(*args)
+        function(*args)
     except Exception:
         Domoticz.Error(f"Internal error in the {name} callback.")
-        return None
 
 
 def onStart():
-    return _callback("start", _plugin.onStart)
+    _callback("start", _plugin.onStart)
 
 
 def onStop():
-    return _callback("stop", _plugin.onStop)
+    _callback("stop", _plugin.onStop)
 
 
 def onConnect(Connection, Status, Description):
-    return _callback("connect", _plugin.onConnect, Connection, Status, Description)
+    _callback("connect", _plugin.onConnect, Connection, Status, Description)
 
 
 def onMessage(Connection, Data):
-    return _callback("message", _plugin.onMessage, Connection, Data)
+    _callback("message", _plugin.onMessage, Connection, Data)
 
 
 def onDisconnect(Connection):
-    return _callback("disconnect", _plugin.onDisconnect, Connection)
+    _callback("disconnect", _plugin.onDisconnect, Connection)
 
 
 def onHeartbeat():
-    return _callback("heartbeat", _plugin.onHeartbeat)
+    _callback("heartbeat", _plugin.onHeartbeat)
 
 
 def onCommand(DeviceID, Unit, Command, Level, Color):
-    return _callback(
+    _callback(
         "command",
         _plugin.onCommand,
         DeviceID,
