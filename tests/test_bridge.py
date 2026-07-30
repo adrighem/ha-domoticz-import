@@ -31,6 +31,7 @@ from custom_components.domoticz_sync.bridge import (  # noqa: E402
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     PROTOCOL_VERSION,
     PROTOCOL_VERSION_V2,
@@ -310,12 +311,21 @@ async def _async_connect_v2(
     )
 
 
+@pytest.mark.parametrize(
+    "client_features",
+    [
+        (FEATURE_HA_EXPORT_NUMERIC_V1,),
+        (FEATURE_HA_EXPORT_BINARY_V1,),
+        SUPPORTED_V2_FEATURES,
+    ],
+)
 @pytest.mark.asyncio
 async def test_application_runs_after_ready_and_exchanges_signed_payloads(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,
+    client_features: tuple[str, ...],
 ) -> None:
-    """The application exclusively owns the ready session before heartbeats."""
+    """Any negotiated export feature enters the application before heartbeats."""
     application = ExchangingApplication()
     manager = DomoticzBridgeManager(application)
     link_id = generate_link_id()
@@ -333,6 +343,7 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
         link_id=link_id,
         pairing_key=pairing_key,
         destination_id=destination_id,
+        client_features=client_features,
     )
     async with asyncio.timeout(1):
         await application.called.wait()
@@ -342,7 +353,7 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
     assert application.destination_id == destination_id
     assert application.selection == connection.selection
     assert application.selection is not None
-    assert application.selection.supports(FEATURE_HA_EXPORT_NUMERIC_V1)
+    assert application.selection.features == client_features
 
     await connection.async_send({"type": "application-request", "value": 42})
     assert await connection.async_receive() == {
@@ -391,7 +402,7 @@ async def test_legacy_v1_remains_heartbeat_only_without_application_side_effects
 
 
 @pytest.mark.asyncio
-async def test_v2_without_numeric_feature_remains_heartbeat_only(
+async def test_v2_without_export_features_remains_heartbeat_only(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,
 ) -> None:

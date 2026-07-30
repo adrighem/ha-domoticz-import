@@ -202,6 +202,29 @@ def test_explicit_non_available_change_is_preserved(
     )
 
 
+@pytest.mark.parametrize(
+    "availability",
+    (Availability.UNKNOWN, Availability.UNAVAILABLE),
+)
+def test_unchanged_non_available_state_is_reasserted(
+    availability: Availability,
+) -> None:
+    """Runtime-only target availability is restored on every connection."""
+    capability = _numeric("unchanged", None, availability)
+
+    assert _plan(
+        [capability],
+        [TargetRecord("target-7", capability)],
+    ) == (
+        ReconciliationAction(
+            kind=ReconciliationActionKind.MARK_UNAVAILABLE,
+            target_id="target-7",
+            capability=capability,
+            stale=False,
+        ),
+    )
+
+
 def test_equivalent_numeric_int_and_float_values_need_no_update() -> None:
     """Normal numeric equality avoids churn without adding a tolerance."""
     previous = _numeric("changed", 1)
@@ -253,11 +276,18 @@ def test_explicitly_unavailable_missing_target_becomes_stale() -> None:
     )
 
 
-def test_repeated_mark_unavailable_is_suppressed() -> None:
-    """An unavailable missing target does not produce repeated writes."""
+def test_stale_mark_unavailable_is_reasserted() -> None:
+    """A missing target's runtime-only timeout is restored after restart."""
     previous = _numeric("missing", None, Availability.UNAVAILABLE)
 
-    assert _plan([], [TargetRecord("target-7", previous, stale=True)]) == ()
+    assert _plan([], [TargetRecord("target-7", previous, stale=True)]) == (
+        ReconciliationAction(
+            kind=ReconciliationActionKind.MARK_UNAVAILABLE,
+            target_id="target-7",
+            capability=previous,
+            stale=True,
+        ),
+    )
 
 
 def test_available_reappearance_clears_stale_state_with_update() -> None:

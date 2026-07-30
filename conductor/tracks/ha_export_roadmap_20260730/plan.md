@@ -39,9 +39,15 @@
 
 - [x] Task 2.1: Define safe binary device-class mappings and fallback behavior
   (`05a8b5f`)
-- [ ] Task 2.2: Extend the catalog and plugin with passive binary profiles
-- [ ] Task 2.3: Test creation, adoption, state changes, and unavailable state
-- [ ] Task 2.4: Document and manually verify representative binary sensors
+- [x] Task 2.2: Extend the catalog and plugin with passive binary profiles
+- [x] Task 2.3: Test creation, adoption, state changes, and unavailable state
+- [x] Task 2.4: Completely rewrite the README for both user communities
+  - [x] Keep the existing image at the top
+  - [x] Give Home Assistant and Domoticz users equally complete setup, upgrade,
+    troubleshooting, and verification guidance
+  - [x] Explain mappings, fallbacks, limitations, and version compatibility in
+    plain language
+- [ ] Task 2.5: Manually verify representative binary sensors
 
 ## Phase 3: Protocol Compatibility Hardening
 

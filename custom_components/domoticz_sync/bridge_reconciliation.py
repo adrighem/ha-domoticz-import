@@ -9,25 +9,33 @@ from typing import TYPE_CHECKING
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.instance_id import async_get as async_get_instance_id
 
-from .catalog_storage import HomeAssistantCatalogStorage
+from .catalog_storage import (
+    HomeAssistantBinaryCatalogStorage,
+    HomeAssistantCatalogStorage,
+)
 from .const import CONF_EXPORT_LABEL_ID
-from .core.capabilities import CapabilityKind
+from .core.capabilities import Capability, CapabilityKind
 from .core.catalog import CatalogFormatError
 from .core.execution import (
     ApplyConfirmation,
     CatalogStorageError,
     ExecutionConflictError,
+    ExecutionReport,
     ExecutionStatus,
     ReconciliationExecutor,
     TargetActionError,
 )
 from .core.protocol import (
+    FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
+    ApplyResult,
     ApplyResultStatus,
     ProtocolError,
     build_apply,
+    build_binary_apply,
     generate_request_id,
     parse_apply_result,
+    parse_binary_apply_result,
     validate_nonce,
 )
 from .core.reconciliation import (
@@ -51,7 +59,7 @@ _SOURCE_SYSTEM = "home_assistant"
 
 
 class DomoticzSessionTargetAdapter:
-    """Apply reconciliation actions over one authenticated bridge session."""
+    """Apply numeric actions over one authenticated bridge session."""
 
     def __init__(self, session: BridgeApplicationSession) -> None:
         """Bind the adapter to one sequential application session."""
@@ -65,9 +73,7 @@ class DomoticzSessionTargetAdapter:
         request_id = generate_request_id()
 
         async with asyncio.timeout(APPLY_TIMEOUT):
-            await self._session.async_send(
-                build_apply(self._session.selection, request_id, action)
-            )
+            await self._session.async_send(self._build_apply(request_id, action))
             while True:
                 payload = await self._session.async_receive()
                 if isinstance(payload, dict) and payload.get("type") == "ping":
@@ -75,7 +81,7 @@ class DomoticzSessionTargetAdapter:
                     await self._session.async_send({"id": ping_id, "type": "pong"})
                     continue
 
-                result = parse_apply_result(self._session.selection, payload)
+                result = self._parse_apply_result(payload)
                 if result.request_id != request_id:
                     raise ProtocolError("invalid protocol message")
                 if result.status is ApplyResultStatus.REJECTED:
@@ -93,9 +99,37 @@ class DomoticzSessionTargetAdapter:
                     raise ProtocolError("invalid protocol message")
                 return ApplyConfirmation(result.target_id, result.source)
 
+    def _build_apply(
+        self,
+        request_id: str,
+        action: ReconciliationAction,
+    ) -> dict[str, object]:
+        """Build one numeric action request."""
+        return build_apply(self._session.selection, request_id, action)
+
+    def _parse_apply_result(self, payload: object) -> ApplyResult:
+        """Parse one numeric action result."""
+        return parse_apply_result(self._session.selection, payload)
+
+
+class DomoticzBinarySessionTargetAdapter(DomoticzSessionTargetAdapter):
+    """Apply binary actions over one authenticated bridge session."""
+
+    def _build_apply(
+        self,
+        request_id: str,
+        action: ReconciliationAction,
+    ) -> dict[str, object]:
+        """Build one binary action request."""
+        return build_binary_apply(self._session.selection, request_id, action)
+
+    def _parse_apply_result(self, payload: object) -> ApplyResult:
+        """Parse one binary action result."""
+        return parse_binary_apply_result(self._session.selection, payload)
+
 
 class HomeAssistantExportApplication:
-    """Reconcile labelled numeric entities when a bridge session connects."""
+    """Reconcile negotiated labelled entities when a bridge session connects."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Store the Home Assistant instance used for source collection."""
@@ -105,8 +139,10 @@ class HomeAssistantExportApplication:
         ] = {}
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
-        """Run one fail-closed numeric reconciliation for a ready session."""
-        if not session.supports(FEATURE_HA_EXPORT_NUMERIC_V1):
+        """Run one fail-closed reconciliation for each negotiated capability kind."""
+        numeric_enabled = session.supports(FEATURE_HA_EXPORT_NUMERIC_V1)
+        binary_enabled = session.supports(FEATURE_HA_EXPORT_BINARY_V1)
+        if not numeric_enabled and not binary_enabled:
             return
 
         entry = self._hass.config_entries.async_get_entry(session.entry_id)
@@ -119,25 +155,37 @@ class HomeAssistantExportApplication:
 
         try:
             instance_id = await async_get_instance_id(self._hass)
+            included_kinds = set()
+            if numeric_enabled:
+                included_kinds.add(CapabilityKind.NUMERIC)
+            if binary_enabled:
+                included_kinds.add(CapabilityKind.BINARY)
             collection = collect_export_selection(
                 self._hass,
                 instance_id=instance_id,
                 label_id=label_id,
-                included_kinds=frozenset({CapabilityKind.NUMERIC}),
+                included_kinds=frozenset(included_kinds),
             )
             self._report_exclusions(session, collection.exclusions)
-            executor = ReconciliationExecutor(
-                DomoticzSessionTargetAdapter(session),
-                HomeAssistantCatalogStorage(
-                    self._hass,
-                    entry_id=session.entry_id,
-                    destination_id=session.destination_id,
-                ),
-            )
-            report = await executor.async_reconcile(
-                SourceScope(_SOURCE_SYSTEM, instance_id),
-                collection.capabilities,
-            )
+            reports: list[ExecutionReport] = []
+            if numeric_enabled:
+                report = await self._async_reconcile_kind(
+                    session,
+                    instance_id,
+                    collection.capabilities,
+                    kind=CapabilityKind.NUMERIC,
+                )
+                self._ensure_persistence_confirmed(report)
+                reports.append(report)
+            if binary_enabled:
+                report = await self._async_reconcile_kind(
+                    session,
+                    instance_id,
+                    collection.capabilities,
+                    kind=CapabilityKind.BINARY,
+                )
+                self._ensure_persistence_confirmed(report)
+                reports.append(report)
         except (
             CatalogFormatError,
             CatalogStorageError,
@@ -146,6 +194,27 @@ class HomeAssistantExportApplication:
         ) as error:
             raise ProtocolError("export reconciliation is unavailable") from error
 
+        committed = sum(
+            result.status is ExecutionStatus.COMMITTED
+            for report in reports
+            for result in report.results
+        )
+        rejected = sum(
+            result.status is ExecutionStatus.TARGET_NOT_CONFIRMED
+            for report in reports
+            for result in report.results
+        )
+        _LOGGER.info(
+            "Domoticz export reconciliation completed: "
+            "%d planned, %d committed, %d rejected",
+            sum(len(report.actions) for report in reports),
+            committed,
+            rejected,
+        )
+
+    @staticmethod
+    def _ensure_persistence_confirmed(report: ExecutionReport) -> None:
+        """Stop before another catalog is touched after an uncertain write."""
         if report.persistence_uncertain:
             _LOGGER.warning(
                 "Domoticz export reconciliation stopped because catalog "
@@ -153,19 +222,35 @@ class HomeAssistantExportApplication:
             )
             raise ProtocolError("export reconciliation is unavailable")
 
-        committed = sum(
-            result.status is ExecutionStatus.COMMITTED for result in report.results
-        )
-        rejected = sum(
-            result.status is ExecutionStatus.TARGET_NOT_CONFIRMED
-            for result in report.results
-        )
-        _LOGGER.info(
-            "Domoticz export reconciliation completed: "
-            "%d planned, %d committed, %d rejected",
-            len(report.actions),
-            committed,
-            rejected,
+    async def _async_reconcile_kind(
+        self,
+        session: BridgeApplicationSession,
+        instance_id: str,
+        capabilities: tuple[Capability, ...],
+        *,
+        kind: CapabilityKind,
+    ) -> ExecutionReport:
+        """Reconcile one negotiated kind in its independent target catalog."""
+        if kind is CapabilityKind.NUMERIC:
+            adapter = DomoticzSessionTargetAdapter(session)
+            storage = HomeAssistantCatalogStorage(
+                self._hass,
+                entry_id=session.entry_id,
+                destination_id=session.destination_id,
+            )
+        elif kind is CapabilityKind.BINARY:
+            adapter = DomoticzBinarySessionTargetAdapter(session)
+            storage = HomeAssistantBinaryCatalogStorage(
+                self._hass,
+                entry_id=session.entry_id,
+                destination_id=session.destination_id,
+            )
+        else:
+            raise ValueError("unsupported export capability kind")
+        executor = ReconciliationExecutor(adapter, storage)
+        return await executor.async_reconcile(
+            SourceScope(_SOURCE_SYSTEM, instance_id),
+            (capability for capability in capabilities if capability.kind is kind),
         )
 
     def _report_exclusions(

@@ -481,6 +481,71 @@ def test_every_sensor_device_class_has_an_explicit_export_decision() -> None:
     assert decisions == {device_class.value for device_class in SensorDeviceClass}
 
 
+def test_every_binary_sensor_device_class_has_an_explicit_export_decision() -> None:
+    """A new Home Assistant binary class must receive an intentional policy."""
+    native_switch_profile = {
+        "door",
+        "garage_door",
+        "lock",
+        "motion",
+        "opening",
+        "smoke",
+        "window",
+    }
+    generic_switch_profile = {
+        "battery",
+        "battery_charging",
+        "carbon_monoxide",
+        "cold",
+        "connectivity",
+        "gas",
+        "heat",
+        "light",
+        "moisture",
+        "moving",
+        "occupancy",
+        "plug",
+        "power",
+        "presence",
+        "problem",
+        "running",
+        "safety",
+        "sound",
+        "tamper",
+        "update",
+        "vibration",
+    }
+
+    assert native_switch_profile.isdisjoint(generic_switch_profile)
+    assert native_switch_profile | generic_switch_profile == {
+        device_class.value for device_class in BinarySensorDeviceClass
+    }
+
+
+def test_enabled_binary_kind_is_selected_without_an_exclusion(
+    hass: HomeAssistant,
+) -> None:
+    """Negotiated binary export does not retain its previous disabled warning."""
+    entry = _register_entity(
+        hass,
+        "binary_sensor",
+        "selected_motion",
+        device_class=BinarySensorDeviceClass.MOTION,
+    )
+    hass.states.async_set(entry.entity_id, STATE_ON)
+
+    collection = collect_export_selection(
+        hass,
+        instance_id="ha-instance",
+        included_kinds=frozenset({CapabilityKind.BINARY}),
+    )
+
+    assert [capability.source.object_id for capability in collection.capabilities] == [
+        entry.id
+    ]
+    assert collection.exclusions == ()
+
+
 def test_registry_id_survives_entity_id_rename(hass: HomeAssistant) -> None:
     """Mutable entity IDs do not participate in exported identity."""
     entry = _register_entity(hass, "sensor", "original")

@@ -28,13 +28,13 @@ friendly migration or coexistence path without maintaining separate bridges.
 - MQTT transport in the current roadmap.
 - Unrestricted bidirectional control before a signed command path exists.
 - Silent deletion of Domoticz devices.
-- Compatibility migrations for the unreleased Home Assistant export feature.
+- Automatic retyping of existing exported Domoticz devices.
 - Exporting every Home Assistant provider or media domain.
 
 ## Current Product State
 
 Domoticz to Home Assistant import is established and read-only. The companion
 plugin can pair with Home Assistant and perform a connect-time export of
-directly labeled numeric sensors. Native numeric mappings, binary sensors,
-remote inventory, continuous synchronization, and controls are being added in
-that order.
+directly labeled numeric and passive binary sensors. Native numeric mappings
+use Custom Sensor as a safe fallback. Remote inventory, continuous
+synchronization, and controls remain later roadmap phases.

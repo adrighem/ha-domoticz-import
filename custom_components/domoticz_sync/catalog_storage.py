@@ -11,15 +11,19 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .core import CatalogStorageError, catalog_from_document
+from .core import CapabilityKind, CatalogStorageError, catalog_from_document
 
 _STORAGE_VERSION = 1
 _STORAGE_KEY_PREFIX = "domoticz_sync.target_catalog"
+_BINARY_STORAGE_KEY_PREFIX = "domoticz_sync.target_catalog.binary"
 _WRAPPER_KEYS = {"entry_id", "destination_id", "catalog"}
 
 
 class HomeAssistantCatalogStorage:
     """Persist one destination's target catalog in Home Assistant storage."""
+
+    _storage_key_prefix = _STORAGE_KEY_PREFIX
+    _capability_kind = CapabilityKind.NUMERIC
 
     def __init__(
         self,
@@ -35,7 +39,9 @@ class HomeAssistantCatalogStorage:
             "destination_id",
         )
         self._hass = hass
-        self._key = f"{_STORAGE_KEY_PREFIX}.{self._entry_id}.{self._destination_id}"
+        self._key = (
+            f"{self._storage_key_prefix}.{self._entry_id}.{self._destination_id}"
+        )
         self._store = self._new_store()
         self._failed = False
 
@@ -75,7 +81,7 @@ class HomeAssistantCatalogStorage:
 
         try:
             catalog = self._unwrap(wrapper)
-            catalog_from_document(catalog)
+            self._validate_catalog(catalog)
         except TypeError, ValueError:
             self._fail("target catalog could not be loaded")
         return catalog
@@ -88,7 +94,7 @@ class HomeAssistantCatalogStorage:
 
         try:
             catalog = deepcopy(dict(document))
-            catalog_from_document(catalog)
+            self._validate_catalog(catalog)
         except Exception:
             self._fail("target catalog could not be saved")
 
@@ -109,7 +115,7 @@ class HomeAssistantCatalogStorage:
 
         try:
             persisted_catalog = self._unwrap(persisted)
-            catalog_from_document(persisted_catalog)
+            self._validate_catalog(persisted_catalog)
         except TypeError, ValueError:
             self._fail("target catalog save could not be confirmed")
 
@@ -145,10 +151,26 @@ class HomeAssistantCatalogStorage:
         if self._failed:
             raise CatalogStorageError("target catalog storage is unavailable")
 
+    def _validate_catalog(self, document: object) -> None:
+        """Require every record to belong to this storage capability kind."""
+        catalog = catalog_from_document(document)
+        if any(
+            record.capability.kind is not self._capability_kind
+            for record in catalog.records
+        ):
+            raise ValueError("catalog contains an unexpected capability kind")
+
     def _fail(self, message: str) -> None:
         """Remember one unsafe state and raise a sanitized storage error."""
         self._failed = True
         raise CatalogStorageError(message) from None
+
+
+class HomeAssistantBinaryCatalogStorage(HomeAssistantCatalogStorage):
+    """Persist one destination's binary target catalog separately."""
+
+    _storage_key_prefix = _BINARY_STORAGE_KEY_PREFIX
+    _capability_kind = CapabilityKind.BINARY
 
 
 def _validate_namespace_id(value: object, field: str) -> str:

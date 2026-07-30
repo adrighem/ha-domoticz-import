@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,7 @@ from custom_components.domoticz_sync import (
     bridge_reconciliation as app_module,  # noqa: E402
 )
 from custom_components.domoticz_sync.bridge_reconciliation import (  # noqa: E402
+    DomoticzBinarySessionTargetAdapter,
     DomoticzSessionTargetAdapter,
     HomeAssistantExportApplication,
 )
@@ -26,6 +28,7 @@ from custom_components.domoticz_sync.core import (
     protocol as protocol_module,  # noqa: E402
 )
 from custom_components.domoticz_sync.core.capabilities import (  # noqa: E402
+    Availability,
     Capability,
     CapabilityKind,
     SourceIdentity,
@@ -37,6 +40,7 @@ from custom_components.domoticz_sync.core.execution import (  # noqa: E402
     TargetActionError,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
+    FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     PROTOCOL_VERSION_V2,
     WEBSOCKET_SUBPROTOCOL_V2,
@@ -44,8 +48,10 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     ProtocolError,
     ProtocolSelection,
     build_apply_result,
+    build_binary_apply_result,
     generate_nonce,
     parse_apply,
+    parse_binary_apply,
 )
 from custom_components.domoticz_sync.core.reconciliation import (  # noqa: E402
     ReconciliationAction,
@@ -61,6 +67,19 @@ _SELECTION = ProtocolSelection(
     version=PROTOCOL_VERSION_V2,
     websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
     features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+)
+_BINARY_SELECTION = ProtocolSelection(
+    version=PROTOCOL_VERSION_V2,
+    websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+    features=(FEATURE_HA_EXPORT_BINARY_V1,),
+)
+_MIXED_SELECTION = ProtocolSelection(
+    version=PROTOCOL_VERSION_V2,
+    websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+    features=(
+        FEATURE_HA_EXPORT_BINARY_V1,
+        FEATURE_HA_EXPORT_NUMERIC_V1,
+    ),
 )
 
 
@@ -125,7 +144,10 @@ class _Session:
     async def async_send(self, payload: dict[str, object]) -> None:
         """Record a payload and enqueue responses to apply requests."""
         self.sent.append(deepcopy(payload))
-        if payload.get("type") == "apply" and self._response_builder is not None:
+        if (
+            payload.get("type") in {"apply", "binary_apply"}
+            and self._response_builder is not None
+        ):
             self._responses.extend(self._response_builder(payload))
 
     async def async_receive(self) -> dict[str, object]:
@@ -183,11 +205,39 @@ def _confirmed_response(payload: dict[str, object]) -> list[dict[str, object]]:
     ]
 
 
+def _confirmed_binary_response(
+    payload: dict[str, object],
+) -> list[dict[str, object]]:
+    """Confirm one binary apply request using its exact source."""
+    request = parse_binary_apply(_BINARY_SELECTION, payload)
+    return [
+        build_binary_apply_result(
+            _BINARY_SELECTION,
+            request.request_id,
+            ApplyResultStatus.CONFIRMED,
+            f"target-{request.action.capability.source.object_id}",
+            request.action.capability.source,
+        )
+    ]
+
+
+def _confirmed_mixed_response(
+    payload: dict[str, object],
+) -> list[dict[str, object]]:
+    """Confirm either independently negotiated application message."""
+    if payload.get("type") == "binary_apply":
+        return _confirmed_binary_response(payload)
+    return _confirmed_response(payload)
+
+
 def _configure_application(
     monkeypatch: pytest.MonkeyPatch,
     capabilities: list[Capability],
     storage: _MemoryStorage,
     exclusions: list[ExportExclusion] | None = None,
+    *,
+    included_kinds: frozenset[CapabilityKind] = frozenset({CapabilityKind.NUMERIC}),
+    binary_storage: _MemoryStorage | None = None,
 ) -> None:
     """Inject deterministic source collection and catalog storage."""
     if exclusions is None:
@@ -202,9 +252,10 @@ def _configure_application(
     def collect(_hass, *, instance_id: str, label_id: str, included_kinds):
         assert instance_id == "instance-1"
         assert label_id == "export-label"
-        assert included_kinds == frozenset({CapabilityKind.NUMERIC})
+        assert included_kinds == expected_kinds
         return ExportCollection(tuple(capabilities), tuple(exclusions))
 
+    expected_kinds = included_kinds
     monkeypatch.setattr(app_module, "collect_export_selection", collect)
 
     def make_storage(_hass, *, entry_id: str, destination_id: str):
@@ -214,10 +265,23 @@ def _configure_application(
 
     monkeypatch.setattr(app_module, "HomeAssistantCatalogStorage", make_storage)
 
+    if binary_storage is not None:
+
+        def make_binary_storage(_hass, *, entry_id: str, destination_id: str):
+            assert entry_id == "entry-1"
+            assert destination_id == "destination-1"
+            return binary_storage
+
+        monkeypatch.setattr(
+            app_module,
+            "HomeAssistantBinaryCatalogStorage",
+            make_binary_storage,
+        )
+
 
 @pytest.mark.asyncio
-async def test_application_is_inert_without_negotiated_numeric_feature() -> None:
-    """Direct invocation cannot bypass the authenticated feature gate."""
+async def test_application_is_inert_without_negotiated_export_feature() -> None:
+    """Direct invocation cannot bypass authenticated application feature gates."""
     selection = ProtocolSelection(
         version=PROTOCOL_VERSION_V2,
         websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
@@ -228,6 +292,152 @@ async def test_application_is_inert_without_negotiated_numeric_feature() -> None
     await HomeAssistantExportApplication(_Hass()).async_connected(session)
 
     assert session.sent == []
+
+
+@pytest.mark.asyncio
+async def test_application_reconciles_binary_only_when_independently_negotiated(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A binary-only peer uses only the binary wire route and catalog."""
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(
+        monkeypatch,
+        [binary],
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    session = _Session(
+        _confirmed_binary_response,
+        selection=_BINARY_SELECTION,
+    )
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    requests = [
+        parse_binary_apply(_BINARY_SELECTION, payload)
+        for payload in session.sent
+        if payload.get("type") == "binary_apply"
+    ]
+    assert [request.action.capability for request in requests] == [binary]
+    assert numeric_storage.document is None
+    catalog = catalog_from_document(binary_storage.document)
+    assert [record.capability for record in catalog.records] == [binary]
+    assert ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED.value not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_application_reconciles_mixed_features_into_separate_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Numeric and binary actions retain independent wire and storage state."""
+    numeric = _capability("numeric-source")
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(
+        monkeypatch,
+        [numeric, binary],
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.NUMERIC, CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    session = _Session(
+        _confirmed_mixed_response,
+        selection=_MIXED_SELECTION,
+    )
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert [payload["type"] for payload in session.sent] == [
+        "apply",
+        "binary_apply",
+    ]
+    assert [
+        record.capability
+        for record in catalog_from_document(numeric_storage.document).records
+    ] == [numeric]
+    assert [
+        record.capability
+        for record in catalog_from_document(binary_storage.document).records
+    ] == [binary]
+
+
+@pytest.mark.asyncio
+async def test_binary_reconnect_uses_persisted_catalog_without_duplicate_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged binary reconnect is a no-op after its first commit."""
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(
+        monkeypatch,
+        [binary],
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    application = HomeAssistantExportApplication(_Hass())
+    session = _Session(
+        _confirmed_binary_response,
+        selection=_BINARY_SELECTION,
+    )
+
+    await application.async_connected(session)
+    await application.async_connected(session)
+
+    assert [payload["type"] for payload in session.sent] == ["binary_apply"]
+    assert len(binary_storage.saved_documents) == 1
+
+
+@pytest.mark.asyncio
+async def test_binary_unavailable_state_is_reasserted_on_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect restores runtime-only timeout through the binary route."""
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    capabilities = [binary]
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(
+        monkeypatch,
+        capabilities,
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    application = HomeAssistantExportApplication(_Hass())
+    session = _Session(
+        _confirmed_binary_response,
+        selection=_BINARY_SELECTION,
+    )
+    await application.async_connected(session)
+
+    capabilities[0] = replace(
+        binary,
+        value=None,
+        availability=Availability.UNAVAILABLE,
+    )
+    await application.async_connected(session)
+    await application.async_connected(session)
+
+    requests = [
+        parse_binary_apply(_BINARY_SELECTION, payload)
+        for payload in session.sent
+        if payload.get("type") == "binary_apply"
+    ]
+    assert [request.action.kind for request in requests] == [
+        ReconciliationActionKind.CREATE,
+        ReconciliationActionKind.MARK_UNAVAILABLE,
+        ReconciliationActionKind.MARK_UNAVAILABLE,
+    ]
+    record = catalog_from_document(binary_storage.document).records[0]
+    assert record.capability.availability is Availability.UNAVAILABLE
+    assert record.capability.value is None
 
 
 @pytest.mark.asyncio
@@ -362,6 +572,26 @@ async def test_adapter_rejects_result_for_different_request() -> None:
 
     with pytest.raises(ProtocolError, match="invalid protocol message"):
         await DomoticzSessionTargetAdapter(_Session(responses)).async_apply(action)
+
+
+@pytest.mark.asyncio
+async def test_binary_adapter_uses_the_independent_binary_messages() -> None:
+    """The binary adapter neither sends nor accepts numeric apply messages."""
+    action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=_capability("binary-source", kind=CapabilityKind.BINARY),
+    )
+    session = _Session(
+        _confirmed_binary_response,
+        selection=_BINARY_SELECTION,
+    )
+
+    confirmation = await DomoticzBinarySessionTargetAdapter(session).async_apply(action)
+
+    assert session.sent[0]["type"] == "binary_apply"
+    request = parse_binary_apply(_BINARY_SELECTION, session.sent[0])
+    assert request.action == action
+    assert confirmation.source == action.capability.source
 
 
 @pytest.mark.asyncio

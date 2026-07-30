@@ -281,6 +281,32 @@ async def test_initially_unavailable_capability_is_created_without_a_value() -> 
     assert not report.catalog.records[0].stale
 
 
+@pytest.mark.parametrize(
+    "availability",
+    (Availability.UNKNOWN, Availability.UNAVAILABLE),
+)
+@pytest.mark.asyncio
+async def test_committed_non_available_state_is_reasserted(
+    availability: Availability,
+) -> None:
+    """Every connection reapplies runtime-only target availability."""
+    capability = _numeric("sensor-a", None, availability)
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    adapter = _FakeTargetAdapter(remote)
+    executor = ReconciliationExecutor(adapter, storage)
+    await executor.async_reconcile(_SCOPE, [capability])
+    calls_after_create = len(adapter.calls)
+
+    repeated = await executor.async_reconcile(_SCOPE, [capability])
+
+    assert repeated.actions[0].kind is ReconciliationActionKind.MARK_UNAVAILABLE
+    assert repeated.results[0].status is ExecutionStatus.COMMITTED
+    assert len(adapter.calls) == calls_after_create + 1
+    assert adapter.calls[-1] == repeated.actions[0]
+    assert not repeated.catalog.records[0].stale
+
+
 @pytest.mark.asyncio
 async def test_explicit_unavailable_missing_and_reappearance_are_distinct() -> None:
     """Stale tracks disappearance separately from explicit source availability."""
@@ -307,7 +333,9 @@ async def test_explicit_unavailable_missing_and_reappearance_are_distinct() -> N
     )
 
     repeated = await executor.async_reconcile(_SCOPE, [])
-    assert repeated.actions == ()
+    assert repeated.actions[0].kind is ReconciliationActionKind.MARK_UNAVAILABLE
+    assert repeated.results[0].status is ExecutionStatus.COMMITTED
+    assert repeated.catalog.records[0].stale
 
     returned = await executor.async_reconcile(_SCOPE, [available])
     assert returned.actions[0].kind is ReconciliationActionKind.UPDATE

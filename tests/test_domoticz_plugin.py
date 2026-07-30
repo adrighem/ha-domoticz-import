@@ -369,6 +369,40 @@ def _numeric_action(
     )
 
 
+def _binary_action(
+    protocol,
+    *,
+    kind="create",
+    target_id=None,
+    value=True,
+    availability="available",
+    stale=False,
+    name="Back door",
+    semantic="door",
+):
+    """Build one representative neutral passive binary action."""
+    source = protocol.SourceIdentity(
+        system="home_assistant",
+        instance_id="instance-1",
+        object_id="binary_sensor.back_door",
+        capability_id="state",
+    )
+    capability = protocol.Capability(
+        source=source,
+        kind=protocol.CapabilityKind.BINARY,
+        name=name,
+        value=value,
+        availability=protocol.Availability(availability),
+        semantic=semantic,
+    )
+    return protocol.ReconciliationAction(
+        kind=protocol.ReconciliationActionKind(kind),
+        capability=capability,
+        target_id=target_id,
+        stale=stale,
+    )
+
+
 @pytest.mark.parametrize(
     (
         "semantic",
@@ -474,6 +508,70 @@ def test_ambiguous_or_counter_numeric_values_fall_back_to_custom(
     assert profile.manages_options is True
 
 
+@pytest.mark.parametrize(
+    ("semantic", "expected_switch_type"),
+    [
+        ("battery", 0),
+        ("battery_charging", 0),
+        ("carbon_monoxide", 0),
+        ("cold", 0),
+        ("connectivity", 0),
+        ("door", 11),
+        ("garage_door", 11),
+        ("gas", 0),
+        ("heat", 0),
+        ("light", 0),
+        ("lock", 20),
+        ("moisture", 0),
+        ("motion", 8),
+        ("moving", 0),
+        ("occupancy", 0),
+        ("opening", 2),
+        ("plug", 0),
+        ("power", 0),
+        ("presence", 0),
+        ("problem", 0),
+        ("running", 0),
+        ("safety", 0),
+        ("smoke", 5),
+        ("sound", 0),
+        ("tamper", 0),
+        ("update", 0),
+        ("vibration", 0),
+        ("window", 2),
+        (None, 0),
+        ("future_device_class", 0),
+    ],
+)
+def test_all_binary_device_classes_have_a_safe_passive_profile(
+    loaded_plugin,
+    semantic,
+    expected_switch_type,
+):
+    """Known, absent, and future classes select an explicit safe switch."""
+    module, _domoticz = loaded_plugin
+    action = _binary_action(module.wire_protocol, semantic=semantic)
+
+    profile = module._binary_target_profile(action.capability)
+
+    assert profile.type_id == 244
+    assert profile.subtype == 73
+    assert profile.switch_type == expected_switch_type
+    assert profile.manages_options is False
+    assert profile.encoder(True, None) == (1, "On")
+    assert profile.encoder(False, None) == (0, "Off")
+
+
+def test_binary_profile_rejects_non_boolean_values(loaded_plugin):
+    """The Domoticz codec does not coerce integers or strings to switches."""
+    module, _domoticz = loaded_plugin
+    action = _binary_action(module.wire_protocol)
+    profile = module._binary_target_profile(action.capability)
+
+    with pytest.raises(module.DomoticzApplyError):
+        profile.encoder(1, None)
+
+
 def _send_apply(
     module,
     plugin,
@@ -515,6 +613,50 @@ def _send_apply(
         last_sequence=previous_out_sequence,
     )
     return protocol.parse_apply_result(
+        plugin._protocol_selection,
+        response.payload,
+    )
+
+
+def _send_binary_apply(
+    module,
+    plugin,
+    connection,
+    session_key,
+    session_id,
+    *,
+    request_id,
+    action,
+):
+    """Send one signed passive binary request and parse its response."""
+    protocol = module.wire_protocol
+    payload = protocol.build_binary_apply(
+        plugin._protocol_selection,
+        request_id,
+        action,
+    )
+    previous_out_sequence = plugin._out_sequence
+    envelope = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload=payload,
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(envelope)},
+    )
+    response = protocol.verify_envelope(
+        session_key,
+        protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
+        expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
+        expected_session_id=session_id,
+        last_sequence=previous_out_sequence,
+    )
+    return protocol.parse_binary_apply_result(
         plugin._protocol_selection,
         response.payload,
     )
@@ -716,7 +858,8 @@ def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
 
     assert domoticz.statuses == [
         "Authenticated Home Assistant connection is ready; "
-        "protocol=ha-domoticz-sync.v2; features=ha-export.numeric.v1."
+        "protocol=ha-domoticz-sync.v2; "
+        "features=ha-export.binary.v1,ha-export.numeric.v1."
     ]
 
     server_ping_id = protocol.generate_nonce()
@@ -870,6 +1013,49 @@ def test_v2_without_numeric_feature_does_not_parse_or_apply(
     assert connection.disconnected
 
 
+def test_v2_numeric_only_peer_does_not_parse_or_apply_binary(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Independent feature gating rejects binary messages before parsing."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=(protocol.FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    assert plugin._protocol_selection.features == (
+        protocol.FEATURE_HA_EXPORT_NUMERIC_V1,
+    )
+    parse_calls = []
+
+    def record_parse(*args, **kwargs):
+        parse_calls.append((args, kwargs))
+        raise AssertionError
+
+    monkeypatch.setattr(protocol, "parse_binary_apply", record_parse)
+    binary_apply = protocol.sign_envelope(
+        session_key,
+        protocol_version=protocol.PROTOCOL_VERSION_V2,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=2,
+        payload={"schema": 1, "type": "binary_apply"},
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(binary_apply)},
+    )
+
+    assert parse_calls == []
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+
+
 @pytest.mark.parametrize(
     ("selected_protocol", "wrong_version"),
     [
@@ -1008,6 +1194,220 @@ def test_signed_create_uses_native_sensor_and_survives_lost_ack(
     assert unit.Options == {}
     assert unit.nValue == 0
     assert unit.sValue == "20.0"
+
+
+def test_signed_binary_create_is_idempotent_across_reconnects(loaded_plugin):
+    """A repeated passive create adopts the deterministic existing switch."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    first_plugin, first_connection = _start_and_upgrade(module)
+    first_key, first_session_id = _complete_handshake(
+        module,
+        first_plugin,
+        first_connection,
+    )
+    action = _binary_action(protocol, semantic="door")
+
+    first = _send_binary_apply(
+        module,
+        first_plugin,
+        first_connection,
+        first_key,
+        first_session_id,
+        request_id="binary-create-1",
+        action=action,
+    )
+    repeated = _send_binary_apply(
+        module,
+        first_plugin,
+        first_connection,
+        first_key,
+        first_session_id,
+        request_id="binary-create-repeated-1",
+        action=action,
+    )
+
+    second_plugin, second_connection = _start_and_upgrade(module)
+    second_key, second_session_id = _complete_handshake(
+        module,
+        second_plugin,
+        second_connection,
+    )
+    reconnected = _send_binary_apply(
+        module,
+        second_plugin,
+        second_connection,
+        second_key,
+        second_session_id,
+        request_id="binary-create-reconnected-1",
+        action=action,
+    )
+
+    expected_id = module._device_id_for_source(action.capability.source)
+    assert first.status is protocol.ApplyResultStatus.CONFIRMED
+    assert first.target_id == expected_id
+    assert first.source == action.capability.source
+    assert repeated.status is protocol.ApplyResultStatus.CONFIRMED
+    assert reconnected.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == 1
+    assert domoticz.create_calls[0] == {
+        "Name": "Back door",
+        "DeviceID": expected_id,
+        "Unit": 1,
+        "Type": 244,
+        "Subtype": 73,
+        "Switchtype": 11,
+        "Used": 1,
+    }
+    unit = domoticz.devices[expected_id].Units[1]
+    assert unit.nValue == 1
+    assert unit.sValue == "On"
+    assert domoticz.devices[expected_id].TimedOut == 0
+
+
+def test_binary_update_and_unavailable_preserve_last_state(loaded_plugin):
+    """Binary changes converge in place and unavailable retains the value."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    create_action = _binary_action(protocol, semantic="motion")
+    created = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-motion-create-1",
+        action=create_action,
+    )
+    device_id = created.target_id
+    create_count = len(domoticz.create_calls)
+
+    updated = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-motion-update-1",
+        action=_binary_action(
+            protocol,
+            kind="update",
+            target_id=device_id,
+            value=False,
+            name="Hall motion",
+            semantic="motion",
+        ),
+    )
+    unavailable_action = _binary_action(
+        protocol,
+        kind="mark_unavailable",
+        target_id=device_id,
+        value=None,
+        availability="unavailable",
+        stale=True,
+        name="Hall motion",
+        semantic="motion",
+    )
+    unavailable = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-motion-unavailable-1",
+        action=unavailable_action,
+    )
+    domoticz.devices[device_id].TimedOut = 0
+    repeated_unavailable = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-motion-unavailable-reconnect-1",
+        action=unavailable_action,
+    )
+
+    unit = domoticz.devices[device_id].Units[1]
+    assert updated.status is protocol.ApplyResultStatus.CONFIRMED
+    assert unavailable.status is protocol.ApplyResultStatus.CONFIRMED
+    assert repeated_unavailable.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == create_count
+    assert unit.Name == "Hall motion"
+    assert unit.Type == 244
+    assert unit.SubType == 73
+    assert unit.SwitchType == 8
+    assert unit.nValue == 0
+    assert unit.sValue == "Off"
+    assert domoticz.devices[device_id].TimedOut == 1
+
+
+def test_binary_apply_rejects_incompatible_collision(loaded_plugin):
+    """A deterministic ID collision never retypes an unrelated device."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _binary_action(protocol, semantic="smoke")
+    device_id = module._device_id_for_source(action.capability.source)
+    module.Domoticz.Unit(
+        Name="Do not replace",
+        DeviceID=device_id,
+        Unit=1,
+        Type=244,
+        Subtype=73,
+        Switchtype=0,
+    ).Create()
+    incompatible = domoticz.devices[device_id].Units[1]
+
+    result = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-collision-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert result.target_id is None
+    assert result.source is None
+    assert domoticz.devices[device_id].Units[1] is incompatible
+    assert incompatible.Name == "Do not replace"
+    assert incompatible.SwitchType == 0
+    assert not incompatible.deleted
+
+
+def test_binary_command_callback_is_an_explicit_read_only_noop(loaded_plugin):
+    """A Domoticz control never changes state or sends a reverse command."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _binary_action(protocol, value=True)
+    created = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="binary-read-only-1",
+        action=action,
+    )
+    unit = domoticz.devices[created.target_id].Units[1]
+    sent_before = list(connection.sent)
+    module._plugin = plugin
+
+    module.onCommand(created.target_id, 1, "Off", 0, None)
+
+    assert unit.nValue == 1
+    assert unit.sValue == "On"
+    assert connection.sent == sent_before
+    assert domoticz.statuses[-1] == "Home Assistant export devices are read-only."
+    assert not hasattr(module, "onDeviceModified")
 
 
 def test_update_adopts_and_converges_matching_native_sensor(loaded_plugin):

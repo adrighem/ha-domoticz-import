@@ -66,6 +66,8 @@ _PING_TIMEOUT_TICKS = 3
 _MAX_RECONNECT_TICKS = 32
 _CUSTOM_SENSOR_TYPE = 243
 _CUSTOM_SENSOR_SUBTYPE = 31
+_GENERAL_SWITCH_TYPE = 244
+_GENERAL_SWITCH_SUBTYPE = 73
 _TARGET_UNIT = 1
 _DEFAULT_SWITCH_TYPE = 0
 
@@ -242,6 +244,13 @@ def _scaled_value(value, unit, factors):
 
 def _encode_custom(value, _unit):
     return 0, _numeric_s_value(value)
+
+
+def _encode_binary(value, _unit):
+    """Encode one exact binary state as a Domoticz General Switch value."""
+    if type(value) is not bool:
+        raise DomoticzApplyError
+    return (1, "On") if value else (0, "Off")
 
 
 def _encode_temperature(value, unit):
@@ -438,6 +447,16 @@ _SOUND_PRESSURE_PROFILE = _TargetProfile(243, 24, 0, _encode_sound_pressure, Fal
 _IRRADIANCE_PROFILE = _TargetProfile(243, 2, 0, _encode_irradiance, False)
 _CARBON_DIOXIDE_PROFILE = _TargetProfile(249, 1, 0, _encode_carbon_dioxide, False)
 _UV_INDEX_PROFILE = _TargetProfile(87, 1, 0, _encode_uv_index, False)
+_BINARY_SWITCH_TYPE_BY_SEMANTIC = {
+    "door": 11,
+    "garage_door": 11,
+    "opening": 2,
+    "window": 2,
+    "motion": 8,
+    "smoke": 5,
+    # Door Lock Inverted preserves HA's on=unlocked binary meaning.
+    "lock": 20,
+}
 _ALWAYS_CUSTOM_SEMANTICS = {
     "aqi",
     "energy",
@@ -485,6 +504,20 @@ def _target_profile(capability):
     if unit == "UV index":
         return _UV_INDEX_PROFILE
     return _CUSTOM_PROFILE
+
+
+def _binary_target_profile(capability):
+    """Choose a passive switch profile with a safe generic fallback."""
+    return _TargetProfile(
+        _GENERAL_SWITCH_TYPE,
+        _GENERAL_SWITCH_SUBTYPE,
+        _BINARY_SWITCH_TYPE_BY_SEMANTIC.get(
+            capability.semantic,
+            _DEFAULT_SWITCH_TYPE,
+        ),
+        _encode_binary,
+        False,
+    )
 
 
 class DomoticzSyncPlugin:
@@ -918,6 +951,16 @@ class DomoticzSyncPlugin:
                 raise wire_protocol.ProtocolCompatibilityError
             self._handle_apply_payload(payload)
             return
+        if message_type == "binary_apply":
+            if (
+                self._protocol_selection is None
+                or not self._protocol_selection.supports(
+                    wire_protocol.FEATURE_HA_EXPORT_BINARY_V1
+                )
+            ):
+                raise wire_protocol.ProtocolCompatibilityError
+            self._handle_binary_apply_payload(payload)
+            return
 
         message_id = payload.get("id")
         if set(payload) != {"type", "id"}:
@@ -956,12 +999,53 @@ class DomoticzSyncPlugin:
             )
         self._send_signed(result)
 
+    def _handle_binary_apply_payload(self, payload):
+        """Apply one passive binary request and return a sanitized result."""
+        request = wire_protocol.parse_binary_apply(
+            self._protocol_selection,
+            payload,
+        )
+
+        try:
+            target_id = self._apply_binary_action(request.action)
+        except Exception:
+            result = wire_protocol.build_binary_apply_result(
+                self._protocol_selection,
+                request.request_id,
+                wire_protocol.ApplyResultStatus.REJECTED,
+                None,
+                None,
+            )
+        else:
+            result = wire_protocol.build_binary_apply_result(
+                self._protocol_selection,
+                request.request_id,
+                wire_protocol.ApplyResultStatus.CONFIRMED,
+                target_id,
+                request.action.capability.source,
+            )
+        self._send_signed(result)
+
     def _apply_action(self, action):
         """Idempotently converge and re-read one numeric Domoticz target."""
         capability = action.capability
         if capability.kind.value != "numeric":
             raise DomoticzApplyError
+        return self._apply_profile_action(action, _target_profile(capability))
 
+    def _apply_binary_action(self, action):
+        """Idempotently converge and re-read one passive binary target."""
+        capability = action.capability
+        if capability.kind.value != "binary":
+            raise DomoticzApplyError
+        return self._apply_profile_action(
+            action,
+            _binary_target_profile(capability),
+        )
+
+    def _apply_profile_action(self, action, profile):
+        """Idempotently converge one capability through an exact profile."""
+        capability = action.capability
         action_kind = action.kind.value
         if action_kind not in {"create", "update", "mark_unavailable"}:
             raise DomoticzApplyError
@@ -971,7 +1055,6 @@ class DomoticzSyncPlugin:
             raise DomoticzApplyError
 
         available = capability.availability.value == "available"
-        profile = _target_profile(capability)
         desired_values = (
             profile.encoder(capability.value, capability.unit) if available else None
         )
@@ -1280,6 +1363,11 @@ class DomoticzSyncPlugin:
             except Exception:
                 pass
 
+    @staticmethod
+    def onCommand(_device_id, _unit, _command, _level, _color):
+        """Reject Domoticz controls because exported entities are read-only."""
+        Domoticz.Status("Home Assistant export devices are read-only.")
+
     def _reject_connection(self, message, *, send_close=True):
         Domoticz.Error(message)
         connection = self.connection
@@ -1360,3 +1448,15 @@ def onDisconnect(Connection):
 
 def onHeartbeat():
     return _callback("heartbeat", _plugin.onHeartbeat)
+
+
+def onCommand(DeviceID, Unit, Command, Level, Color):
+    return _callback(
+        "command",
+        _plugin.onCommand,
+        DeviceID,
+        Unit,
+        Command,
+        Level,
+        Color,
+    )

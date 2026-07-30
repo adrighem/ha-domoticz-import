@@ -7,6 +7,9 @@
 - Keep configuration choices editable while treating generated credentials as
   read-only values.
 - Explain limitations at the point where users encounter them.
+- Treat Home Assistant and Domoticz users as equal first-class audiences in
+  installation, configuration, upgrade, troubleshooting, and verification
+  documentation.
 
 ## Safety
 

@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant  # noqa: E402
 from homeassistant.helpers.storage import Store  # noqa: E402
 
 from custom_components.domoticz_sync.catalog_storage import (  # noqa: E402
+    HomeAssistantBinaryCatalogStorage,
     HomeAssistantCatalogStorage,
 )
 from custom_components.domoticz_sync.core import CatalogStorageError  # noqa: E402
@@ -22,7 +23,39 @@ from custom_components.domoticz_sync.core import CatalogStorageError  # noqa: E4
 ENTRY_ID = "entry-1"
 DESTINATION_ID = "domoticz-destination-1"
 STORAGE_KEY = "domoticz_sync.target_catalog.entry-1.domoticz-destination-1"
+BINARY_STORAGE_KEY = (
+    "domoticz_sync.target_catalog.binary.entry-1.domoticz-destination-1"
+)
 CATALOG = {"version": 2, "targets": []}
+
+
+def _catalog_for_kind(kind: str) -> dict[str, object]:
+    """Build one valid non-empty catalog for a capability kind."""
+    binary = kind == "binary"
+    return {
+        "version": 2,
+        "targets": [
+            {
+                "target_id": f"{kind}-target-1",
+                "capability": {
+                    "source": {
+                        "system": "home_assistant",
+                        "instance_id": "instance-1",
+                        "object_id": f"{kind}-entry-1",
+                        "capability_id": "state",
+                    },
+                    "kind": kind,
+                    "name": "Motion" if binary else "Temperature",
+                    "value": True if binary else 21.5,
+                    "availability": "available",
+                    "semantic": "motion" if binary else "temperature",
+                    "unit": None if binary else "celsius",
+                    "state_class": None if binary else "measurement",
+                },
+                "stale": False,
+            }
+        ],
+    }
 
 
 @pytest.fixture
@@ -63,6 +96,122 @@ async def test_missing_catalog_can_be_saved_and_loaded(
         "entry_id": ENTRY_ID,
         "destination_id": DESTINATION_ID,
         "catalog": CATALOG,
+    }
+
+
+async def test_binary_catalog_uses_an_independent_storage_namespace(
+    hass: HomeAssistant,
+) -> None:
+    """Binary persistence cannot read or overwrite the numeric catalog."""
+    numeric = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=ENTRY_ID,
+        destination_id=DESTINATION_ID,
+    )
+    binary = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=ENTRY_ID,
+        destination_id=DESTINATION_ID,
+    )
+    binary_catalog = _catalog_for_kind("binary")
+
+    assert numeric.key == STORAGE_KEY
+    assert binary.key == BINARY_STORAGE_KEY
+
+    await numeric.async_save(CATALOG)
+    await binary.async_save(binary_catalog)
+
+    assert await numeric.async_load() == CATALOG
+    assert await binary.async_load() == binary_catalog
+
+
+@pytest.mark.parametrize(
+    ("storage_class", "storage_key", "wrong_kind"),
+    [
+        (HomeAssistantCatalogStorage, STORAGE_KEY, "binary"),
+        (HomeAssistantBinaryCatalogStorage, BINARY_STORAGE_KEY, "numeric"),
+    ],
+)
+async def test_load_rejects_valid_catalog_from_the_wrong_capability_kind(
+    hass: HomeAssistant,
+    storage_class: type[HomeAssistantCatalogStorage],
+    storage_key: str,
+    wrong_kind: str,
+) -> None:
+    """A catalog cannot cross the numeric and binary trust boundary."""
+    wrapper = {
+        "entry_id": ENTRY_ID,
+        "destination_id": DESTINATION_ID,
+        "catalog": _catalog_for_kind(wrong_kind),
+    }
+    raw_store = Store(
+        hass,
+        1,
+        storage_key,
+        private=True,
+        atomic_writes=True,
+    )
+    await raw_store.async_save(wrapper)
+    storage = storage_class(
+        hass,
+        entry_id=ENTRY_ID,
+        destination_id=DESTINATION_ID,
+    )
+
+    with pytest.raises(
+        CatalogStorageError,
+        match="target catalog could not be loaded",
+    ):
+        await storage.async_load()
+
+    assert await raw_store.async_load() == wrapper
+
+
+@pytest.mark.parametrize(
+    ("storage_class", "storage_key", "correct_kind", "wrong_kind"),
+    [
+        (HomeAssistantCatalogStorage, STORAGE_KEY, "numeric", "binary"),
+        (
+            HomeAssistantBinaryCatalogStorage,
+            BINARY_STORAGE_KEY,
+            "binary",
+            "numeric",
+        ),
+    ],
+)
+async def test_save_rejects_wrong_kind_without_overwriting_valid_catalog(
+    hass: HomeAssistant,
+    storage_class: type[HomeAssistantCatalogStorage],
+    storage_key: str,
+    correct_kind: str,
+    wrong_kind: str,
+) -> None:
+    """A wrong-kind document fails before replacing trusted persisted state."""
+    storage = storage_class(
+        hass,
+        entry_id=ENTRY_ID,
+        destination_id=DESTINATION_ID,
+    )
+    correct_catalog = _catalog_for_kind(correct_kind)
+    await storage.async_save(correct_catalog)
+
+    with pytest.raises(
+        CatalogStorageError,
+        match="target catalog could not be saved",
+    ):
+        await storage.async_save(_catalog_for_kind(wrong_kind))
+
+    persisted = await Store(
+        hass,
+        1,
+        storage_key,
+        private=True,
+        atomic_writes=True,
+    ).async_load()
+    assert persisted == {
+        "entry_id": ENTRY_ID,
+        "destination_id": DESTINATION_ID,
+        "catalog": correct_catalog,
     }
 
 

@@ -17,6 +17,9 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 
 from aiohttp import WSMsgType  # noqa: E402
 from aiohttp import client as aiohttp_client  # noqa: E402
+from homeassistant.components.binary_sensor import (  # noqa: E402
+    BinarySensorDeviceClass,
+)
 from homeassistant.components.sensor import (  # noqa: E402
     ATTR_STATE_CLASS,
     SensorDeviceClass,
@@ -26,6 +29,9 @@ from homeassistant.const import (  # noqa: E402
     ATTR_DEVICE_CLASS,
     ATTR_FRIENDLY_NAME,
     ATTR_UNIT_OF_MEASUREMENT,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant  # noqa: E402
@@ -48,6 +54,7 @@ from custom_components.domoticz_sync.bridge_reconciliation import (  # noqa: E40
     HomeAssistantExportApplication,
 )
 from custom_components.domoticz_sync.catalog_storage import (  # noqa: E402
+    HomeAssistantBinaryCatalogStorage,
     HomeAssistantCatalogStorage,
 )
 from custom_components.domoticz_sync.const import (  # noqa: E402
@@ -771,3 +778,243 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
             bridge_view,
             3,
         )
+
+
+@pytest.mark.asyncio
+async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create, update, and reassert an unavailable native binary target."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="binary-integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    source_entry = registry.async_get_or_create(
+        "binary_sensor",
+        "integration_test",
+        "hall_motion",
+        suggested_object_id="hall_motion",
+        original_device_class=BinarySensorDeviceClass.MOTION,
+        original_name="Hall motion",
+    )
+    registry.async_update_entity(
+        source_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    state_attributes = {
+        ATTR_DEVICE_CLASS: BinarySensorDeviceClass.MOTION,
+        ATTR_FRIENDLY_NAME: "Hall motion",
+    }
+    hass.states.async_set(source_entry.entity_id, STATE_ON, state_attributes)
+
+    application = _ObservedApplication(HomeAssistantExportApplication(hass))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+    assert endpoint.port is not None
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    async def open_and_reconcile(
+        expected_call: int,
+        *,
+        expect_apply: bool,
+    ) -> tuple[object, _FakeConnection, object, int]:
+        opened = await _open_plugin_connection(
+            plugin_module,
+            fake_domoticz,
+            client,
+            monkeypatch,
+        )
+        plugin, connection, websocket, position = opened
+        if expect_apply:
+            position = await _exchange_one_apply(
+                plugin,
+                connection,
+                websocket,
+                position,
+                application,
+                expected_call,
+            )
+        await application.async_wait_for_calls(expected_call)
+        return plugin, connection, websocket, position
+
+    first, first_connection, first_websocket, first_position = await open_and_reconcile(
+        1, expect_apply=True
+    )
+    destination_id = first._destination_id
+    assert isinstance(destination_id, str)
+    binary_storage = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    numeric_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    try:
+        catalog = catalog_from_document(await binary_storage.async_load())
+        assert len(catalog.records) == 1
+        record = catalog.records[0]
+        assert record.capability.semantic == BinarySensorDeviceClass.MOTION
+        assert record.capability.value is True
+        target_id = record.target_id
+        assert await numeric_storage.async_load() is None
+        assert len(fake_domoticz.create_calls) == 1
+        assert first_position == len(first_connection.sent)
+
+        unit = fake_domoticz.devices[target_id].Units[1]
+        assert unit.Name == "Hall motion"
+        assert unit.Type == 244
+        assert unit.SubType == 73
+        assert unit.SwitchType == 8
+        assert unit.Used == 1
+        assert unit.nValue == 1
+        assert unit.sValue == "On"
+        assert fake_domoticz.devices[target_id].TimedOut == 0
+    finally:
+        await _close_plugin_connection(
+            first,
+            first_websocket,
+            manager,
+            bridge_view,
+            1,
+        )
+
+    (
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+    ) = await open_and_reconcile(2, expect_apply=False)
+    try:
+        assert second._destination_id == destination_id
+        assert second_position == len(second_connection.sent)
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id].Units[1] is unit
+    finally:
+        await _close_plugin_connection(
+            second,
+            second_websocket,
+            manager,
+            bridge_view,
+            2,
+        )
+
+    hass.states.async_set(source_entry.entity_id, STATE_OFF, state_attributes)
+    third, third_connection, third_websocket, third_position = await open_and_reconcile(
+        3, expect_apply=True
+    )
+    try:
+        updated_storage = HomeAssistantBinaryCatalogStorage(
+            hass,
+            entry_id=entry.entry_id,
+            destination_id=destination_id,
+        )
+        updated_catalog = catalog_from_document(await updated_storage.async_load())
+        assert updated_catalog.records[0].target_id == target_id
+        assert updated_catalog.records[0].capability.value is False
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id].Units[1] is unit
+        assert unit.nValue == 0
+        assert unit.sValue == "Off"
+        assert fake_domoticz.devices[target_id].TimedOut == 0
+        assert third_position == len(third_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            third,
+            third_websocket,
+            manager,
+            bridge_view,
+            3,
+        )
+
+    hass.states.async_set(
+        source_entry.entity_id,
+        STATE_UNAVAILABLE,
+        state_attributes,
+    )
+    (
+        fourth,
+        fourth_connection,
+        fourth_websocket,
+        fourth_position,
+    ) = await open_and_reconcile(4, expect_apply=True)
+    try:
+        unavailable_storage = HomeAssistantBinaryCatalogStorage(
+            hass,
+            entry_id=entry.entry_id,
+            destination_id=destination_id,
+        )
+        unavailable_catalog = catalog_from_document(
+            await unavailable_storage.async_load()
+        )
+        unavailable_record = unavailable_catalog.records[0]
+        assert unavailable_record.target_id == target_id
+        assert unavailable_record.capability.value is None
+        assert unavailable_record.capability.availability.value == "unavailable"
+        assert len(fake_domoticz.create_calls) == 1
+        assert unit.nValue == 0
+        assert unit.sValue == "Off"
+        assert fake_domoticz.devices[target_id].TimedOut == 1
+        assert fourth_position == len(fourth_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            fourth,
+            fourth_websocket,
+            manager,
+            bridge_view,
+            4,
+        )
+
+    # Domoticz does not persist Device.TimedOut. Simulate a plugin process
+    # restart clearing it while Home Assistant still has the same unavailable
+    # snapshot and catalog record.
+    fake_domoticz.devices[target_id].TimedOut = 0
+    fifth, fifth_connection, fifth_websocket, fifth_position = await open_and_reconcile(
+        5, expect_apply=True
+    )
+    try:
+        assert fifth._destination_id == destination_id
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id].Units[1] is unit
+        assert unit.nValue == 0
+        assert unit.sValue == "Off"
+        assert fake_domoticz.devices[target_id].TimedOut == 1
+        assert fifth_position == len(fifth_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            fifth,
+            fifth_websocket,
+            manager,
+            bridge_view,
+            5,
+        )
+
+    assert fake_domoticz.errors == []

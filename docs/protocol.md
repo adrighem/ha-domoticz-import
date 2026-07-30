@@ -63,22 +63,31 @@ authentication fail.
 
 ## Application Features and Schemas
 
-The first write-capable feature is:
+Numeric and passive binary export are independent write-capable features:
 
 ```text
 ha-export.numeric.v1
+ha-export.binary.v1
 ```
 
-Home Assistant may send numeric export actions only when this feature appears
-in `selected_features`. The Domoticz plugin must reject a feature-bearing
-message that was not negotiated.
+Home Assistant may send an export action only when its feature appears in
+`selected_features`. A session can support numeric export, binary export, both,
+or neither. The Domoticz plugin rejects a feature-bearing message that was not
+negotiated.
 
-V2 application messages use exact schemas. The base `application_ready`
-message uses schema `1`. The `apply` and `apply_result` messages also use schema
-`1` and require the negotiated `ha-export.numeric.v1` feature. Parsers require
-the exact keys and value types for the selected message and schema. Missing
-fields, extra fields, unknown schemas, unsupported message types, invalid
-sequences, and messages belonging to an unselected feature fail closed.
+V2 application messages use exact schemas:
+
+- `application_ready` uses schema `1` and is feature-independent;
+- `apply` and `apply_result` use schema `1` and require
+  `ha-export.numeric.v1`; and
+- `binary_apply` and `binary_apply_result` use schema `1` and require
+  `ha-export.binary.v1`.
+
+The numeric schemas remain unchanged by the addition of binary export. Parsers
+require the exact keys and value types for the selected message and schema.
+Missing fields, extra fields, unknown schemas, unsupported message types,
+invalid sequences, cross-kind values, and messages belonging to an unselected
+feature fail closed.
 
 An existing schema is immutable after release. Adding an optional field is
 still a schema change and requires a new schema or a new versioned feature.
@@ -95,7 +104,8 @@ intermediate states are safe:
 | --- | --- | --- |
 | New, v1 and v2 aware | Old, v1 only | Authenticated v1 heartbeat session; export is disabled |
 | Old, v1 only | New, v1 and v2 aware | Authenticated v1 heartbeat session; export is disabled |
-| New, v1 and v2 aware | New, v2 aware | Authenticated v2 session; numeric export runs when `ha-export.numeric.v1` is selected |
+| Current, v1 and v2 aware | Current, v2 aware | Authenticated v2 session; numeric and binary export run independently when their features are selected |
+| Current binary-aware peer | Earlier numeric-only v2 peer | Authenticated v2 session; numeric export continues and binary export stays disabled |
 | Both support v2 but not the same optional feature | Mixed feature support | The v2 session may run its common baseline, but the unsupported feature is not used |
 
 No mixed state permits legacy writes. A mismatch can temporarily stop export,
@@ -128,6 +138,9 @@ Future protocol changes must follow these rules:
 7. Compatibility tests cover current/current, new Home Assistant with the
    previous plugin, previous Home Assistant with the new plugin, no common
    protocol, feature intersection, and negotiation tampering.
+8. Target-profile selection and value encoding released under a feature remain
+   stable. A mapping change that would retype an existing Domoticz target
+   requires an explicit migration strategy or a new versioned feature.
 
 Support for an older major protocol may be removed only as an explicit
 breaking change after its compatibility window. It must not disappear as a
@@ -135,8 +148,17 @@ side effect of adding a feature.
 
 ## Catalog Versions
 
-The Home Assistant target catalog is local persistence, not a wire-protocol
-document. Its versions are independent:
+The Home Assistant target catalogs are local persistence, not wire-protocol
+documents. Numeric and binary state use separate Store keys:
+
+```text
+domoticz_sync.target_catalog.{entry_id}.{destination_id}
+domoticz_sync.target_catalog.binary.{entry_id}.{destination_id}
+```
+
+Keeping the catalogs separate prevents a peer that supports only one feature
+from treating the other capability kind as missing. Their versions are
+independent of the wire protocol:
 
 - the outer Home Assistant Store container remains version `1`;
 - the current inner target catalog uses exact schema version `2`; and
@@ -180,6 +202,6 @@ That attack is limited to availability:
 - repeated negotiation values are authenticated inside the v2 handshake; and
 - frozen legacy v1 has no write-capable feature or application message.
 
-Header stripping can therefore suppress a connection or numeric export, but it
-cannot make Home Assistant perform a legacy write, make the plugin accept a v2
-write as v1, or forge an authenticated application message.
+Header stripping can therefore suppress a connection or negotiated export, but
+it cannot make Home Assistant perform a legacy write, make the plugin accept a
+v2 write as v1, or forge an authenticated application message.

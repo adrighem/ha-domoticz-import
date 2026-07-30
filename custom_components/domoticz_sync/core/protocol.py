@@ -27,9 +27,13 @@ PROTOCOL_VERSION = PROTOCOL_VERSION_V1
 PROTOCOL_VERSION_V2 = 2
 
 WEBSOCKET_SUBPROTOCOL_V2 = "ha-domoticz-sync.v2"
+FEATURE_HA_EXPORT_BINARY_V1 = "ha-export.binary.v1"
 FEATURE_HA_EXPORT_NUMERIC_V1 = "ha-export.numeric.v1"
 SUPPORTED_WEBSOCKET_SUBPROTOCOLS = (WEBSOCKET_SUBPROTOCOL_V2,)
-SUPPORTED_V2_FEATURES = (FEATURE_HA_EXPORT_NUMERIC_V1,)
+SUPPORTED_V2_FEATURES = (
+    FEATURE_HA_EXPORT_BINARY_V1,
+    FEATURE_HA_EXPORT_NUMERIC_V1,
+)
 
 DIRECTION_DOMOTICZ_TO_HA = "domoticz_to_home_assistant"
 DIRECTION_HA_TO_DOMOTICZ = "home_assistant_to_domoticz"
@@ -1165,6 +1169,103 @@ def parse_apply_result(
         raise ProtocolFormatError("invalid protocol message") from None
 
 
+def build_binary_apply(
+    selection: ProtocolSelection,
+    request_id: str,
+    action: ReconciliationAction,
+) -> Dict[str, object]:
+    """Build one strict binary Home Assistant-to-Domoticz request."""
+    _require_binary_export_selection(selection)
+    request = ApplyRequest(request_id=request_id, action=action)
+    if request.action.capability.kind is not CapabilityKind.BINARY:
+        raise ProtocolFormatError("invalid protocol message")
+    return _normalize_payload(
+        {
+            "schema": 1,
+            "type": "binary_apply",
+            "request_id": request.request_id,
+            "action": _action_to_dict(request.action),
+        }
+    )
+
+
+def parse_binary_apply(
+    selection: ProtocolSelection,
+    document: object,
+) -> ApplyRequest:
+    """Parse one exact binary request into the neutral action model."""
+    _require_binary_export_selection(selection)
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _APPLY_KEYS,
+            "binary_apply",
+        )
+        request = ApplyRequest(
+            request_id=_require_string(data["request_id"]),
+            action=_action_from_dict(data["action"]),
+        )
+        if request.action.capability.kind is not CapabilityKind.BINARY:
+            raise ProtocolFormatError("invalid protocol message")
+        return request
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def build_binary_apply_result(
+    selection: ProtocolSelection,
+    request_id: str,
+    status: ApplyResultStatus,
+    target_id: Optional[str],
+    source: Optional[SourceIdentity],
+) -> Dict[str, object]:
+    """Build one strict binary Domoticz-to-Home Assistant action result."""
+    _require_binary_export_selection(selection)
+    result = ApplyResult(
+        request_id=request_id,
+        status=status,
+        target_id=target_id,
+        source=source,
+    )
+    return _normalize_payload(
+        {
+            "schema": 1,
+            "type": "binary_apply_result",
+            "request_id": result.request_id,
+            "status": result.status.value,
+            "target_id": result.target_id,
+            "source": (
+                _source_to_dict(result.source) if result.source is not None else None
+            ),
+        }
+    )
+
+
+def parse_binary_apply_result(
+    selection: ProtocolSelection,
+    document: object,
+) -> ApplyResult:
+    """Parse one exact binary result without accepting remote error details."""
+    _require_binary_export_selection(selection)
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _APPLY_RESULT_KEYS,
+            "binary_apply_result",
+        )
+        source_data = data["source"]
+        return ApplyResult(
+            request_id=_require_string(data["request_id"]),
+            status=ApplyResultStatus(data["status"]),
+            target_id=data["target_id"],
+            source=(
+                _source_from_dict(source_data) if source_data is not None else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
 def _object_without_duplicate_keys(
     pairs: List[Tuple[str, object]],
 ) -> Dict[str, object]:
@@ -1361,6 +1462,16 @@ def _require_numeric_export_selection(
     """Require the negotiated Home Assistant numeric export behavior."""
     validated = _require_v2_selection(selection)
     if not validated.supports(FEATURE_HA_EXPORT_NUMERIC_V1):
+        raise ProtocolCompatibilityError("incompatible protocol")
+    return validated
+
+
+def _require_binary_export_selection(
+    selection: object,
+) -> ProtocolSelection:
+    """Require the negotiated Home Assistant binary export behavior."""
+    validated = _require_v2_selection(selection)
+    if not validated.supports(FEATURE_HA_EXPORT_BINARY_V1):
         raise ProtocolCompatibilityError("incompatible protocol")
     return validated
 
@@ -1618,6 +1729,7 @@ def _unsigned_envelope(
 __all__ = [
     "DIRECTION_DOMOTICZ_TO_HA",
     "DIRECTION_HA_TO_DOMOTICZ",
+    "FEATURE_HA_EXPORT_BINARY_V1",
     "FEATURE_HA_EXPORT_NUMERIC_V1",
     "MAX_FEATURE_IDS",
     "MAX_MESSAGE_BYTES",
@@ -1650,6 +1762,8 @@ __all__ = [
     "build_application_ready",
     "build_apply",
     "build_apply_result",
+    "build_binary_apply",
+    "build_binary_apply_result",
     "build_authenticate",
     "build_challenge",
     "build_hello",
@@ -1680,6 +1794,8 @@ __all__ = [
     "parse_apply",
     "parse_apply_result",
     "parse_application_ready",
+    "parse_binary_apply",
+    "parse_binary_apply_result",
     "parse_hello",
     "parse_v2_hello",
     "select_websocket_subprotocol",

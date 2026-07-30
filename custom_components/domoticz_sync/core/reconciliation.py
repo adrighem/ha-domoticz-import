@@ -196,8 +196,6 @@ def plan_reconciliation(
                 )
             )
         elif capability is None:
-            if target.stale:
-                continue
             actions.append(
                 ReconciliationAction(
                     kind=ReconciliationActionKind.MARK_UNAVAILABLE,
@@ -206,7 +204,11 @@ def plan_reconciliation(
                     stale=True,
                 )
             )
-        elif target.stale or capability != target.capability:
+        elif (
+            target.stale
+            or capability != target.capability
+            or capability.availability is not Availability.AVAILABLE
+        ):
             kind = (
                 ReconciliationActionKind.UPDATE
                 if capability.availability is Availability.AVAILABLE

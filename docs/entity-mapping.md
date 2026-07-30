@@ -54,11 +54,11 @@ are not exported by the numeric feature.
 
 ## Passive Binary Sensors
 
-Binary sensors are collected but are not exported yet. The planned passive
-mapping uses Domoticz General Switch devices and never sends a command back to
-Home Assistant.
+Binary sensors use Domoticz General Switch devices with Type 244 and Subtype
+73. They are read-only mirrors: a Domoticz command is refused and never sent
+back to Home Assistant.
 
-| Home Assistant device class | Planned Domoticz SwitchType |
+| Home Assistant device class | Domoticz SwitchType |
 | --- | --- |
 | `door`, `garage_door` | Door Contact |
 | `opening`, `window` | Contact |
@@ -71,10 +71,24 @@ Door Lock Inverted preserves Home Assistant's binary meaning: on means
 unlocked. The generic fallback avoids misleading mappings such as carbon
 monoxide to Smoke Detector or occupancy to Motion Sensor.
 
+Available `on` and `off` states become `On` and `Off`. An unavailable source
+keeps its last Domoticz value and is marked timed out. That timeout is runtime
+state and is reapplied when the plugin reconnects after a Domoticz restart.
+Export currently runs when the plugin connects, so later state or label changes
+also require a reconnect.
+
+Deterministic identity makes reconnects adopt the same device. A later device
+class change that selects a different SwitchType is rejected rather than
+silently retyping the existing Domoticz device.
+Once released, these mappings are part of the `ha-export.binary.v1`
+compatibility contract. A future change that would retype existing devices
+needs an explicit migration or a new feature version.
+
 ## Selection Diagnostics
 
-Directly labelled numeric entities that use Custom Sensor are exported
-successfully and do not produce warning-level logs. Directly labelled entities
-that cannot be exported produce a safe, deduplicated warning containing only
-the entity ID and a fixed reason. If the issue is resolved and later recurs,
-Home Assistant reports it again.
+Directly labelled numeric entities that use Custom Sensor and binary entities
+that use generic On/Off are exported successfully and do not produce
+warning-level logs. Directly labelled entities that cannot be exported by the
+negotiated feature set produce a safe, deduplicated warning containing only the
+entity ID and a fixed reason. If the issue is resolved and later recurs, Home
+Assistant reports it again.

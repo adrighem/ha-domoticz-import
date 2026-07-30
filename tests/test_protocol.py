@@ -19,6 +19,7 @@ from custom_components.domoticz_sync.core.capabilities import (
 from custom_components.domoticz_sync.core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     MAX_MESSAGE_BYTES,
     MAX_SAFE_INTEGER,
@@ -45,6 +46,8 @@ from custom_components.domoticz_sync.core.protocol import (
     build_apply,
     build_apply_result,
     build_authenticate,
+    build_binary_apply,
+    build_binary_apply_result,
     build_challenge,
     build_hello,
     build_ready,
@@ -74,6 +77,8 @@ from custom_components.domoticz_sync.core.protocol import (
     parse_application_ready,
     parse_apply,
     parse_apply_result,
+    parse_binary_apply,
+    parse_binary_apply_result,
     parse_hello,
     parse_v2_hello,
     select_websocket_subprotocol,
@@ -191,6 +196,31 @@ def _numeric_capability(
         semantic="temperature",
         unit="\N{DEGREE SIGN}C",
         state_class=state_class,
+    )
+
+
+def _binary_source_identity() -> SourceIdentity:
+    return SourceIdentity(
+        system="home_assistant",
+        instance_id="ha-instance-1",
+        object_id="binary_sensor.living_room_motion",
+        capability_id="state",
+    )
+
+
+def _binary_capability(
+    *,
+    availability: Availability = Availability.AVAILABLE,
+    value: object = True,
+    semantic: str | None = "motion",
+) -> Capability:
+    return Capability(
+        source=_binary_source_identity(),
+        kind=CapabilityKind.BINARY,
+        name="Living room motion",
+        value=value,
+        availability=availability,
+        semantic=semantic,
     )
 
 
@@ -716,7 +746,7 @@ def test_complete_v2_handshake_negotiates_features_and_agrees_on_session() -> No
             "server.feature",
         ),
     )
-    assert server_context.selection == _selection()
+    assert server_context.selection == _selection((FEATURE_HA_EXPORT_NUMERIC_V1,))
 
     challenge = build_v2_challenge(pairing_key, server_context)
     assert set(challenge) == {
@@ -746,10 +776,58 @@ def test_complete_v2_handshake_negotiates_features_and_agrees_on_session() -> No
     assert verify_v2_ready(client_key, client_context, ready) == ready["session_id"]
 
 
+@pytest.mark.parametrize(
+    ("client_features", "server_features", "selected_features"),
+    [
+        (
+            (FEATURE_HA_EXPORT_NUMERIC_V1,),
+            SUPPORTED_V2_FEATURES,
+            (FEATURE_HA_EXPORT_NUMERIC_V1,),
+        ),
+        (
+            SUPPORTED_V2_FEATURES,
+            (FEATURE_HA_EXPORT_NUMERIC_V1,),
+            (FEATURE_HA_EXPORT_NUMERIC_V1,),
+        ),
+        (
+            (FEATURE_HA_EXPORT_BINARY_V1,),
+            SUPPORTED_V2_FEATURES,
+            (FEATURE_HA_EXPORT_BINARY_V1,),
+        ),
+        (
+            SUPPORTED_V2_FEATURES,
+            SUPPORTED_V2_FEATURES,
+            SUPPORTED_V2_FEATURES,
+        ),
+    ],
+)
+def test_v2_mixed_versions_negotiate_features_independently(
+    client_features: tuple[str, ...],
+    server_features: tuple[str, ...],
+    selected_features: tuple[str, ...],
+) -> None:
+    """New and old peers retain exactly their mutually supported behavior."""
+    context = _fixed_v2_context(
+        client_features=client_features,
+        server_features=server_features,
+    )
+
+    assert context.selection.features == selected_features
+    assert context.selection.supports(FEATURE_HA_EXPORT_BINARY_V1) is (
+        FEATURE_HA_EXPORT_BINARY_V1 in selected_features
+    )
+    assert context.selection.supports(FEATURE_HA_EXPORT_NUMERIC_V1) is (
+        FEATURE_HA_EXPORT_NUMERIC_V1 in selected_features
+    )
+
+
 def test_v2_fixed_handshake_has_stable_cross_runtime_vectors() -> None:
     """V2 domains and the complete canonical negotiation cannot drift."""
     pairing_key = _fixed_pairing_key()
-    context = _fixed_v2_context()
+    context = _fixed_v2_context(
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+        server_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
 
     assert (
         create_v2_client_proof(pairing_key, context)
@@ -915,7 +993,12 @@ def test_signed_envelope_round_trip_and_defensive_payload_copy() -> None:
 
 def test_v2_envelope_uses_selected_version_and_domain() -> None:
     """V2 messages round-trip only under the authenticated v2 MAC domain."""
-    session_key, context, session_id = _v2_session()
+    context = _fixed_v2_context(
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+        server_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    session_key = derive_v2_session_key(_fixed_pairing_key(), context)
+    session_id = derive_v2_session_id(session_key, context)
     payload = build_application_ready(context.selection)
     envelope = sign_envelope(
         session_key,
@@ -1695,3 +1778,286 @@ def test_apply_result_builder_requires_enum_and_consistent_fields() -> None:
                 target_id,
                 source,
             )
+
+
+def test_binary_codecs_require_the_independent_binary_feature() -> None:
+    """Binary messages cannot ride on the numeric feature or vice versa."""
+    action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=_binary_capability(),
+    )
+    binary_selection = _selection((FEATURE_HA_EXPORT_BINARY_V1,))
+    numeric_selection = _selection((FEATURE_HA_EXPORT_NUMERIC_V1,))
+    binary_payload = build_binary_apply(binary_selection, "request-1", action)
+    binary_result = build_binary_apply_result(
+        binary_selection,
+        "request-1",
+        ApplyResultStatus.REJECTED,
+        None,
+        None,
+    )
+
+    with pytest.raises(ProtocolCompatibilityError):
+        build_binary_apply(numeric_selection, "request-1", action)
+    with pytest.raises(ProtocolCompatibilityError):
+        parse_binary_apply(numeric_selection, binary_payload)
+    with pytest.raises(ProtocolCompatibilityError):
+        build_binary_apply_result(
+            numeric_selection,
+            "request-1",
+            ApplyResultStatus.REJECTED,
+            None,
+            None,
+        )
+    with pytest.raises(ProtocolCompatibilityError):
+        parse_binary_apply_result(numeric_selection, binary_result)
+
+    numeric_action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=_numeric_capability(),
+    )
+    with pytest.raises(ProtocolCompatibilityError):
+        build_apply(binary_selection, "request-2", numeric_action)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ReconciliationAction(
+            kind=ReconciliationActionKind.CREATE,
+            capability=_binary_capability(),
+        ),
+        ReconciliationAction(
+            kind=ReconciliationActionKind.UPDATE,
+            capability=_binary_capability(value=False),
+            target_id="42",
+        ),
+        ReconciliationAction(
+            kind=ReconciliationActionKind.MARK_UNAVAILABLE,
+            capability=_binary_capability(
+                availability=Availability.UNAVAILABLE,
+                value=None,
+            ),
+            target_id="42",
+            stale=True,
+        ),
+    ],
+)
+def test_binary_apply_codec_round_trips_exact_actions(
+    action: ReconciliationAction,
+) -> None:
+    """Every binary action uses its own exact schema-versioned message."""
+    selection = _selection()
+    payload = build_binary_apply(selection, "request-42", action)
+
+    assert payload == {
+        "schema": 1,
+        "type": "binary_apply",
+        "request_id": "request-42",
+        "action": {
+            "kind": action.kind.value,
+            "capability": {
+                "source": {
+                    "system": "home_assistant",
+                    "instance_id": "ha-instance-1",
+                    "object_id": "binary_sensor.living_room_motion",
+                    "capability_id": "state",
+                },
+                "kind": "binary",
+                "name": "Living room motion",
+                "value": action.capability.value,
+                "availability": action.capability.availability.value,
+                "semantic": "motion",
+                "unit": None,
+                "state_class": None,
+            },
+            "target_id": action.target_id,
+            "stale": action.stale,
+        },
+    }
+    assert parse_binary_apply(selection, payload) == ApplyRequest(
+        request_id="request-42",
+        action=action,
+    )
+
+
+@pytest.mark.parametrize("value", [0, 1, "on", "off"])
+def test_binary_apply_parser_requires_real_boolean_values(value: object) -> None:
+    """Binary availability cannot be confused with integers or text states."""
+    selection = _selection()
+    payload = build_binary_apply(
+        selection,
+        "request-1",
+        ReconciliationAction(
+            kind=ReconciliationActionKind.CREATE,
+            capability=_binary_capability(),
+        ),
+    )
+    payload["action"]["capability"]["value"] = value
+
+    with pytest.raises(
+        ProtocolFormatError,
+        match="^invalid protocol message$",
+    ):
+        parse_binary_apply(selection, payload)
+
+
+def test_binary_apply_parser_rejects_numeric_and_schema_extensions() -> None:
+    """Binary requests reject the numeric kind and every unsigned extension."""
+    selection = _selection()
+    payload = build_binary_apply(
+        selection,
+        "request-1",
+        ReconciliationAction(
+            kind=ReconciliationActionKind.CREATE,
+            capability=_binary_capability(),
+        ),
+    )
+    mutations = []
+
+    numeric_kind = deepcopy(payload)
+    numeric_kind["action"]["capability"].update(
+        kind="numeric",
+        value=1,
+        semantic=None,
+        unit=None,
+        state_class=None,
+    )
+    mutations.append(numeric_kind)
+    extra_message = deepcopy(payload)
+    extra_message["unexpected"] = True
+    mutations.append(extra_message)
+    missing_action_field = deepcopy(payload)
+    del missing_action_field["action"]["stale"]
+    mutations.append(missing_action_field)
+    extra_capability_field = deepcopy(payload)
+    extra_capability_field["action"]["capability"]["unexpected"] = True
+    mutations.append(extra_capability_field)
+    wrong_schema = deepcopy(payload)
+    wrong_schema["schema"] = 2
+    mutations.append(wrong_schema)
+    numeric_discriminator = deepcopy(payload)
+    numeric_discriminator["type"] = "apply"
+    mutations.append(numeric_discriminator)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_binary_apply(selection, mutation)
+
+
+def test_binary_apply_result_round_trips_confirmed_and_safe_rejected() -> None:
+    """Binary results confirm identity or reject without remote error details."""
+    selection = _selection()
+    confirmed = build_binary_apply_result(
+        selection,
+        "request-42",
+        ApplyResultStatus.CONFIRMED,
+        "123",
+        _binary_source_identity(),
+    )
+    rejected = build_binary_apply_result(
+        selection,
+        "request-43",
+        ApplyResultStatus.REJECTED,
+        None,
+        None,
+    )
+
+    assert confirmed == {
+        "schema": 1,
+        "type": "binary_apply_result",
+        "request_id": "request-42",
+        "status": "confirmed",
+        "target_id": "123",
+        "source": {
+            "system": "home_assistant",
+            "instance_id": "ha-instance-1",
+            "object_id": "binary_sensor.living_room_motion",
+            "capability_id": "state",
+        },
+    }
+    assert rejected == {
+        "schema": 1,
+        "type": "binary_apply_result",
+        "request_id": "request-43",
+        "status": "rejected",
+        "target_id": None,
+        "source": None,
+    }
+    assert parse_binary_apply_result(selection, confirmed) == ApplyResult(
+        request_id="request-42",
+        status=ApplyResultStatus.CONFIRMED,
+        target_id="123",
+        source=_binary_source_identity(),
+    )
+    assert parse_binary_apply_result(selection, rejected) == ApplyResult(
+        request_id="request-43",
+        status=ApplyResultStatus.REJECTED,
+        target_id=None,
+        source=None,
+    )
+
+    mutations = []
+    rejected_with_details = deepcopy(rejected)
+    rejected_with_details["error"] = "remote detail"
+    mutations.append(rejected_with_details)
+    missing_result_field = deepcopy(rejected)
+    del missing_result_field["source"]
+    mutations.append(missing_result_field)
+    wrong_schema = deepcopy(rejected)
+    wrong_schema["schema"] = 2
+    mutations.append(wrong_schema)
+    numeric_discriminator = deepcopy(rejected)
+    numeric_discriminator["type"] = "apply_result"
+    mutations.append(numeric_discriminator)
+    rejected_with_target = deepcopy(rejected)
+    rejected_with_target["target_id"] = "123"
+    mutations.append(rejected_with_target)
+    rejected_with_source = deepcopy(rejected)
+    rejected_with_source["source"] = confirmed["source"]
+    mutations.append(rejected_with_source)
+    confirmed_without_target = deepcopy(confirmed)
+    confirmed_without_target["target_id"] = None
+    mutations.append(confirmed_without_target)
+    confirmed_without_source = deepcopy(confirmed)
+    confirmed_without_source["source"] = None
+    mutations.append(confirmed_without_source)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_binary_apply_result(selection, mutation)
+
+
+@pytest.mark.parametrize(
+    ("status", "target_id", "source"),
+    [
+        ("confirmed", "123", _binary_source_identity()),
+        (ApplyResultStatus.CONFIRMED, None, _binary_source_identity()),
+        (ApplyResultStatus.CONFIRMED, "123", None),
+        (ApplyResultStatus.REJECTED, "123", None),
+        (ApplyResultStatus.REJECTED, None, _binary_source_identity()),
+    ],
+)
+def test_binary_apply_result_builder_rejects_ambiguous_results(
+    status: object,
+    target_id: object,
+    source: object,
+) -> None:
+    """Local binary result callers cannot emit contradictory fields."""
+    with pytest.raises(
+        ProtocolFormatError,
+        match="^invalid protocol message$",
+    ):
+        build_binary_apply_result(
+            _selection(),
+            "request-42",
+            status,
+            target_id,
+            source,
+        )

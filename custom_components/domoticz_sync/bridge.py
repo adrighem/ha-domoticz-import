@@ -14,6 +14,7 @@ from .const import DOMAIN
 from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     PROTOCOL_VERSION,
     SUPPORTED_V2_FEATURES,
@@ -463,8 +464,12 @@ class DomoticzBridgeManager:
         )
         session.ready = True
 
-        if self._application is not None and selection.supports(
-            FEATURE_HA_EXPORT_NUMERIC_V1
+        if self._application is not None and any(
+            selection.supports(feature)
+            for feature in (
+                FEATURE_HA_EXPORT_NUMERIC_V1,
+                FEATURE_HA_EXPORT_BINARY_V1,
+            )
         ):
             application_session = BridgeApplicationSession(self, session)
             try:

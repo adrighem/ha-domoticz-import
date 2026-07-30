@@ -48,6 +48,16 @@ live fallback device was verified to reconnect without duplication.
 - Authenticate and validate reverse commands before enabling interactive
   entities.
 
+### Documentation
+
+- Completely rewrite the README for clarity while keeping its existing top
+  image.
+- Treat Home Assistant and Domoticz users as equal audiences, with complete
+  installation, configuration, upgrade, troubleshooting, and verification
+  paths for both sides.
+- Explain supported mappings, safe fallbacks, current limitations, and the
+  release compatibility contract in plain language.
+
 ## Accepted Implementation Order
 
 1. Native numeric sensors.
@@ -77,6 +87,8 @@ live fallback device was verified to reconnect without duplication.
 - Unknown combinations remain functional through a Custom Sensor fallback.
 - Directly labelled exclusions produce actionable, log-safe warnings without
   reconnect noise.
+- The README keeps its top image and provides equally complete guidance for
+  Home Assistant and Domoticz users.
 - Both current Python and Python 3.9 compatibility suites pass.
 - The user can validate the plugin against a real Domoticz and Home Assistant
   installation before phase completion.
