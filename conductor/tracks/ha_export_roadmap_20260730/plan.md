@@ -16,8 +16,10 @@
   - [x] Run current Python, Python 3.9, integration, and Ruff validation
 - [~] Task 1.4: Manual verification
   - [x] Install the released version on the test Domoticz instance
-  - [ ] Confirm representative native devices and fallback sensors
+  - [ ] Confirm representative native devices
+  - [x] Confirm the live fallback uses the expected Custom Sensor profile
   - [x] Confirm a fallback sensor reconnects without duplicates
+  - [x] Cover native and fallback reconnects end to end (`2698f1b`)
 - [x] Task 1.5: Audit and complete safe native numeric mapping coverage
   (`05a8b5f`)
   - [x] Compare every Home Assistant numeric sensor device class with current
@@ -63,6 +65,11 @@
   boundaries, and current and Python 3.9 compatibility
 - [~] Task 3.5: Document and manually verify both mixed-version rolling upgrade
   orders and the matching-tag installation
+  - [x] Document both rolling-upgrade orders and matching-tag checks (`621bacc`)
+  - [x] Preserve matching-version surfaces with regression coverage (`2698f1b`)
+  - [ ] Manually verify the Home Assistant-first order
+  - [ ] Manually verify the Domoticz plugin-first order
+  - [ ] Manually verify a matching-tag installation
 
 ## Phase 4: First Export Release
 
