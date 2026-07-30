@@ -25,6 +25,7 @@ from homeassistant.const import (  # noqa: E402
     STATE_ON,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
+    UV_INDEX,
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant  # noqa: E402
@@ -346,6 +347,77 @@ def test_skips_text_non_finite_and_non_numeric_sensor_states(
     assert not collect_export_capabilities(hass, instance_id="ha-instance")
 
 
+def test_every_sensor_device_class_has_an_explicit_export_decision() -> None:
+    """A new Home Assistant sensor class must receive an intentional policy."""
+    native_when_metadata_matches = {
+        "atmospheric_pressure",
+        "battery",
+        "carbon_dioxide",
+        "current",
+        "distance",
+        "humidity",
+        "illuminance",
+        "irradiance",
+        "moisture",
+        "power",
+        "power_factor",
+        "pressure",
+        "sound_pressure",
+        "temperature",
+        "voltage",
+        "weight",
+    }
+    custom_sensor = {
+        "absolute_humidity",
+        "apparent_power",
+        "aqi",
+        "area",
+        "blood_glucose_concentration",
+        "carbon_monoxide",
+        "conductivity",
+        "data_rate",
+        "data_size",
+        "duration",
+        "energy",
+        "energy_distance",
+        "energy_storage",
+        "frequency",
+        "gas",
+        "monetary",
+        "nitrogen_dioxide",
+        "nitrogen_monoxide",
+        "nitrous_oxide",
+        "ozone",
+        "ph",
+        "pm1",
+        "pm10",
+        "pm25",
+        "pm4",
+        "precipitation",
+        "precipitation_intensity",
+        "reactive_energy",
+        "reactive_power",
+        "signal_strength",
+        "speed",
+        "sulphur_dioxide",
+        "temperature_delta",
+        "volatile_organic_compounds",
+        "volatile_organic_compounds_parts",
+        "volume",
+        "volume_flow_rate",
+        "volume_storage",
+        "water",
+        "wind_direction",
+        "wind_speed",
+    }
+    excluded_non_numeric = {"date", "enum", "timestamp", "uptime"}
+
+    decisions = native_when_metadata_matches | custom_sensor | excluded_non_numeric
+
+    assert native_when_metadata_matches.isdisjoint(custom_sensor)
+    assert decisions == {device_class.value for device_class in SensorDeviceClass}
+
+
 def test_registry_id_survives_entity_id_rename(hass: HomeAssistant) -> None:
     """Mutable entity IDs do not participate in exported identity."""
     entry = _register_entity(hass, "sensor", "original")
@@ -459,6 +531,29 @@ def test_numeric_sensor_without_state_class_preserves_absence(
     )[0]
 
     assert capability.state_class is None
+
+
+def test_uv_index_unit_is_preserved_for_native_domoticz_selection(
+    hass: HomeAssistant,
+) -> None:
+    """The official unit carries UV semantics when HA has no device class."""
+    entry = _register_entity(
+        hass,
+        "sensor",
+        "uv_index",
+        state_class=SensorStateClass.MEASUREMENT,
+        unit=UV_INDEX,
+    )
+    hass.states.async_set(entry.entity_id, "6.25")
+
+    capability = collect_export_capabilities(
+        hass,
+        instance_id="ha-instance",
+    )[0]
+
+    assert capability.semantic is None
+    assert capability.unit == UV_INDEX
+    assert capability.value == 6.25
 
 
 def test_missing_state_uses_registry_state_class(

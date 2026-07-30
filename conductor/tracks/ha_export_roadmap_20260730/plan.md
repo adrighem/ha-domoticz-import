@@ -15,9 +15,23 @@
   - [x] Update user and architecture documentation
   - [x] Run current Python, Python 3.9, integration, and Ruff validation
 - [~] Task 1.4: Manual verification
-  - [ ] Install the branch on the test Domoticz instance
+  - [x] Install the released version on the test Domoticz instance
   - [ ] Confirm representative native devices and fallback sensors
-  - [ ] Confirm reconnect updates without duplicates
+  - [x] Confirm a fallback sensor reconnects without duplicates
+- [~] Task 1.5: Audit and complete safe native numeric mapping coverage
+  - [~] Compare every Home Assistant numeric sensor device class with current
+    Domoticz native device profiles
+  - [ ] Add every missing mapping that preserves meaning, unit, state class,
+    and value encoding
+  - [ ] Document why remaining classes deliberately use Custom Sensor fallback
+- [ ] Task 1.6: Make directly labelled but unmapped entities visible
+  - [ ] Warn when a directly labelled entity is skipped entirely, with a safe
+    reason and entity ID
+  - [ ] Report when a numeric entity uses Custom Sensor because no safe native
+    profile exists
+  - [ ] Aggregate or deduplicate diagnostics so reconnects do not create noisy
+    logs
+  - [ ] Test that diagnostics never include entity values or secret material
 
 ## Phase 2: Passive Binary Sensors
 
@@ -40,10 +54,11 @@
 
 ## Phase 4: First Export Release
 
-- [ ] Task 4.1: Run complete Home Assistant and Domoticz compatibility suites
-- [ ] Task 4.2: Review setup, security, upgrade, and limitation documentation
-- [ ] Task 4.3: Merge the feature and refresh the Release Please pull request
-- [ ] Task 4.4: Manually validate release artifacts and publish version 0.3.0
+- [x] Task 4.1: Run complete Home Assistant and Domoticz compatibility suites
+- [x] Task 4.2: Review setup, security, upgrade, and limitation documentation
+- [x] Task 4.3: Merge the feature and refresh the Release Please pull request
+- [x] Task 4.4: Manually validate release artifacts and publish versions 0.3.0
+  and 0.3.1
 
 ## Phase 5: Domoticz Inventory and Drift Repair
 

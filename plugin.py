@@ -405,6 +405,15 @@ def _encode_carbon_dioxide(value, unit):
     return _round_positive_half_up(value, 1000000), ""
 
 
+def _encode_uv_index(value, unit):
+    if unit != "UV index":
+        raise DomoticzApplyError
+    value = _finite_number(value)
+    if value < 0 or value > 30:
+        raise DomoticzApplyError
+    return 0, _numeric_s_value(value) + ";0"
+
+
 _CUSTOM_PROFILE = _TargetProfile(
     _CUSTOM_SENSOR_TYPE,
     _CUSTOM_SENSOR_SUBTYPE,
@@ -428,6 +437,7 @@ _WEIGHT_PROFILE = _TargetProfile(93, 1, 0, _encode_weight, False)
 _SOUND_PRESSURE_PROFILE = _TargetProfile(243, 24, 0, _encode_sound_pressure, False)
 _IRRADIANCE_PROFILE = _TargetProfile(243, 2, 0, _encode_irradiance, False)
 _CARBON_DIOXIDE_PROFILE = _TargetProfile(249, 1, 0, _encode_carbon_dioxide, False)
+_UV_INDEX_PROFILE = _TargetProfile(87, 1, 0, _encode_uv_index, False)
 _ALWAYS_CUSTOM_SEMANTICS = {
     "aqi",
     "energy",
@@ -472,6 +482,8 @@ def _target_profile(capability):
 
     if unit in {"%", "percent"}:
         return _PERCENTAGE_PROFILE
+    if unit == "UV index":
+        return _UV_INDEX_PROFILE
     return _CUSTOM_PROFILE
 
 

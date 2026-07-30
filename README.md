@@ -93,10 +93,14 @@ Compatible sensors use a native Domoticz profile:
 | `sound_pressure` | Sound Level |
 | `irradiance` | Solar Radiation |
 | `carbon_dioxide` | Air Quality |
+| Unit `UV index` | UV |
 
 Values are converted to the canonical unit expected by Domoticz when needed.
 Sensors with total or counter state classes, energy, AQI, ambiguous volume
 flow, or unknown semantics or units remain Custom Sensors for now.
+The complete mapping matrix, including deliberate Custom Sensor choices and
+the planned passive binary mappings, is in
+[Home Assistant to Domoticz mapping](docs/entity-mapping.md).
 
 The plugin uses deterministic device IDs, so reconnecting adopts the same
 devices instead of creating duplicates. It never deletes Domoticz devices.

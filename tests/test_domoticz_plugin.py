@@ -406,6 +406,7 @@ def _numeric_action(
         ("irradiance", "W/m²", 1200.5, 243, 2, 0, "1200.5"),
         ("irradiance", "BTU/(h⋅ft²)", 1, 243, 2, 0, "3.154590745"),
         ("carbon_dioxide", "ppm", 812.5, 249, 1, 813, ""),
+        (None, "UV index", 6.25, 87, 1, 0, "6.25;0"),
     ],
 )
 def test_native_numeric_profile_selection_and_encoding(
@@ -1213,6 +1214,7 @@ def test_native_profile_requires_exact_switch_type(loaded_plugin):
         ("humidity", "%", 100.1),
         ("sound_pressure", "dB", -0.1),
         ("carbon_dioxide", "ppm", 1_000_000.1),
+        (None, "UV index", 30.1),
     ],
 )
 def test_invalid_native_value_is_rejected_before_device_creation(
