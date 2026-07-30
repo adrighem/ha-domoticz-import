@@ -70,9 +70,9 @@ private.
 
 ## Domoticz Companion Plugin
 
-The root-level `plugin.py` lets Domoticz make an outbound, authenticated
-WebSocket connection to Home Assistant. When the plugin connects, Home
-Assistant exports numeric sensor entities assigned the **Domoticz Export**
+This plugin can also be installed in Domoticz. If so, Domoticz makes an outbound,
+authenticated WebSocket connection to Home Assistant. When the plugin connects,
+Home Assistant exports numeric sensor entities assigned the **Domoticz Export**
 label. The plugin creates, adopts, or updates matching Domoticz Custom Sensors.
 It uses deterministic device IDs, so reconnecting adopts the same devices
 instead of creating duplicates. It never deletes Domoticz devices.
