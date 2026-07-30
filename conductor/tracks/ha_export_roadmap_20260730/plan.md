@@ -65,6 +65,8 @@
   (`e5d3575`)
 - [x] Task 4.4: Manually validate release artifacts and publish versions 0.3.0
   and 0.3.1 (`e5d3575`, `7d599ae`)
+- [x] Task 4.5: Publish numeric mapping coverage and exclusion diagnostics as
+  version 0.4.0 (`37763b5`)
 
 ## Phase 5: Domoticz Inventory and Drift Repair
 
