@@ -6,15 +6,15 @@
   - [x] Add focused capability, catalog, and protocol tests
   - [x] Add optional numeric `state_class` metadata
   - [x] Populate it from the Home Assistant entity source
-- [~] Task 1.2: Define conservative Domoticz target profiles
-  - [ ] Verify native type, subtype, options, and value encodings
-  - [ ] Add profile-selection and value-codec tests
-  - [ ] Implement native profiles with Custom Sensor fallback
-- [ ] Task 1.3: Integrate and document native creation and updates
-  - [ ] Test deterministic creation, adoption, update, and unavailable state
-  - [ ] Update user and architecture documentation
-  - [ ] Run current Python, Python 3.9, integration, and Ruff validation
-- [ ] Task 1.4: Manual verification
+- [x] Task 1.2: Define conservative Domoticz target profiles
+  - [x] Verify native type, subtype, options, and value encodings
+  - [x] Add profile-selection and value-codec tests
+  - [x] Implement native profiles with Custom Sensor fallback
+- [x] Task 1.3: Integrate and document native creation and updates
+  - [x] Test deterministic creation, adoption, update, and unavailable state
+  - [x] Update user and architecture documentation
+  - [x] Run current Python, Python 3.9, integration, and Ruff validation
+- [~] Task 1.4: Manual verification
   - [ ] Install the branch on the test Domoticz instance
   - [ ] Confirm representative native devices and fallback sensors
   - [ ] Confirm reconnect updates without duplicates

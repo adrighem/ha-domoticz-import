@@ -19,7 +19,8 @@ The entities imported from Domoticz are intentionally read-only:
 - Supports username/password Basic Auth
 - Supports hidden-device and favorite-only filters through the options flow
 - Includes a Domoticz companion plugin that exports selected Home Assistant
-  numeric sensor entities as Domoticz Custom Sensors.
+  numeric sensor entities as native Domoticz devices where possible, with a
+  safe Custom Sensor fallback.
 
 ## Installation
 
@@ -73,9 +74,34 @@ private.
 The root-level `plugin.py` lets Domoticz make an outbound, authenticated
 WebSocket connection to Home Assistant. When the plugin connects, Home
 Assistant exports numeric sensor entities assigned the **Domoticz Export**
-label. The plugin creates, adopts, or updates matching Domoticz Custom Sensors.
-It uses deterministic device IDs, so reconnecting adopts the same devices
-instead of creating duplicates. It never deletes Domoticz devices.
+label. The plugin creates, adopts, or updates matching Domoticz devices.
+Compatible sensors use a native Domoticz profile:
+
+| Home Assistant meaning | Domoticz profile |
+| --- | --- |
+| `temperature` | Temperature |
+| `humidity` | Humidity |
+| Other measurements with unit `%` | Percentage |
+| `atmospheric_pressure` | Barometer |
+| `pressure` | Pressure |
+| `voltage` | Voltage |
+| `current` | Current |
+| `power` | Usage |
+| `illuminance` | Lux |
+| `distance` | Distance |
+| `weight` | Weight |
+| `sound_pressure` | Sound Level |
+| `irradiance` | Solar Radiation |
+| `carbon_dioxide` | Air Quality |
+
+Values are converted to the canonical unit expected by Domoticz when needed.
+Sensors with total or counter state classes, energy, AQI, ambiguous volume
+flow, or unknown semantics or units remain Custom Sensors for now.
+
+The plugin uses deterministic device IDs, so reconnecting adopts the same
+devices instead of creating duplicates. It never deletes Domoticz devices.
+Once a target exists, reconnecting or changing the source profile does not
+change its Domoticz type.
 
 To select an entity for export in Home Assistant:
 

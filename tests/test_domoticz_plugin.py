@@ -57,6 +57,7 @@ class FakeUnit:
         self.Unit = kwargs.get("Unit", 1)
         self.Type = kwargs.get("Type", 0)
         self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
+        self.SwitchType = kwargs.get("Switchtype", kwargs.get("SwitchType", 0))
         self.Options = dict(kwargs.get("Options", {}))
         self.Used = kwargs.get("Used", 0)
         self.nValue = kwargs.get("nValue", 0)
@@ -276,6 +277,8 @@ def _numeric_action(
     stale=False,
     name="Outdoor temperature",
     unit="deg C",
+    semantic=None,
+    state_class=None,
 ):
     """Build one representative neutral numeric action."""
     source = protocol.SourceIdentity(
@@ -290,7 +293,9 @@ def _numeric_action(
         name=name,
         value=value,
         availability=protocol.Availability(availability),
+        semantic=semantic,
         unit=unit,
+        state_class=state_class,
     )
     return protocol.ReconciliationAction(
         kind=protocol.ReconciliationActionKind(kind),
@@ -298,6 +303,110 @@ def _numeric_action(
         target_id=target_id,
         stale=stale,
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "semantic",
+        "unit",
+        "value",
+        "expected_type",
+        "expected_subtype",
+        "expected_n_value",
+        "expected_s_value",
+    ),
+    [
+        ("temperature", "°C", 20.25, 80, 5, 0, "20.25"),
+        ("temperature", "°F", 68, 80, 5, 0, "20.0"),
+        ("temperature", "K", 293.15, 80, 5, 0, "20.0"),
+        ("temperature", "celsius", 10, 80, 5, 0, "10"),
+        ("temperature", "fahrenheit", 50, 80, 5, 0, "10.0"),
+        ("humidity", "%", 24.4, 81, 1, 24, "2"),
+        ("humidity", "%", 24.5, 81, 1, 25, "1"),
+        ("humidity", "%", 60.5, 81, 1, 61, "3"),
+        (None, "%", 42.5, 243, 6, 0, "42.5"),
+        (None, "percent", 43.5, 243, 6, 0, "43.5"),
+        ("atmospheric_pressure", "Pa", 101325, 243, 26, 0, "1013.25;5"),
+        ("atmospheric_pressure", "hpa", 1013, 243, 26, 0, "1013;5"),
+        ("pressure", "kPa", 250, 243, 9, 0, "2.5"),
+        ("voltage", "mV", 2500, 243, 8, 0, "2.5"),
+        ("voltage", "volt", 230, 243, 8, 0, "230"),
+        ("current", "mA", 1250, 243, 23, 0, "1.25"),
+        ("power", "kW", 1.5, 248, 1, 0, "1500.0"),
+        ("power", "watt", 1500, 248, 1, 0, "1500"),
+        ("illuminance", "lx", 325.5, 246, 1, 0, "325.5"),
+        ("illuminance", "lux", 326.5, 246, 1, 0, "326.5"),
+        ("distance", "m", 1.25, 243, 27, 0, "125.0"),
+        ("weight", "g", 1250, 93, 1, 0, "1.25"),
+        ("sound_pressure", "dB", 49.5, 243, 24, 0, "50"),
+        ("irradiance", "W/m²", 1200.5, 243, 2, 0, "1200.5"),
+        ("irradiance", "BTU/(h⋅ft²)", 1, 243, 2, 0, "3.154590745"),
+        ("carbon_dioxide", "ppm", 812.5, 249, 1, 813, ""),
+    ],
+)
+def test_native_numeric_profile_selection_and_encoding(
+    loaded_plugin,
+    semantic,
+    unit,
+    value,
+    expected_type,
+    expected_subtype,
+    expected_n_value,
+    expected_s_value,
+):
+    """Each supported Home Assistant gauge has one exact Domoticz codec."""
+    module, _domoticz = loaded_plugin
+    action = _numeric_action(
+        module.wire_protocol,
+        semantic=semantic,
+        unit=unit,
+        value=value,
+        state_class="measurement",
+    )
+
+    profile = module._target_profile(action.capability)
+    encoded = profile.encoder(value, unit)
+
+    assert profile.type_id == expected_type
+    assert profile.subtype == expected_subtype
+    assert profile.switch_type == 0
+    assert profile.manages_options is False
+    assert encoded == (expected_n_value, expected_s_value)
+
+
+@pytest.mark.parametrize(
+    ("semantic", "unit", "state_class"),
+    [
+        ("temperature", "°C", "total"),
+        ("power", "W", "total_increasing"),
+        ("aqi", None, "measurement"),
+        ("energy", "kWh", "total_increasing"),
+        ("volume_flow_rate", "m³/h", "measurement"),
+        ("temperature", "mystery", "measurement"),
+        (None, "°C", "measurement"),
+    ],
+)
+def test_ambiguous_or_counter_numeric_values_fall_back_to_custom(
+    loaded_plugin,
+    semantic,
+    unit,
+    state_class,
+):
+    """Unsupported semantics remain lossless Custom Sensors."""
+    module, _domoticz = loaded_plugin
+    action = _numeric_action(
+        module.wire_protocol,
+        semantic=semantic,
+        unit=unit,
+        state_class=state_class,
+    )
+
+    profile = module._target_profile(action.capability)
+
+    assert profile.type_id == 243
+    assert profile.subtype == 31
+    assert profile.switch_type == 0
+    assert profile.manages_options is True
 
 
 def _send_apply(
@@ -566,6 +675,297 @@ def test_signed_create_uses_stable_custom_sensor_and_survives_lost_ack(
     assert domoticz.devices[expected_id].TimedOut == 0
     assert len(unit.updates) == 1
     assert unit.refreshes == 2
+
+
+def test_signed_create_uses_native_sensor_and_survives_lost_ack(
+    loaded_plugin,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _numeric_action(
+        protocol,
+        semantic="temperature",
+        unit="°F",
+        value=68,
+    )
+
+    first = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="native-create-1",
+        action=action,
+    )
+    second = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="native-create-1",
+        action=action,
+    )
+
+    expected_id = module._device_id_for_source(action.capability.source)
+    assert first.status is protocol.ApplyResultStatus.CONFIRMED
+    assert first.target_id == expected_id
+    assert second == first
+    assert len(domoticz.create_calls) == 1
+    assert domoticz.create_calls[0] == {
+        "Name": "Outdoor temperature",
+        "DeviceID": expected_id,
+        "Unit": 1,
+        "Type": 80,
+        "Subtype": 5,
+        "Switchtype": 0,
+        "Used": 1,
+    }
+    unit = domoticz.devices[expected_id].Units[1]
+    assert unit.SwitchType == 0
+    assert unit.Options == {}
+    assert unit.nValue == 0
+    assert unit.sValue == "20.0"
+
+
+def test_update_adopts_and_converges_matching_native_sensor(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    source_action = _numeric_action(
+        protocol,
+        semantic="temperature",
+        unit="°C",
+    )
+    device_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Old name",
+        DeviceID=device_id,
+        Unit=1,
+        Type=80,
+        Subtype=5,
+        Switchtype=0,
+        Options={"Native": "leave-me-alone"},
+    ).Create()
+    existing = domoticz.devices[device_id].Units[1]
+    existing.Used = 0
+    existing.nValue = 7
+    existing.sValue = "-1"
+    domoticz.devices[device_id].TimedOut = 1
+    created_before = len(domoticz.create_calls)
+    action = _numeric_action(
+        protocol,
+        kind="update",
+        target_id=device_id,
+        semantic="temperature",
+        unit="K",
+        value=293.15,
+        name="Conservatory temperature",
+        state_class="measurement",
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="native-update-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == created_before
+    assert domoticz.devices[device_id].Units[1] is existing
+    assert existing.Name == "Conservatory temperature"
+    assert existing.Options == {"Native": "leave-me-alone"}
+    assert existing.Used == 1
+    assert existing.nValue == 0
+    assert existing.sValue == "20.0"
+    assert domoticz.devices[device_id].TimedOut == 0
+    assert existing.updates[-1] == {
+        "Log": False,
+        "UpdateProperties": True,
+    }
+
+
+def test_unavailable_native_sensor_retains_values_and_options(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    source_action = _numeric_action(
+        protocol,
+        semantic="humidity",
+        unit="%",
+    )
+    device_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Humidity",
+        DeviceID=device_id,
+        Unit=1,
+        Type=81,
+        Subtype=1,
+        Switchtype=0,
+        Options={"Calibration": "7"},
+        Used=1,
+    ).Create()
+    unit = domoticz.devices[device_id].Units[1]
+    unit.nValue = 48
+    unit.sValue = "1"
+    domoticz.devices[device_id].TimedOut = 0
+    action = _numeric_action(
+        protocol,
+        kind="mark_unavailable",
+        target_id=device_id,
+        semantic="humidity",
+        unit="%",
+        value=None,
+        availability="unavailable",
+        stale=True,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="native-unavailable-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert unit.nValue == 48
+    assert unit.sValue == "1"
+    assert unit.Options == {"Calibration": "7"}
+    assert domoticz.devices[device_id].TimedOut == 1
+
+
+def test_profile_change_collision_is_rejected_without_retyping(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    custom_action = _numeric_action(protocol, unit="°C")
+    created = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="profile-custom-1",
+        action=custom_action,
+    )
+    device_id = created.target_id
+    unit = domoticz.devices[device_id].Units[1]
+    create_count = len(domoticz.create_calls)
+
+    changed = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="profile-native-1",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=device_id,
+            semantic="temperature",
+            unit="°C",
+            value=20,
+        ),
+    )
+
+    assert changed.status is protocol.ApplyResultStatus.REJECTED
+    assert len(domoticz.create_calls) == create_count
+    assert domoticz.devices[device_id].Units[1] is unit
+    assert unit.Type == 243
+    assert unit.SubType == 31
+    assert unit.sValue == "12.5"
+    assert not unit.deleted
+
+
+def test_native_profile_requires_exact_switch_type(loaded_plugin):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    action = _numeric_action(
+        protocol,
+        semantic="temperature",
+        unit="°C",
+    )
+    device_id = module._device_id_for_source(action.capability.source)
+    module.Domoticz.Unit(
+        Name="Do not replace",
+        DeviceID=device_id,
+        Unit=1,
+        Type=80,
+        Subtype=5,
+        Switchtype=1,
+    ).Create()
+    incompatible = domoticz.devices[device_id].Units[1]
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="native-switch-collision-1",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.devices[device_id].Units[1] is incompatible
+    assert incompatible.Name == "Do not replace"
+    assert not incompatible.deleted
+
+
+@pytest.mark.parametrize(
+    ("semantic", "unit", "value"),
+    [
+        ("humidity", "%", -0.1),
+        ("humidity", "%", 100.1),
+        ("sound_pressure", "dB", -0.1),
+        ("carbon_dioxide", "ppm", 1_000_000.1),
+    ],
+)
+def test_invalid_native_value_is_rejected_before_device_creation(
+    loaded_plugin,
+    semantic,
+    unit,
+    value,
+):
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="invalid-native-1",
+        action=_numeric_action(
+            protocol,
+            semantic=semantic,
+            unit=unit,
+            value=value,
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert domoticz.devices == {}
 
 
 def test_create_adopts_matching_existing_custom_sensor(loaded_plugin):

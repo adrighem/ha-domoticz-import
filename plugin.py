@@ -50,6 +50,7 @@ import os
 import secrets
 import sys
 import uuid
+from typing import Callable, NamedTuple
 
 import DomoticzEx as Domoticz
 
@@ -65,7 +66,8 @@ _PING_TIMEOUT_TICKS = 3
 _MAX_RECONNECT_TICKS = 32
 _CUSTOM_SENSOR_TYPE = 243
 _CUSTOM_SENSOR_SUBTYPE = 31
-_CUSTOM_SENSOR_UNIT = 1
+_TARGET_UNIT = 1
+_DEFAULT_SWITCH_TYPE = 0
 
 PHASE_STOPPED = "stopped"
 PHASE_DISCONNECTED = "disconnected"
@@ -199,6 +201,270 @@ def _numeric_s_value(value):
 def _custom_sensor_options(unit):
     """Build Domoticz's Custom Sensor options for an optional source unit."""
     return {"Custom": "1;" + (unit if unit is not None else "")}
+
+
+class _TargetProfile(NamedTuple):
+    """Immutable Domoticz unit shape and value codec."""
+
+    type_id: int
+    subtype: int
+    switch_type: int
+    encoder: Callable[[object, object], tuple[int, str]]
+    manages_options: bool
+
+
+def _finite_number(value):
+    """Return one finite protocol number, rejecting bool explicitly."""
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise DomoticzApplyError
+    return value
+
+
+def _scaled_value(value, unit, factors):
+    """Convert a finite value using one explicit source-unit factor."""
+    value = _finite_number(value)
+    try:
+        converted = value * factors[unit]
+    except (KeyError, TypeError):
+        raise DomoticzApplyError from None
+    if not math.isfinite(converted):
+        raise DomoticzApplyError
+    return converted
+
+
+def _encode_custom(value, _unit):
+    return 0, _numeric_s_value(value)
+
+
+def _encode_temperature(value, unit):
+    value = _finite_number(value)
+    if unit in {"°C", "celsius"}:
+        converted = value
+    elif unit in {"°F", "fahrenheit"}:
+        converted = (value - 32) * 5 / 9
+    elif unit in {"K", "kelvin"}:
+        converted = value - 273.15
+    else:
+        raise DomoticzApplyError
+    return 0, _numeric_s_value(converted)
+
+
+def _round_positive_half_up(value, maximum):
+    value = _finite_number(value)
+    if value < 0 or value > maximum:
+        raise DomoticzApplyError
+    return int(math.floor(value + 0.5))
+
+
+def _encode_humidity(value, unit):
+    if unit not in {"%", "percent"}:
+        raise DomoticzApplyError
+    rounded = _round_positive_half_up(value, 100)
+    if rounded < 25:
+        status = "2"
+    elif rounded <= 60:
+        status = "1"
+    else:
+        status = "3"
+    return rounded, status
+
+
+def _encode_percentage(value, unit):
+    if unit not in {"%", "percent"}:
+        raise DomoticzApplyError
+    return 0, _numeric_s_value(value)
+
+
+# Keep conversion factors local and explicit. Lowercase word aliases are the
+# stable neutral units already emitted by the Home Assistant source adapter.
+_HPA_FACTORS = {
+    "mPa": 0.00001,
+    "Pa": 0.01,
+    "hPa": 1,
+    "hpa": 1,
+    "kPa": 10,
+    "bar": 1000,
+    "cbar": 10,
+    "mbar": 1,
+    "mmHg": 1.333223684,
+    "inHg": 33.863886667,
+    "inH₂O": 2.4908891,
+    "psi": 68.947572932,
+}
+_BAR_FACTORS = {unit: factor / 1000 for unit, factor in _HPA_FACTORS.items()}
+_VOLT_FACTORS = {
+    "μV": 0.000001,
+    "µV": 0.000001,
+    "mV": 0.001,
+    "V": 1,
+    "volt": 1,
+    "kV": 1000,
+    "MV": 1000000,
+}
+_AMPERE_FACTORS = {
+    "μA": 0.000001,
+    "µA": 0.000001,
+    "mA": 0.001,
+    "A": 1,
+}
+_WATT_FACTORS = {
+    "mW": 0.001,
+    "W": 1,
+    "watt": 1,
+    "kW": 1000,
+    "MW": 1000000,
+    "GW": 1000000000,
+    "TW": 1000000000000,
+    "BTU/h": 0.29307107,
+}
+_CENTIMETER_FACTORS = {
+    "mm": 0.1,
+    "cm": 1,
+    "m": 100,
+    "km": 100000,
+    "in": 2.54,
+    "ft": 30.48,
+    "yd": 91.44,
+    "mi": 160934.4,
+    "nmi": 185200,
+}
+_KILOGRAM_FACTORS = {
+    "μg": 0.000000001,
+    "µg": 0.000000001,
+    "mg": 0.000001,
+    "g": 0.001,
+    "kg": 1,
+    "oz": 0.028349523125,
+    "lb": 0.45359237,
+    "st": 6.35029318,
+}
+_IRRADIANCE_FACTORS = {
+    "W/m²": 1,
+    "W/m2": 1,
+    "BTU/(h⋅ft²)": 3.154590745,
+}
+
+
+def _encode_atmospheric_pressure(value, unit):
+    converted = _scaled_value(value, unit, _HPA_FACTORS)
+    return 0, _numeric_s_value(converted) + ";5"
+
+
+def _encode_pressure(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _BAR_FACTORS))
+
+
+def _encode_voltage(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _VOLT_FACTORS))
+
+
+def _encode_current(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _AMPERE_FACTORS))
+
+
+def _encode_power(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _WATT_FACTORS))
+
+
+def _encode_illuminance(value, unit):
+    if unit not in {"lx", "lux"}:
+        raise DomoticzApplyError
+    return 0, _numeric_s_value(value)
+
+
+def _encode_distance(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _CENTIMETER_FACTORS))
+
+
+def _encode_weight(value, unit):
+    return 0, _numeric_s_value(_scaled_value(value, unit, _KILOGRAM_FACTORS))
+
+
+def _encode_sound_pressure(value, unit):
+    if unit not in {"dB", "dBA"}:
+        raise DomoticzApplyError
+    return 0, str(_round_positive_half_up(value, 2147483647))
+
+
+def _encode_irradiance(value, unit):
+    converted = _scaled_value(value, unit, _IRRADIANCE_FACTORS)
+    return 0, _numeric_s_value(converted)
+
+
+def _encode_carbon_dioxide(value, unit):
+    if unit != "ppm":
+        raise DomoticzApplyError
+    return _round_positive_half_up(value, 1000000), ""
+
+
+_CUSTOM_PROFILE = _TargetProfile(
+    _CUSTOM_SENSOR_TYPE,
+    _CUSTOM_SENSOR_SUBTYPE,
+    _DEFAULT_SWITCH_TYPE,
+    _encode_custom,
+    True,
+)
+_TEMPERATURE_PROFILE = _TargetProfile(80, 5, 0, _encode_temperature, False)
+_HUMIDITY_PROFILE = _TargetProfile(81, 1, 0, _encode_humidity, False)
+_PERCENTAGE_PROFILE = _TargetProfile(243, 6, 0, _encode_percentage, False)
+_ATMOSPHERIC_PRESSURE_PROFILE = _TargetProfile(
+    243, 26, 0, _encode_atmospheric_pressure, False
+)
+_PRESSURE_PROFILE = _TargetProfile(243, 9, 0, _encode_pressure, False)
+_VOLTAGE_PROFILE = _TargetProfile(243, 8, 0, _encode_voltage, False)
+_CURRENT_PROFILE = _TargetProfile(243, 23, 0, _encode_current, False)
+_POWER_PROFILE = _TargetProfile(248, 1, 0, _encode_power, False)
+_ILLUMINANCE_PROFILE = _TargetProfile(246, 1, 0, _encode_illuminance, False)
+_DISTANCE_PROFILE = _TargetProfile(243, 27, 0, _encode_distance, False)
+_WEIGHT_PROFILE = _TargetProfile(93, 1, 0, _encode_weight, False)
+_SOUND_PRESSURE_PROFILE = _TargetProfile(243, 24, 0, _encode_sound_pressure, False)
+_IRRADIANCE_PROFILE = _TargetProfile(243, 2, 0, _encode_irradiance, False)
+_CARBON_DIOXIDE_PROFILE = _TargetProfile(249, 1, 0, _encode_carbon_dioxide, False)
+_ALWAYS_CUSTOM_SEMANTICS = {
+    "aqi",
+    "energy",
+    "volume_flow_rate",
+}
+_PROFILE_BY_SEMANTIC = {
+    "temperature": (
+        _TEMPERATURE_PROFILE,
+        {"°C", "°F", "K", "celsius", "fahrenheit", "kelvin"},
+    ),
+    "humidity": (_HUMIDITY_PROFILE, {"%", "percent"}),
+    "atmospheric_pressure": (_ATMOSPHERIC_PRESSURE_PROFILE, set(_HPA_FACTORS)),
+    "pressure": (_PRESSURE_PROFILE, set(_BAR_FACTORS)),
+    "voltage": (_VOLTAGE_PROFILE, set(_VOLT_FACTORS)),
+    "current": (_CURRENT_PROFILE, set(_AMPERE_FACTORS)),
+    "power": (_POWER_PROFILE, set(_WATT_FACTORS)),
+    "illuminance": (_ILLUMINANCE_PROFILE, {"lx", "lux"}),
+    "distance": (_DISTANCE_PROFILE, set(_CENTIMETER_FACTORS)),
+    "weight": (_WEIGHT_PROFILE, set(_KILOGRAM_FACTORS)),
+    "sound_pressure": (_SOUND_PRESSURE_PROFILE, {"dB", "dBA"}),
+    "irradiance": (_IRRADIANCE_PROFILE, set(_IRRADIANCE_FACTORS)),
+    "carbon_dioxide": (_CARBON_DIOXIDE_PROFILE, {"ppm"}),
+}
+
+
+def _target_profile(capability):
+    """Choose a conservative native Domoticz profile or Custom fallback."""
+    if getattr(capability, "state_class", None) not in {None, "measurement"}:
+        return _CUSTOM_PROFILE
+
+    semantic = capability.semantic
+    unit = capability.unit
+    if semantic in _ALWAYS_CUSTOM_SEMANTICS:
+        return _CUSTOM_PROFILE
+
+    profile_entry = _PROFILE_BY_SEMANTIC.get(semantic)
+    if profile_entry is not None:
+        profile, supported_units = profile_entry
+        if unit in supported_units:
+            return profile
+        return _CUSTOM_PROFILE
+
+    if unit in {"%", "percent"}:
+        return _PERCENTAGE_PROFILE
+    return _CUSTOM_PROFILE
 
 
 class DomoticzSyncPlugin:
@@ -574,7 +840,7 @@ class DomoticzSyncPlugin:
         self._send_signed(result)
 
     def _apply_action(self, action):
-        """Idempotently converge and re-read one numeric Custom Sensor."""
+        """Idempotently converge and re-read one numeric Domoticz target."""
         capability = action.capability
         if capability.kind.value != "numeric":
             raise DomoticzApplyError
@@ -588,36 +854,45 @@ class DomoticzSyncPlugin:
             raise DomoticzApplyError
 
         available = capability.availability.value == "available"
-        desired_s_value = _numeric_s_value(capability.value) if available else None
-        options = _custom_sensor_options(capability.unit)
+        profile = _target_profile(capability)
+        desired_values = (
+            profile.encoder(capability.value, capability.unit) if available else None
+        )
+        options = (
+            _custom_sensor_options(capability.unit) if profile.manages_options else None
+        )
         device = self._get_device(device_id)
         unit = self._get_unit(device)
 
         if unit is None:
             if action_kind != "create" and not (action_kind == "update" and available):
                 raise DomoticzApplyError
-            Domoticz.Unit(
-                Name=capability.name,
-                DeviceID=device_id,
-                Unit=_CUSTOM_SENSOR_UNIT,
-                Type=_CUSTOM_SENSOR_TYPE,
-                Subtype=_CUSTOM_SENSOR_SUBTYPE,
-                Options=options,
-                Used=1,
-            ).Create()
+            create_arguments = {
+                "Name": capability.name,
+                "DeviceID": device_id,
+                "Unit": _TARGET_UNIT,
+                "Type": profile.type_id,
+                "Subtype": profile.subtype,
+                "Switchtype": profile.switch_type,
+                "Used": 1,
+            }
+            if profile.manages_options:
+                create_arguments["Options"] = options
+            Domoticz.Unit(**create_arguments).Create()
             device = self._get_device(device_id)
             unit = self._get_unit(device)
 
-        if not self._is_custom_sensor(unit):
+        if not self._is_target_profile(unit, profile):
             raise DomoticzApplyError
 
-        self._converge_custom_sensor(
+        self._converge_target(
             device,
             unit,
+            profile=profile,
             name=capability.name,
             options=options,
             available=available,
-            s_value=desired_s_value,
+            values=desired_values,
         )
         confirmed_device = self._get_device(device_id)
         confirmed_unit = self._get_unit(confirmed_device)
@@ -626,13 +901,14 @@ class DomoticzSyncPlugin:
         confirmed_unit.Refresh()
         confirmed_device = self._get_device(device_id)
         confirmed_unit = self._get_unit(confirmed_device)
-        if not self._custom_sensor_matches(
+        if not self._target_matches(
             confirmed_device,
             confirmed_unit,
+            profile=profile,
             name=capability.name,
             options=options,
             available=available,
-            s_value=desired_s_value,
+            values=desired_values,
         ):
             raise DomoticzApplyError
         return device_id
@@ -651,86 +927,100 @@ class DomoticzSyncPlugin:
         if device is None:
             return None
         units = getattr(device, "Units", None)
-        if units is None or _CUSTOM_SENSOR_UNIT not in units:
+        if units is None or _TARGET_UNIT not in units:
             return None
-        return units[_CUSTOM_SENSOR_UNIT]
+        return units[_TARGET_UNIT]
 
     @staticmethod
-    def _is_custom_sensor(unit):
+    def _is_target_profile(unit, profile):
         return (
             unit is not None
-            and getattr(unit, "Type", None) == _CUSTOM_SENSOR_TYPE
-            and getattr(unit, "SubType", None) == _CUSTOM_SENSOR_SUBTYPE
+            and getattr(unit, "Type", None) == profile.type_id
+            and getattr(unit, "SubType", None) == profile.subtype
+            and getattr(unit, "SwitchType", None) == profile.switch_type
         )
 
     @staticmethod
-    def _converge_custom_sensor(
+    def _converge_target(
         device,
         unit,
         *,
+        profile,
         name,
         options,
         available,
-        s_value,
+        values,
     ):
         """Set the complete desired state while retaining unavailable values."""
         properties_changed = (
-            getattr(unit, "Name", None) != name
-            or getattr(unit, "Options", None) != options
-            or getattr(unit, "Used", None) != 1
+            getattr(unit, "Name", None) != name or getattr(unit, "Used", None) != 1
+        )
+        options_changed = (
+            profile.manages_options and getattr(unit, "Options", None) != options
         )
         timed_out = 0 if available else 1
         timeout_changed = getattr(device, "TimedOut", None) != timed_out
         values_changed = False
         if available:
+            n_value, s_value = values
             values_changed = (
-                getattr(unit, "nValue", None) != 0
+                getattr(unit, "nValue", None) != n_value
                 or getattr(unit, "sValue", None) != s_value
             )
-        if not properties_changed and not values_changed and not timeout_changed:
+        if (
+            not properties_changed
+            and not options_changed
+            and not values_changed
+            and not timeout_changed
+        ):
             return
 
         unit.Name = name
-        unit.Options = dict(options)
         unit.Used = 1
+        if profile.manages_options:
+            unit.Options = dict(options)
         # Extended Domoticz exposes timeout on the parent Device. It is
         # runtime-only state read directly by CPlugin::HasNodeFailed.
         device.TimedOut = timed_out
         if available:
-            unit.nValue = 0
+            unit.nValue = n_value
             unit.sValue = s_value
 
-        if properties_changed or values_changed:
+        if properties_changed or options_changed or values_changed:
             update = {"Log": False}
-            if properties_changed:
+            if properties_changed or options_changed:
                 update["UpdateProperties"] = True
+            if options_changed:
                 update["UpdateOptions"] = True
             unit.Update(**update)
 
     @classmethod
-    def _custom_sensor_matches(
+    def _target_matches(
         cls,
         device,
         unit,
         *,
+        profile,
         name,
         options,
         available,
-        s_value,
+        values,
     ):
         """Confirm desired state from a fresh registry lookup."""
         if (
-            not cls._is_custom_sensor(unit)
+            not cls._is_target_profile(unit, profile)
             or getattr(unit, "Name", None) != name
-            or getattr(unit, "Options", None) != options
             or getattr(unit, "Used", None) != 1
             or getattr(device, "TimedOut", None) != (0 if available else 1)
         ):
             return False
+        if profile.manages_options and getattr(unit, "Options", None) != options:
+            return False
         if not available:
             return True
+        n_value, s_value = values
         return (
-            getattr(unit, "nValue", None) == 0
+            getattr(unit, "nValue", None) == n_value
             and getattr(unit, "sValue", None) == s_value
         )
 
