@@ -25,13 +25,13 @@
   - [x] Add every missing mapping that preserves meaning, unit, state class,
     and value encoding
   - [x] Document why remaining classes deliberately use Custom Sensor fallback
-- [~] Task 1.6: Make directly labelled exclusions visible
-  - [ ] Return structured, side-effect-free exclusion reasons
-  - [ ] Warn when a directly labelled entity is skipped entirely, with a safe
+- [x] Task 1.6: Make directly labelled exclusions visible (`b5b9cdc`)
+  - [x] Return structured, side-effect-free exclusion reasons
+  - [x] Warn when a directly labelled entity is skipped entirely, with a safe
     reason and entity ID
-  - [ ] Aggregate or deduplicate diagnostics so reconnects do not create noisy
+  - [x] Aggregate or deduplicate diagnostics so reconnects do not create noisy
     logs
-  - [ ] Test that diagnostics never include entity values or secret material
+  - [x] Test that diagnostics never include entity values or secret material
   - [x] Keep successful Custom Sensor fallbacks out of warning-level logs
     (`05a8b5f`)
 
