@@ -43,6 +43,7 @@ def _capability(
     name: str = "Temperature",
     semantic: str | None = "temperature",
     unit: str | None = "celsius",
+    state_class: str | None = "measurement",
 ) -> Capability:
     return Capability(
         source=_source(object_id),
@@ -52,6 +53,7 @@ def _capability(
         availability=availability,
         semantic=semantic,
         unit=unit,
+        state_class=state_class,
     )
 
 
@@ -223,11 +225,23 @@ def test_v1_serialization_contains_the_complete_record() -> None:
                     "availability": "available",
                     "semantic": "temperature",
                     "unit": "celsius",
+                    "state_class": "measurement",
                 },
                 "stale": False,
             }
         ],
     }
+
+
+def test_v1_serialization_preserves_absent_state_class_as_null() -> None:
+    """The strict schema retains an explicit nullable metadata field."""
+    capability = _capability("sensor-1", state_class=None)
+    catalog = TargetCatalog([_record("sensor-1", capability=capability)])
+
+    document = catalog_to_document(catalog)
+
+    assert document["targets"][0]["capability"]["state_class"] is None
+    assert catalog_from_document(document) == catalog
 
 
 def test_all_capability_shapes_round_trip_through_json() -> None:
@@ -247,6 +261,7 @@ def test_all_capability_shapes_round_trip_through_json() -> None:
                 value=True,
                 semantic="opening",
                 unit=None,
+                state_class=None,
             ),
         ),
         _record(
@@ -257,6 +272,7 @@ def test_all_capability_shapes_round_trip_through_json() -> None:
                 value="ready",
                 semantic=None,
                 unit=None,
+                state_class=None,
             ),
         ),
         _record(
@@ -311,10 +327,12 @@ def test_none_alone_represents_no_persisted_catalog() -> None:
         lambda data: data["targets"][0].update(stale=1),
         lambda data: data["targets"][0].update(target_id=" "),
         lambda data: data["targets"][0]["capability"].pop("unit"),
+        lambda data: data["targets"][0]["capability"].pop("state_class"),
         lambda data: data["targets"][0]["capability"].update(extra=True),
         lambda data: data["targets"][0]["capability"].update(kind="other"),
         lambda data: data["targets"][0]["capability"].update(availability="other"),
         lambda data: data["targets"][0]["capability"].update(value=True),
+        lambda data: data["targets"][0]["capability"].update(state_class=1),
         lambda data: data["targets"][0]["capability"]["source"].pop("system"),
         lambda data: data["targets"][0]["capability"]["source"].update(extra=True),
         lambda data: data["targets"][0]["capability"]["source"].update(object_id=1),

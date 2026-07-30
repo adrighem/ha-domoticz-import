@@ -17,7 +17,13 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 
 from aiohttp import WSMsgType  # noqa: E402
 from aiohttp import client as aiohttp_client  # noqa: E402
+from homeassistant.components.sensor import (  # noqa: E402
+    ATTR_STATE_CLASS,
+    SensorDeviceClass,
+    SensorStateClass,
+)
 from homeassistant.const import (  # noqa: E402
+    ATTR_DEVICE_CLASS,
     ATTR_FRIENDLY_NAME,
     ATTR_UNIT_OF_MEASUREMENT,
     UnitOfTemperature,
@@ -99,6 +105,7 @@ class _FakeUnit:
         self.Unit = kwargs.get("Unit", 1)
         self.Type = kwargs.get("Type", 0)
         self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
+        self.SwitchType = kwargs.get("Switchtype", kwargs.get("SwitchType", 0))
         self.Options = dict(kwargs.get("Options", {}))
         self.Used = kwargs.get("Used", 0)
         self.nValue = kwargs.get("nValue", 0)
@@ -568,6 +575,8 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         "integration_test",
         "garden_temperature",
         suggested_object_id="garden_temperature",
+        capabilities={ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT},
+        original_device_class=SensorDeviceClass.TEMPERATURE,
         original_name="Garden temperature",
         unit_of_measurement=UnitOfTemperature.CELSIUS,
     )
@@ -576,7 +585,9 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         labels={export_label.label_id},
     )
     state_attributes = {
+        ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
         ATTR_FRIENDLY_NAME: "Garden temperature",
+        ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT,
         ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
     }
     hass.states.async_set(
@@ -641,6 +652,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         )
         catalog = catalog_from_document(await storage.async_load())
         assert len(catalog.records) == 1
+        assert catalog.records[0].capability.state_class == "measurement"
         target_id = catalog.records[0].target_id
         assert len(target_id) == 25
         assert target_id.startswith("HA")
@@ -649,9 +661,10 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
 
         unit = fake_domoticz.devices[target_id].Units[1]
         assert unit.Name == "Garden temperature"
-        assert unit.Type == 243
-        assert unit.SubType == 31
-        assert unit.Options == {"Custom": "1;celsius"}
+        assert unit.Type == 80
+        assert unit.SubType == 5
+        assert unit.SwitchType == 0
+        assert unit.Options == {}
         assert unit.Used == 1
         assert unit.nValue == 0
         assert unit.sValue == "12.5"

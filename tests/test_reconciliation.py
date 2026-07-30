@@ -44,6 +44,7 @@ def _numeric(
     name: str = "Temperature",
     semantic: str | None = "temperature",
     unit: str | None = "celsius",
+    state_class: str | None = None,
 ) -> Capability:
     return Capability(
         source=_source(object_id),
@@ -53,6 +54,7 @@ def _numeric(
         availability=availability,
         semantic=semantic,
         unit=unit,
+        state_class=state_class,
     )
 
 
@@ -143,6 +145,7 @@ def test_unchanged_capability_needs_no_action() -> None:
         _numeric("changed", name="Living room temperature"),
         _numeric("changed", semantic="humidity"),
         _numeric("changed", unit="fahrenheit"),
+        _numeric("changed", state_class="measurement"),
         Capability(
             source=_source("changed"),
             kind=CapabilityKind.BINARY,
@@ -156,6 +159,7 @@ def test_unchanged_capability_needs_no_action() -> None:
         "name",
         "semantic",
         "unit",
+        "state_class",
         "kind",
     ),
 )

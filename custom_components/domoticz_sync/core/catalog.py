@@ -24,6 +24,7 @@ _CAPABILITY_KEYS = {
     "availability",
     "semantic",
     "unit",
+    "state_class",
 }
 _SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _CATALOG_PARSE_ERRORS = (KeyError, TypeError, ValueError, OverflowError)
@@ -135,6 +136,7 @@ class TargetCatalog:
                         "availability": capability.availability.value,
                         "semantic": capability.semantic,
                         "unit": capability.unit,
+                        "state_class": capability.state_class,
                     },
                     "stale": record.stale,
                 }
@@ -204,6 +206,7 @@ def _record_from_dict(data: object) -> TargetRecord:
         availability=Availability(capability_data["availability"]),
         semantic=capability_data["semantic"],
         unit=capability_data["unit"],
+        state_class=capability_data["state_class"],
     )
     return TargetRecord(
         target_id=data["target_id"],
