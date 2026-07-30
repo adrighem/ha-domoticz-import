@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.5.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.4.0...v0.5.0) (2026-07-30)
+
+
+### Features
+
+* export passive binary sensors ([d5bf19d](https://github.com/adrighem/ha-domoticz-sync/commit/d5bf19d8b8c97840573b5c50e2f438ab10c68b40))
+
+
+### Bug Fixes
+
+* harden sync reliability and compatibility ([#20](https://github.com/adrighem/ha-domoticz-sync/issues/20)) ([84831bd](https://github.com/adrighem/ha-domoticz-sync/commit/84831bd6c6f8a40dcbd90108a652b881fd8dbaf9))
+
+
+### Documentation
+
+* recommend PyPluginStore installation ([ef9d4b0](https://github.com/adrighem/ha-domoticz-sync/commit/ef9d4b0fc2cfa2a80ed7463d013787a4c5ef48df))
+* record 0.4.0 release ([91a3cba](https://github.com/adrighem/ha-domoticz-sync/commit/91a3cbaf4e8ec4c4d8dad4d345e5409b9e5e51c9))
+* record passive binary progress ([d8f0b92](https://github.com/adrighem/ha-domoticz-sync/commit/d8f0b92509f5c623203526108572733c5d5d7d19))
+
 ## [0.4.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.3.1...v0.4.0) (2026-07-30)
 
 

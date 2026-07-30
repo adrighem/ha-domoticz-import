@@ -190,7 +190,7 @@ Install a matching tagged release:
 <!-- x-release-please-start-version -->
 ```bash
 cd /path/to/domoticz/plugins
-git clone --branch v0.4.0 https://github.com/adrighem/ha-domoticz-sync.git
+git clone --branch v0.5.0 https://github.com/adrighem/ha-domoticz-sync.git
 chmod +x ha-domoticz-sync/plugin.py
 ```
 <!-- x-release-please-end -->
@@ -352,7 +352,7 @@ For a Git checkout, select the matching tag and restart Domoticz:
 ```bash
 cd /path/to/domoticz/plugins/ha-domoticz-sync
 git fetch --tags
-git checkout v0.4.0
+git checkout v0.5.0
 # Restart Domoticz after the update.
 ```
 <!-- x-release-please-end -->
