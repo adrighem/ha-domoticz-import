@@ -125,6 +125,14 @@ the shared neutral core shipped elsewhere in the repository, so copying only
 Python 3.9 and newer. Install the tagged release matching the Home Assistant
 integration rather than the moving `main` branch.
 
+The two halves can be updated in either order without allowing unsafe writes.
+A mixed old and new installation uses legacy v1 for heartbeats only, with
+export disabled. Protocol v2 and numeric export activate once both halves
+support them. Matching tags provide the tested feature set and remain strongly
+recommended. See the
+[protocol compatibility contract](docs/protocol.md) for the mixed-version,
+feature-negotiation, and transport-security rules.
+
 <!-- x-release-please-start-version -->
 ```bash
 cd /path/to/domoticz/plugins

@@ -173,6 +173,14 @@ def _header_value(headers, name):
     return None
 
 
+def _header_count(headers, name):
+    if not isinstance(headers, dict):
+        return 0
+    return sum(
+        1 for key in headers if isinstance(key, str) and key.lower() == name.lower()
+    )
+
+
 def _source_document(source):
     """Return the exact canonical identity document used for target IDs."""
     return {
@@ -481,6 +489,10 @@ class DomoticzSyncPlugin:
         self._pairing_key = None
         self._destination_id = None
         self._upgrade_key = None
+        self._offered_protocols = tuple(wire_protocol.SUPPORTED_WEBSOCKET_SUBPROTOCOLS)
+        self._selected_protocol = None
+        self._protocol_version = wire_protocol.PROTOCOL_VERSION
+        self._protocol_selection = None
         self._hello = None
         self._handshake_context = None
         self._session_key = None
@@ -621,6 +633,7 @@ class DomoticzSyncPlugin:
                 "Host": host,
                 "Origin": f"{scheme}://{host}",
                 "Sec-WebSocket-Key": self._upgrade_key,
+                "Sec-WebSocket-Protocol": ", ".join(self._offered_protocols),
                 # Domoticz otherwise advertises compression that it cannot decode.
                 "Sec-WebSocket-Extensions": None,
             },
@@ -673,6 +686,11 @@ class DomoticzSyncPlugin:
         upgrade = _header_value(headers, "Upgrade")
         connection_header = _header_value(headers, "Connection")
         extensions = _header_value(headers, "Sec-WebSocket-Extensions")
+        selected_protocol_headers = _header_count(
+            headers,
+            "Sec-WebSocket-Protocol",
+        )
+        selected_protocol = _header_value(headers, "Sec-WebSocket-Protocol")
         if (
             not isinstance(actual_accept, str)
             or not hmac.compare_digest(actual_accept, expected_accept)
@@ -685,15 +703,40 @@ class DomoticzSyncPlugin:
         ):
             self._reject_connection("The WebSocket upgrade response was invalid.")
             return
+        if selected_protocol_headers > 1 or (
+            selected_protocol_headers == 1
+            and (
+                selected_protocol is None
+                or selected_protocol not in self._offered_protocols
+                or selected_protocol != wire_protocol.WEBSOCKET_SUBPROTOCOL_V2
+            )
+        ):
+            self._reject_connection("The WebSocket protocol selection was invalid.")
+            return
 
         self._upgrade_key = None
         try:
-            hello_document = wire_protocol.build_hello(
-                self._link_id,
-                self._destination_id,
-                wire_protocol.generate_nonce(),
-            )
-            self._hello = wire_protocol.parse_hello(hello_document)
+            client_nonce = wire_protocol.generate_nonce()
+            self._selected_protocol = selected_protocol
+            if selected_protocol is None:
+                self._protocol_version = wire_protocol.PROTOCOL_VERSION
+                hello_document = wire_protocol.build_hello(
+                    self._link_id,
+                    self._destination_id,
+                    client_nonce,
+                )
+                self._hello = wire_protocol.parse_hello(hello_document)
+            else:
+                self._protocol_version = wire_protocol.PROTOCOL_VERSION_V2
+                hello_document = wire_protocol.build_v2_hello(
+                    self._link_id,
+                    self._destination_id,
+                    client_nonce,
+                    client_protocols=self._offered_protocols,
+                    selected_protocol=selected_protocol,
+                    client_features=wire_protocol.SUPPORTED_V2_FEATURES,
+                )
+                self._hello = wire_protocol.parse_v2_hello(hello_document)
             self.phase = PHASE_WAIT_CHALLENGE
             self._phase_started_tick = self._heartbeat_tick
             self._send_document(hello_document)
@@ -749,28 +792,64 @@ class DomoticzSyncPlugin:
 
     def _handle_protocol_document(self, document):
         if self.phase == PHASE_WAIT_CHALLENGE:
-            context = wire_protocol.accept_challenge(
-                self._pairing_key, self._hello, document
-            )
+            if self._protocol_version == wire_protocol.PROTOCOL_VERSION_V2:
+                context = wire_protocol.accept_v2_challenge(
+                    self._pairing_key,
+                    self._hello,
+                    document,
+                )
+                self._protocol_selection = context.selection
+                session_key = wire_protocol.derive_v2_session_key(
+                    self._pairing_key,
+                    context,
+                )
+                authenticate = wire_protocol.build_v2_authenticate(
+                    self._pairing_key,
+                    context,
+                )
+            else:
+                context = wire_protocol.accept_challenge(
+                    self._pairing_key,
+                    self._hello,
+                    document,
+                )
+                session_key = wire_protocol.derive_session_key(
+                    self._pairing_key,
+                    context,
+                )
+                authenticate = wire_protocol.build_authenticate(
+                    self._pairing_key,
+                    context,
+                )
             self._handshake_context = context
-            self._session_key = wire_protocol.derive_session_key(
-                self._pairing_key, context
-            )
-            authenticate = wire_protocol.build_authenticate(self._pairing_key, context)
+            self._session_key = session_key
             self.phase = PHASE_WAIT_PROTOCOL_READY
             self._phase_started_tick = self._heartbeat_tick
             self._send_document(authenticate)
             return
 
         if self.phase == PHASE_WAIT_PROTOCOL_READY:
-            self._session_id = wire_protocol.verify_ready(
-                self._session_key, self._handshake_context, document
-            )
+            if self._protocol_version == wire_protocol.PROTOCOL_VERSION_V2:
+                self._session_id = wire_protocol.verify_v2_ready(
+                    self._session_key,
+                    self._handshake_context,
+                    document,
+                )
+                initial_payload = wire_protocol.build_application_ready(
+                    self._protocol_selection
+                )
+            else:
+                self._session_id = wire_protocol.verify_ready(
+                    self._session_key,
+                    self._handshake_context,
+                    document,
+                )
+                initial_payload = {"type": "inventory", "targets": []}
             self._out_sequence = 0
             self._in_sequence = 0
             self.phase = PHASE_WAIT_APPLICATION_READY
             self._phase_started_tick = self._heartbeat_tick
-            self._send_signed({"type": "inventory", "targets": []})
+            self._send_signed(initial_payload)
             return
 
         if self.phase not in {PHASE_WAIT_APPLICATION_READY, PHASE_READY}:
@@ -779,6 +858,7 @@ class DomoticzSyncPlugin:
         verified = wire_protocol.verify_envelope(
             self._session_key,
             document,
+            protocol_version=self._protocol_version,
             expected_direction=wire_protocol.DIRECTION_HA_TO_DOMOTICZ,
             expected_session_id=self._session_id,
             last_sequence=self._in_sequence,
@@ -786,12 +866,23 @@ class DomoticzSyncPlugin:
         self._in_sequence = verified.sequence
         payload = verified.payload
         if self.phase == PHASE_WAIT_APPLICATION_READY:
-            if payload != {"type": "ready"}:
+            if self._protocol_version == wire_protocol.PROTOCOL_VERSION_V2:
+                wire_protocol.parse_application_ready(
+                    self._protocol_selection,
+                    payload,
+                )
+            elif payload != {"type": "ready"}:
                 raise wire_protocol.ProtocolFormatError
             self.phase = PHASE_READY
             self._reconnect_delay = 1
             self._last_ping_tick = self._heartbeat_tick
-            Domoticz.Log("Authenticated connection to Home Assistant is ready.")
+            if self._protocol_version == wire_protocol.PROTOCOL_VERSION:
+                Domoticz.Log(
+                    "Authenticated Home Assistant connection is ready in "
+                    "v1 compatibility mode; entity export is disabled."
+                )
+            else:
+                Domoticz.Log("Authenticated connection to Home Assistant is ready.")
             return
 
         self._handle_signed_payload(payload)
@@ -801,6 +892,13 @@ class DomoticzSyncPlugin:
             raise wire_protocol.ProtocolFormatError
         message_type = payload.get("type")
         if message_type == "apply":
+            if (
+                self._protocol_selection is None
+                or not self._protocol_selection.supports(
+                    wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1
+                )
+            ):
+                raise wire_protocol.ProtocolCompatibilityError
             self._handle_apply_payload(payload)
             return
 
@@ -819,12 +917,13 @@ class DomoticzSyncPlugin:
 
     def _handle_apply_payload(self, payload):
         """Apply one correlated request and return only a sanitized result."""
-        request = wire_protocol.parse_apply(payload)
+        request = wire_protocol.parse_apply(self._protocol_selection, payload)
 
         try:
             target_id = self._apply_action(request.action)
         except Exception:
             result = wire_protocol.build_apply_result(
+                self._protocol_selection,
                 request.request_id,
                 wire_protocol.ApplyResultStatus.REJECTED,
                 None,
@@ -832,6 +931,7 @@ class DomoticzSyncPlugin:
             )
         else:
             result = wire_protocol.build_apply_result(
+                self._protocol_selection,
                 request.request_id,
                 wire_protocol.ApplyResultStatus.CONFIRMED,
                 target_id,
@@ -1034,6 +1134,7 @@ class DomoticzSyncPlugin:
         sequence = self._out_sequence + 1
         document = wire_protocol.sign_envelope(
             self._session_key,
+            protocol_version=self._protocol_version,
             direction=wire_protocol.DIRECTION_DOMOTICZ_TO_HA,
             session_id=self._session_id,
             sequence=sequence,
@@ -1191,6 +1292,9 @@ class DomoticzSyncPlugin:
 
     def _reset_session(self):
         self._upgrade_key = None
+        self._selected_protocol = None
+        self._protocol_version = wire_protocol.PROTOCOL_VERSION
+        self._protocol_selection = None
         self._hello = None
         self._handshake_context = None
         self._session_key = None

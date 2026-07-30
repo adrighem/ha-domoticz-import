@@ -22,6 +22,7 @@ from .core.execution import (
     TargetActionError,
 )
 from .core.protocol import (
+    FEATURE_HA_EXPORT_NUMERIC_V1,
     ApplyResultStatus,
     ProtocolError,
     build_apply,
@@ -63,7 +64,9 @@ class DomoticzSessionTargetAdapter:
         request_id = generate_request_id()
 
         async with asyncio.timeout(APPLY_TIMEOUT):
-            await self._session.async_send(build_apply(request_id, action))
+            await self._session.async_send(
+                build_apply(self._session.selection, request_id, action)
+            )
             while True:
                 payload = await self._session.async_receive()
                 if isinstance(payload, dict) and payload.get("type") == "ping":
@@ -71,7 +74,7 @@ class DomoticzSessionTargetAdapter:
                     await self._session.async_send({"id": ping_id, "type": "pong"})
                     continue
 
-                result = parse_apply_result(payload)
+                result = parse_apply_result(self._session.selection, payload)
                 if result.request_id != request_id:
                     raise ProtocolError("invalid protocol message")
                 if result.status is ApplyResultStatus.REJECTED:
@@ -99,6 +102,9 @@ class HomeAssistantExportApplication:
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
         """Run one fail-closed numeric reconciliation for a ready session."""
+        if not session.supports(FEATURE_HA_EXPORT_NUMERIC_V1):
+            return
+
         entry = self._hass.config_entries.async_get_entry(session.entry_id)
         if entry is None:
             raise ProtocolError("export reconciliation is unavailable")

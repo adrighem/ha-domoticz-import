@@ -22,7 +22,7 @@ from custom_components.domoticz_sync.core import CatalogStorageError  # noqa: E4
 ENTRY_ID = "entry-1"
 DESTINATION_ID = "domoticz-destination-1"
 STORAGE_KEY = "domoticz_sync.target_catalog.entry-1.domoticz-destination-1"
-CATALOG = {"version": 1, "targets": []}
+CATALOG = {"version": 2, "targets": []}
 
 
 @pytest.fixture
@@ -230,6 +230,47 @@ async def test_catalog_schema_is_validated_on_load_and_before_save(
         match="target catalog could not be saved",
     ):
         await writer.async_save(invalid_catalog)
+
+
+@pytest.mark.parametrize("catalog_version", [1, 3])
+async def test_unsupported_catalog_version_is_not_rewritten(
+    hass: HomeAssistant,
+    catalog_version: int,
+) -> None:
+    """Released v1 and unknown future data remain intact after rejection."""
+    wrapper = {
+        "entry_id": ENTRY_ID,
+        "destination_id": DESTINATION_ID,
+        "catalog": {"version": catalog_version, "targets": []},
+    }
+    raw_store = Store(
+        hass,
+        1,
+        STORAGE_KEY,
+        private=True,
+        atomic_writes=True,
+    )
+    await raw_store.async_save(wrapper)
+    storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=ENTRY_ID,
+        destination_id=DESTINATION_ID,
+    )
+
+    with pytest.raises(
+        CatalogStorageError,
+        match="target catalog could not be loaded",
+    ):
+        await storage.async_load()
+
+    persisted = await Store(
+        hass,
+        1,
+        STORAGE_KEY,
+        private=True,
+        atomic_writes=True,
+    ).async_load()
+    assert persisted == wrapper
 
 
 async def test_save_uses_fresh_store_and_rejects_unconfirmed_write(

@@ -14,6 +14,8 @@
 - Use deterministic identities so reconnects do not create duplicates.
 - Never delete a Domoticz device automatically.
 - Fail closed on malformed, unauthenticated, or stale protocol messages.
+- Treat protocol authentication and transport confidentiality as separate
+  concerns; document the limits of both WS and Domoticz's native WSS transport.
 - Prefer a truthful Custom Sensor over an incorrect native device type.
 - Keep imported and exported entities read-only until an authenticated command
   protocol is designed and implemented.
@@ -24,8 +26,17 @@
   3.9 or newer.
 - Keep the Home Assistant integration aligned with the repository's supported
   Home Assistant test version.
-- Treat both halves as one release and document any required coordinated
-  upgrade.
+- Freeze released protocol and message schemas instead of extending them in
+  place.
+- Keep legacy protocol v1 heartbeat-only and never add write behavior to it.
+- Select new major protocols through explicit WebSocket subprotocols, then
+  authenticate the complete protocol and feature negotiation.
+- Version application features and their exact schemas independently so mixed
+  installations use only their common feature set.
+- Make version mismatches disable export or the connection rather than silently
+  downgrading to a write-capable legacy path.
+- Treat both halves as one tested release, recommend matching tags, and
+  document the safe rolling-upgrade order.
 
 ## Quality
 

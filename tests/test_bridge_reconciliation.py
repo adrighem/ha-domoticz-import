@@ -37,8 +37,12 @@ from custom_components.domoticz_sync.core.execution import (  # noqa: E402
     TargetActionError,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
+    FEATURE_HA_EXPORT_NUMERIC_V1,
+    PROTOCOL_VERSION_V2,
+    WEBSOCKET_SUBPROTOCOL_V2,
     ApplyResultStatus,
     ProtocolError,
+    ProtocolSelection,
     build_apply_result,
     generate_nonce,
     parse_apply,
@@ -46,6 +50,12 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
 from custom_components.domoticz_sync.core.reconciliation import (  # noqa: E402
     ReconciliationAction,
     ReconciliationActionKind,
+)
+
+_SELECTION = ProtocolSelection(
+    version=PROTOCOL_VERSION_V2,
+    websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+    features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
 )
 
 
@@ -91,11 +101,21 @@ class _Session:
     entry_id = "entry-1"
     destination_id = "destination-1"
 
-    def __init__(self, response_builder=None) -> None:
+    def __init__(
+        self,
+        response_builder=None,
+        *,
+        selection: ProtocolSelection = _SELECTION,
+    ) -> None:
         self.sent: list[dict[str, object]] = []
         self._responses: deque[dict[str, object]] = deque()
         self._response_builder = response_builder
         self._never_respond = asyncio.Event()
+        self.selection = selection
+
+    def supports(self, feature: str) -> bool:
+        """Return whether one optional application behavior was negotiated."""
+        return self.selection.supports(feature)
 
     async def async_send(self, payload: dict[str, object]) -> None:
         """Record a payload and enqueue responses to apply requests."""
@@ -146,9 +166,10 @@ def _create_action(object_id: str = "sensor-a") -> ReconciliationAction:
 
 def _confirmed_response(payload: dict[str, object]) -> list[dict[str, object]]:
     """Confirm one apply request using its exact source."""
-    request = parse_apply(payload)
+    request = parse_apply(_SELECTION, payload)
     return [
         build_apply_result(
+            _SELECTION,
             request.request_id,
             ApplyResultStatus.CONFIRMED,
             f"target-{request.action.capability.source.object_id}",
@@ -185,6 +206,21 @@ def _configure_application(
 
 
 @pytest.mark.asyncio
+async def test_application_is_inert_without_negotiated_numeric_feature() -> None:
+    """Direct invocation cannot bypass the authenticated feature gate."""
+    selection = ProtocolSelection(
+        version=PROTOCOL_VERSION_V2,
+        websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+        features=(),
+    )
+    session = _Session(selection=selection)
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert session.sent == []
+
+
+@pytest.mark.asyncio
 async def test_application_filters_binary_and_commits_numeric(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -198,7 +234,7 @@ async def test_application_filters_binary_and_commits_numeric(
     await HomeAssistantExportApplication(_Hass()).async_connected(session)
 
     requests = [
-        parse_apply(payload)
+        parse_apply(_SELECTION, payload)
         for payload in session.sent
         if payload.get("type") == "apply"
     ]
@@ -221,10 +257,11 @@ async def test_rejected_action_continues_without_catalog_mutation(
     _configure_application(monkeypatch, [rejected, confirmed], storage)
 
     def responses(payload: dict[str, object]) -> list[dict[str, object]]:
-        request = parse_apply(payload)
+        request = parse_apply(_SELECTION, payload)
         if request.action.capability.source == rejected.source:
             return [
                 build_apply_result(
+                    _SELECTION,
                     request.request_id,
                     ApplyResultStatus.REJECTED,
                     None,
@@ -238,7 +275,7 @@ async def test_rejected_action_continues_without_catalog_mutation(
     await HomeAssistantExportApplication(_Hass()).async_connected(session)
 
     requests = [
-        parse_apply(payload)
+        parse_apply(_SELECTION, payload)
         for payload in session.sent
         if payload.get("type") == "apply"
     ]
@@ -259,6 +296,7 @@ async def test_adapter_rejects_result_for_different_request() -> None:
     def responses(_payload: dict[str, object]) -> list[dict[str, object]]:
         return [
             build_apply_result(
+                _SELECTION,
                 "request-different",
                 ApplyResultStatus.CONFIRMED,
                 "target-a",
@@ -276,9 +314,10 @@ async def test_adapter_rejects_confirmation_for_different_source() -> None:
     action = _create_action()
 
     def responses(payload: dict[str, object]) -> list[dict[str, object]]:
-        request = parse_apply(payload)
+        request = parse_apply(_SELECTION, payload)
         return [
             build_apply_result(
+                _SELECTION,
                 request.request_id,
                 ApplyResultStatus.CONFIRMED,
                 "target-a",
@@ -361,7 +400,7 @@ async def test_adapter_generates_valid_ids_for_problematic_raw_tokens(
 
     await DomoticzSessionTargetAdapter(session).async_apply(_create_action())
 
-    request_id = parse_apply(session.sent[0]).request_id
+    request_id = parse_apply(_SELECTION, session.sent[0]).request_id
     assert request_id.startswith(f"request_{raw_prefix}")
 
 
@@ -384,9 +423,10 @@ async def test_adapter_turns_rejection_into_isolated_target_error() -> None:
     """A strict remote rejection remains local to its action."""
 
     def responses(payload: dict[str, object]) -> list[dict[str, object]]:
-        request = parse_apply(payload)
+        request = parse_apply(_SELECTION, payload)
         return [
             build_apply_result(
+                _SELECTION,
                 request.request_id,
                 ApplyResultStatus.REJECTED,
                 None,

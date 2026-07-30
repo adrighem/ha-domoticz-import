@@ -12,7 +12,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
 from .reconciliation import TargetRecord
 
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 
 _ROOT_KEYS = {"version", "targets"}
 _TARGET_KEYS = {"target_id", "capability", "stale"}
@@ -115,7 +115,7 @@ class TargetCatalog:
         return self.with_record(record)
 
     def to_dict(self) -> Dict[str, object]:
-        """Serialize the complete catalog to the JSON-compatible v1 schema."""
+        """Serialize the complete catalog to the JSON-compatible v2 schema."""
         targets: List[Dict[str, object]] = []
         for record in self._records:
             capability = record.capability
@@ -148,7 +148,7 @@ class TargetCatalog:
 
     @classmethod
     def from_dict(cls, data: object) -> TargetCatalog:
-        """Deserialize a strict v1 schema or raise one safe format error."""
+        """Deserialize a strict v2 schema or raise one safe format error."""
         try:
             _require_object(data, _ROOT_KEYS)
             if type(data["version"]) is not int:
@@ -185,7 +185,7 @@ def _require_object(value: object, expected_keys: Set[str]) -> None:
 
 
 def _record_from_dict(data: object) -> TargetRecord:
-    """Build one fully validated record from its strict v1 representation."""
+    """Build one fully validated record from its strict v2 representation."""
     _require_object(data, _TARGET_KEYS)
     capability_data = data["capability"]
     _require_object(capability_data, _CAPABILITY_KEYS)
