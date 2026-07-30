@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.3.1](https://github.com/adrighem/ha-domoticz-sync/compare/v0.3.0...v0.3.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* support Home Assistant 2026.7 entity categories ([7ac1e0f](https://github.com/adrighem/ha-domoticz-sync/commit/7ac1e0fbdbeca4952ef95bee4e586b52b7a4cf81))
+
 ## [0.3.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.2.0...v0.3.0) (2026-07-30)
 
 
