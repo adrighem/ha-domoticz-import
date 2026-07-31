@@ -678,6 +678,20 @@ def _inventory_features(_monkeypatch, protocol):
     return protocol.SUPPORTED_V2_FEATURES
 
 
+def _continuous_features(monkeypatch, protocol):
+    """Enable the not-yet-default continuous contract for focused tests."""
+    features = tuple(
+        sorted(
+            (
+                *protocol.SUPPORTED_V2_FEATURES,
+                protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1,
+            )
+        )
+    )
+    monkeypatch.setattr(protocol, "SUPPORTED_V2_FEATURES", features)
+    return features
+
+
 def _send_inventory_request(
     module,
     plugin,
@@ -1204,14 +1218,20 @@ def test_invalid_domoticz_inventory_is_rejected_without_value_disclosure(
     assert secret_marker not in logs
 
 
+@pytest.mark.parametrize("continuous", [False, True])
 def test_second_inventory_request_in_one_session_is_a_protocol_violation(
     loaded_plugin,
     monkeypatch,
+    continuous,
 ):
     """A completed snapshot cannot be replaced later in the same session."""
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
-    features = _inventory_features(monkeypatch, protocol)
+    features = (
+        _continuous_features(monkeypatch, protocol)
+        if continuous
+        else _inventory_features(monkeypatch, protocol)
+    )
     plugin, connection = _start_and_upgrade(module)
     session_key, session_id = _complete_handshake(
         module,
@@ -1246,6 +1266,63 @@ def test_second_inventory_request_in_one_session_is_a_protocol_violation(
     assert plugin.phase == module.PHASE_DISCONNECTED
     assert connection.disconnected
     assert connection.sent[-1]["Operation"] == "Close"
+
+
+def test_continuous_session_accepts_sequential_catalog_delta_applies(
+    loaded_plugin,
+    monkeypatch,
+):
+    """One confirmed inventory can gate multiple ordered live deltas."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _continuous_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    inventory = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    baseline_created = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-baseline-target",
+        action=_numeric_action(protocol, value=1.0, name="Initial name"),
+    )
+    updated = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="update-live-target",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=baseline_created.target_id,
+            value=2.0,
+            name="Changed name",
+        ),
+    )
+
+    assert inventory[0].targets == ()
+    assert baseline_created.status is protocol.ApplyResultStatus.CONFIRMED
+    assert updated.status is protocol.ApplyResultStatus.CONFIRMED
+    unit = domoticz.devices[baseline_created.target_id].Units[1]
+    assert unit.Name == "Changed name"
+    assert unit.sValue == "2.0"
+    assert plugin.phase == module.PHASE_READY
+    assert plugin._inventory_confirmed
 
 
 def test_inventory_request_without_negotiated_feature_closes_without_result(

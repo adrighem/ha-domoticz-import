@@ -76,9 +76,22 @@ Remote Domoticz inventory is a separate read-only feature:
 domoticz-inventory.v1
 ```
 
-An implementation advertises this feature only when it implements the complete
-request, paging, validation, and fail-closed behavior below. Inventory support
-does not change either export feature.
+Continuous export is a separate session-lifecycle feature:
+
+```text
+ha-export.continuous.v1
+```
+
+It adds no application payload schema and does not authorize a numeric or
+binary write by itself. It is used only when `domoticz-inventory.v1` and at
+least one matching export-kind feature are also selected. An implementation
+advertises continuous export only after it implements the complete subscription,
+coalescing, session-lifecycle, and recovery behavior below. Merely recognizing
+the feature identifier does not advertise it.
+
+An implementation advertises `domoticz-inventory.v1` only when it implements
+the complete request, paging, validation, and fail-closed behavior below.
+Inventory support does not change either export feature.
 
 Home Assistant may send an export action only when its feature appears in
 `selected_features`. A session can support numeric export, binary export, both,
@@ -317,6 +330,67 @@ When `domoticz-inventory.v1` is not selected, no inventory messages are sent.
 Mutually selected numeric and binary features retain the earlier catalog-only
 connect-time export behavior, without remote drift detection or repair.
 
+## Continuous Export
+
+`ha-export.continuous.v1` turns selected Home Assistant changes into serialized
+reconciliation cycles while one authenticated v2 session remains open.
+It deliberately reuses the immutable schema-1 numeric and binary apply
+messages. There is no `delta` payload, no mutable catalog revision on the wire,
+and still only one complete inventory snapshot per session.
+
+A Home Assistant event is only a value-free dirty hint. After a bounded
+coalescing window, Home Assistant reads the current complete labelled source
+snapshot, jointly validates both durable target catalogs, and derives the
+smallest catalog-owned action delta. Signed envelope sequences order all
+application traffic; independent request IDs correlate each apply result.
+
+The source snapshot, catalogs, and writes for one destination are serialized as
+one cycle, while each confirmed action retains its existing atomic catalog
+persistence boundary. Only one apply is in flight across both export kinds;
+signed ping and pong heartbeats may interleave. An event that arrives during
+collection, apply, or persistence leaves the destination dirty and causes one
+follow-up cycle from fresh state. Event bursts may collapse into one cycle
+because intermediate Home Assistant values are observations, not an ordered
+command stream. The latest authoritative state must not be lost or replaced by
+event payload data.
+
+Removing a direct export label retains the catalog-owned Domoticz target and
+marks it unavailable and stale; it never sends a delete. Adding the label back
+reuses the same source identity and deterministic DeviceID. Updates continue
+only for sources already bound by a durable catalog record, and the plugin
+rechecks the live target shape immediately before every mutation.
+
+A source newly entering the desired export selection without a durable catalog
+record might have been relabelled or might have become exportable after a
+state, metadata, or exclusion change. Home Assistant must not persist a pending
+create from the session's older inventory snapshot. Instead it closes the
+session without performing any part of that live pass. The plugin reconnects
+and the normal connect-time cycle takes a fresh inventory, jointly validates
+both catalogs, checks deterministic collisions, and only then creates the new
+target. Unrelated, ambiguous, retyped, or multi-unit targets retain the
+inventory-aware refusal rules.
+
+If that fresh inventory exposes an unrelated deterministic-ID collision, the
+source remains uncataloged and becomes the new session's unbound desired
+baseline. It does not trigger another reconnect until it leaves the selection
+and later re-enters, preventing an incompatible target from causing a reconnect
+loop.
+
+Disconnecting abandons the session-local dirty generation and every unconfirmed
+cycle result. An apply timeout, correlation failure, or uncertain catalog
+persistence also closes the session for the same recovery path. No event
+payload is persisted for replay. A new
+authenticated session starts with a complete Home Assistant snapshot and fresh
+Domoticz inventory, so the latest state is the recovery barrier. Deterministic
+identities, pending-create records, remote confirmation, and atomic catalog
+persistence keep retries idempotent.
+
+If continuous export is absent from the authenticated feature intersection,
+both peers retain the released connect-time-only behavior even when inventory
+and one or both export kinds are available. A continuous feature selected
+without inventory is unusable and fails closed rather than authorizing a live
+write from stale remote state.
+
 ## Mixed Installations
 
 Home Assistant and the Domoticz plugin may be updated in either order. The
@@ -329,6 +403,7 @@ intermediate states are safe:
 | Current, inventory-aware peer | Current, inventory-aware peer | Authenticated v2 session; inventory is confirmed before export and enables safe drift repair for each selected export kind |
 | Current binary-aware peer | Earlier numeric-only v2 peer | Authenticated v2 session; numeric export continues and binary export stays disabled |
 | Inventory-aware peer | Earlier v2 peer without inventory | Authenticated v2 session; common export features continue and remote inventory and drift repair stay disabled |
+| Continuous-aware peer | Earlier v2 peer without continuous export | Authenticated v2 session; common inventory and export features run once at connect, and no live subscription starts |
 | Both support v2 but not the same optional feature | Mixed feature support | The v2 session may run its common baseline, but the unsupported feature is not used |
 
 No mixed state permits legacy writes. A mismatch can temporarily stop export,

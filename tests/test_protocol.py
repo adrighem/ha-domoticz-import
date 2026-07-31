@@ -21,6 +21,7 @@ from custom_components.domoticz_sync.core.protocol import (
     DIRECTION_HA_TO_DOMOTICZ,
     FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
+    FEATURE_HA_EXPORT_CONTINUOUS_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     MAX_MESSAGE_BYTES,
     MAX_SAFE_INTEGER,
@@ -1453,6 +1454,33 @@ def test_inventory_feature_negotiates_independently_for_mixed_v2_peers() -> None
         client_features=SUPPORTED_V2_FEATURES,
         server_features=SUPPORTED_V2_FEATURES,
     ).selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+
+
+def test_continuous_feature_is_explicit_and_safe_during_rolling_upgrades() -> None:
+    """Continuous behavior stays dormant until both peers advertise it."""
+    continuous_features = tuple(
+        sorted((*SUPPORTED_V2_FEATURES, FEATURE_HA_EXPORT_CONTINUOUS_V1))
+    )
+
+    assert FEATURE_HA_EXPORT_CONTINUOUS_V1 not in SUPPORTED_V2_FEATURES
+    assert (
+        _fixed_v2_context(
+            client_features=continuous_features,
+            server_features=SUPPORTED_V2_FEATURES,
+        ).selection.features
+        == SUPPORTED_V2_FEATURES
+    )
+    assert (
+        _fixed_v2_context(
+            client_features=SUPPORTED_V2_FEATURES,
+            server_features=continuous_features,
+        ).selection.features
+        == SUPPORTED_V2_FEATURES
+    )
+    assert _fixed_v2_context(
+        client_features=continuous_features,
+        server_features=continuous_features,
+    ).selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
 
 
 def test_domoticz_target_id_derivation_is_shared_and_stable() -> None:
