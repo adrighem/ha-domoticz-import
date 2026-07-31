@@ -127,11 +127,20 @@
 - [x] Task 6.2: Subscribe to selected Home Assistant state and metadata changes
   (`03b810a`)
 - [x] Task 6.3: Coalesce updates and recover from disconnects (`99dae55`)
-- [~] Task 6.4: Test and manually verify live updates and relabeling
+- [x] Task 6.4: Test and manually verify live updates and relabeling
   (`2b12e76`)
   - [x] Automated continuous, reconnect, relabel, unavailable, metadata,
     capacity, rejection, and mixed-version verification
-  - [ ] Live verification on the installed Home Assistant and Domoticz peers
+  - [x] Live verification on the installed Home Assistant and Domoticz peers
+    - Both peers ran `0234935` and negotiated protocol v2 with inventory,
+      continuous, numeric, and binary export features.
+    - Live rename, burst, and relabel changes preserved the same targets;
+      removal timed out the existing binary target and restoration revived it.
+    - A `domoticz.service`-only restart converged to the latest state with four
+      Unit 1 targets, no siblings or duplicates, and unchanged safety sentinel.
+    - Temporary metadata was restored, all targets ended current, and relevant
+      Home Assistant and Domoticz logs were clean. User confirmed the result on
+      2026-07-31.
 
 ## Phase 7: Multi-capability Read-only Entities
 
