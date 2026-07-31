@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -28,7 +28,7 @@ from homeassistant.const import (  # noqa: E402
     UV_INDEX,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant  # noqa: E402
+from homeassistant.core import Event, HomeAssistant  # noqa: E402
 from homeassistant.helpers import entity_registry as er  # noqa: E402
 from homeassistant.helpers import label_registry as lr  # noqa: E402
 
@@ -45,6 +45,7 @@ from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E40
     ExportExclusionReason,
     ExportLabelNotFoundError,
     async_collect_export_capabilities,
+    async_subscribe_export_changes,
     collect_export_capabilities,
     collect_export_selection,
 )
@@ -268,6 +269,211 @@ def test_label_rename_keeps_selection_by_stable_id(hass: HomeAssistant) -> None:
     capabilities = collect_export_capabilities(hass, instance_id="ha-instance")
 
     assert capabilities[0].source.object_id == entry.id
+
+
+def test_export_change_subscription_requires_the_explicit_label(
+    hass: HomeAssistant,
+) -> None:
+    """A missing configured label cannot be treated as an empty selection."""
+    with pytest.raises(ExportLabelNotFoundError, match="does not exist"):
+        async_subscribe_export_changes(
+            hass,
+            label_id="deleted-label",
+            on_change=Mock(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_export_change_subscription_tracks_selected_supported_states(
+    hass: HomeAssistant,
+) -> None:
+    """State and attribute changes include directly labelled exclusions only."""
+    selected = _register_entity(hass, "sensor", "selected")
+    disabled = _register_entity(hass, "binary_sensor", "disabled", disabled=True)
+    unlabelled = _register_entity(
+        hass,
+        "sensor",
+        "unlabelled",
+        labelled=False,
+    )
+    unsupported = _register_entity(hass, "input_text", "unsupported")
+    on_change = Mock()
+    unsubscribe = async_subscribe_export_changes(
+        hass,
+        label_id=EXPORT_LABEL_ID,
+        on_change=on_change,
+    )
+
+    hass.states.async_set(selected.entity_id, "1")
+    hass.states.async_set(disabled.entity_id, STATE_ON)
+    hass.states.async_set(unlabelled.entity_id, "2")
+    hass.states.async_set(unsupported.entity_id, "private-value")
+    await hass.async_block_till_done()
+
+    assert on_change.call_count == 2
+    assert all(not call.args and not call.kwargs for call in on_change.call_args_list)
+
+    on_change.reset_mock()
+    hass.states.async_set(
+        selected.entity_id,
+        "1",
+        {ATTR_FRIENDLY_NAME: "Updated display name"},
+    )
+    await hass.async_block_till_done()
+
+    on_change.assert_called_once_with()
+    unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_export_change_subscription_replaces_state_ids_during_relabel(
+    hass: HomeAssistant,
+) -> None:
+    """Relabeling adds and removes state tracking without an event-loop gap."""
+    entry = _register_entity(hass, "sensor", "relabelled", labelled=False)
+    hass.states.async_set(entry.entity_id, "1")
+    registry = er.async_get(hass)
+    on_change = Mock()
+    unsubscribe = async_subscribe_export_changes(
+        hass,
+        label_id=EXPORT_LABEL_ID,
+        on_change=on_change,
+    )
+
+    registry.async_update_entity(entry.entity_id, labels={EXPORT_LABEL_ID})
+    hass.states.async_set(entry.entity_id, "2")
+    await hass.async_block_till_done()
+
+    assert on_change.call_count == 2
+    assert all(not call.args and not call.kwargs for call in on_change.call_args_list)
+
+    on_change.reset_mock()
+    registry.async_update_entity(entry.entity_id, labels=set())
+    hass.states.async_set(entry.entity_id, "3")
+    await hass.async_block_till_done()
+
+    on_change.assert_called_once_with()
+    unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_export_change_subscription_tracks_registry_metadata_and_rename(
+    hass: HomeAssistant,
+) -> None:
+    """Selected registry metadata and renamed state IDs remain observable."""
+    selected = _register_entity(hass, "sensor", "registry_selected")
+    unlabelled = _register_entity(
+        hass,
+        "sensor",
+        "registry_unlabelled",
+        labelled=False,
+    )
+    registry = er.async_get(hass)
+    on_change = Mock()
+    unsubscribe = async_subscribe_export_changes(
+        hass,
+        label_id=EXPORT_LABEL_ID,
+        on_change=on_change,
+    )
+
+    registry.async_update_entity(unlabelled.entity_id, name="Ignored metadata")
+    await hass.async_block_till_done()
+    on_change.assert_not_called()
+
+    registry.async_update_entity(
+        selected.entity_id,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    registry.async_update_entity(selected.entity_id, name="Updated metadata")
+    await hass.async_block_till_done()
+    assert on_change.call_count == 2
+
+    on_change.reset_mock()
+    renamed = registry.async_update_entity(
+        selected.entity_id,
+        new_entity_id="sensor.registry_renamed",
+    )
+    hass.states.async_set(renamed.entity_id, "4")
+    await hass.async_block_till_done()
+
+    assert on_change.call_count == 2
+    assert all(not call.args and not call.kwargs for call in on_change.call_args_list)
+    unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_export_change_subscription_handles_label_lifecycle_and_cleanup(
+    hass: HomeAssistant,
+) -> None:
+    """The stable label can be renamed, while deletion and cleanup are safe."""
+    selected = _register_entity(hass, "sensor", "label_lifecycle")
+    hass.states.async_set(selected.entity_id, "1")
+    label_registry = lr.async_get(hass)
+    on_change = Mock()
+    unsubscribe = async_subscribe_export_changes(
+        hass,
+        label_id=EXPORT_LABEL_ID,
+        on_change=on_change,
+    )
+
+    label_registry.async_update(EXPORT_LABEL_ID, name="Send to Domoticz")
+    await hass.async_block_till_done()
+    on_change.assert_not_called()
+
+    label_registry.async_delete(EXPORT_LABEL_ID)
+    await hass.async_block_till_done()
+    on_change.assert_called_once_with()
+
+    on_change.reset_mock()
+    hass.states.async_set(selected.entity_id, "2")
+    await hass.async_block_till_done()
+    on_change.assert_not_called()
+
+    unsubscribe()
+    unsubscribe()
+
+
+@pytest.mark.asyncio
+async def test_export_change_unsubscribe_makes_queued_callbacks_inert(
+    hass: HomeAssistant,
+) -> None:
+    """A queued state callback cannot outlive its idempotent unsubscribe."""
+    selected = _register_entity(hass, "sensor", "queued_callback")
+    on_change = Mock()
+    state_callbacks = []
+    remove_state_listener = Mock()
+
+    def track_state_change(_hass, entity_ids, action):
+        assert entity_ids == [selected.entity_id]
+        state_callbacks.append(action)
+        return remove_state_listener
+
+    with patch(
+        "custom_components.domoticz_sync.home_assistant_source."
+        "async_track_state_change_event",
+        side_effect=track_state_change,
+    ):
+        unsubscribe = async_subscribe_export_changes(
+            hass,
+            label_id=EXPORT_LABEL_ID,
+            on_change=on_change,
+        )
+
+    unsubscribe()
+    unsubscribe()
+    state_callbacks[0](
+        Event(
+            "state_changed",
+            {
+                "entity_id": selected.entity_id,
+                "new_state": None,
+                "old_state": None,
+            },
+        )
+    )
+
+    on_change.assert_not_called()
+    remove_state_listener.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
