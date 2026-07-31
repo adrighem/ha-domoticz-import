@@ -108,8 +108,8 @@
 ## Phase 5: Domoticz Inventory and Drift Repair
 
 - [x] Task 5.1: Design authenticated remote inventory messages (`9b236d7`)
-- [~] Task 5.2: Reconcile owned devices against real Domoticz state
-- [ ] Task 5.3: Repair safe drift without deleting or claiming unrelated devices
+- [x] Task 5.2: Reconcile owned devices against real Domoticz state (`c3ac10e`)
+- [~] Task 5.3: Repair safe drift without deleting or claiming unrelated devices
 - [ ] Task 5.4: Test and manually verify restart and manual-change scenarios
 
 ## Phase 6: Continuous Synchronization
