@@ -14,7 +14,7 @@
   - [x] Test deterministic creation, adoption, update, and unavailable state
   - [x] Update user and architecture documentation
   - [x] Run current Python, Python 3.9, integration, and Ruff validation
-- [x] Task 1.4: Manual verification
+- [x] Task 1.4: Manual verification (`7347ca3`)
   - [x] Install the released version on the test Domoticz instance
   - [x] Confirm a native Temperature target keeps its identity across reconnects
     (live 2026-07-31)
@@ -71,7 +71,7 @@
   - [ ] Manually verify the Home Assistant-first order
     - Blocked until the installed Domoticz plugin checkout can be inspected and
       switched to an exact tag without deleting the installation
-  - [x] Manually verify the Domoticz plugin-first order
+  - [x] Manually verify the Domoticz plugin-first order (`7347ca3`)
     - Live 2026-07-31: HA `v0.2.0` negotiated heartbeat-only v1 with two
       persistent targets; restoring `v0.3.1` negotiated numeric v2 with the
       same two targets
