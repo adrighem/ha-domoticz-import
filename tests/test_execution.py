@@ -1121,4 +1121,4 @@ async def test_result_never_contains_adapter_error_message() -> None:
 def test_step_five_public_contract_has_no_delete_operation() -> None:
     """The persistence and execution layers remain deliberately non-destructive."""
     assert not hasattr(TargetCatalog, "remove")
-    assert not hasattr(_FakeTargetAdapter, "async_delete")
+    assert not hasattr(TargetAdapter, "async_delete")

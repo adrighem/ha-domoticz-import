@@ -2933,6 +2933,64 @@ def test_v2_numeric_only_peer_does_not_parse_or_apply_binary(
     assert connection.disconnected
 
 
+@pytest.mark.parametrize("message_type", ["apply", "binary_apply"])
+def test_apply_routes_resolve_handlers_when_each_message_is_dispatched(
+    loaded_plugin,
+    monkeypatch,
+    message_type,
+):
+    """Route names remain dynamically replaceable at the protocol boundary."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(module, plugin, connection)
+    route = module._APPLY_ROUTES[message_type]
+    parser = getattr(protocol, route.parser_name)
+    action_handler = getattr(plugin, route.action_handler_name)
+    result_builder = getattr(protocol, route.result_builder_name)
+    calls = []
+
+    def recording_parser(*args, **kwargs):
+        calls.append("parse")
+        return parser(*args, **kwargs)
+
+    def recording_action_handler(*args, **kwargs):
+        calls.append("apply")
+        return action_handler(*args, **kwargs)
+
+    def recording_result_builder(*args, **kwargs):
+        calls.append("result")
+        return result_builder(*args, **kwargs)
+
+    monkeypatch.setattr(protocol, route.parser_name, recording_parser)
+    monkeypatch.setattr(plugin, route.action_handler_name, recording_action_handler)
+    monkeypatch.setattr(protocol, route.result_builder_name, recording_result_builder)
+
+    if message_type == "apply":
+        result = _send_apply(
+            module,
+            plugin,
+            connection,
+            session_key,
+            session_id,
+            request_id="dynamic-route-1",
+            action=_numeric_action(protocol),
+        )
+    else:
+        result = _send_binary_apply(
+            module,
+            plugin,
+            connection,
+            session_key,
+            session_id,
+            request_id="dynamic-route-1",
+            action=_binary_action(protocol),
+        )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert calls == ["parse", "apply", "result"]
+
+
 @pytest.mark.parametrize(
     ("selected_protocol", "wrong_version"),
     [

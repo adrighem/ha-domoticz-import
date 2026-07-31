@@ -748,6 +748,50 @@ async def test_inventory_is_complete_before_either_catalog_is_loaded(
 
 
 @pytest.mark.asyncio
+async def test_inventory_constructs_all_catalogs_in_stable_preflight_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preflight builds the inactive binary catalog before the numeric catalog."""
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(monkeypatch, [], numeric_storage)
+    construction_order: list[CapabilityKind] = []
+
+    def make_numeric_storage(_hass, *, entry_id: str, destination_id: str):
+        assert entry_id == "entry-1"
+        assert destination_id == "destination-1"
+        construction_order.append(CapabilityKind.NUMERIC)
+        return numeric_storage
+
+    def make_binary_storage(_hass, *, entry_id: str, destination_id: str):
+        assert entry_id == "entry-1"
+        assert destination_id == "destination-1"
+        construction_order.append(CapabilityKind.BINARY)
+        return binary_storage
+
+    monkeypatch.setattr(
+        app_module,
+        "HomeAssistantCatalogStorage",
+        make_numeric_storage,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "HomeAssistantBinaryCatalogStorage",
+        make_binary_storage,
+    )
+    session = _Session(
+        _inventory_and_apply_responses(_INVENTORY_SELECTION),
+        selection=_INVENTORY_SELECTION,
+    )
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert construction_order == [CapabilityKind.BINARY, CapabilityKind.NUMERIC]
+    assert binary_storage.load_calls == 1
+    assert numeric_storage.load_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_inventory_accepts_interleaved_ping_before_terminal_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

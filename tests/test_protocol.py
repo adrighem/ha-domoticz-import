@@ -2165,6 +2165,13 @@ def test_apply_codecs_require_the_negotiated_numeric_feature() -> None:
         capability=_numeric_capability(),
     )
     payload = build_apply(_selection(), "request-1", action)
+    result = build_apply_result(
+        _selection(),
+        "request-1",
+        ApplyResultStatus.REJECTED,
+        None,
+        None,
+    )
 
     with pytest.raises(ProtocolCompatibilityError):
         build_apply(_selection(()), "request-1", action)
@@ -2178,6 +2185,8 @@ def test_apply_codecs_require_the_negotiated_numeric_feature() -> None:
             None,
             None,
         )
+    with pytest.raises(ProtocolCompatibilityError):
+        parse_apply_result(_selection(()), result)
 
 
 def test_apply_codec_rejects_non_numeric_capabilities() -> None:

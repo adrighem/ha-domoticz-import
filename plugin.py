@@ -214,6 +214,31 @@ class _TargetProfile(NamedTuple):
     manages_options: bool
 
 
+class _ApplyRoute(NamedTuple):
+    """Names needed to dispatch one negotiated application write."""
+
+    feature: str
+    parser_name: str
+    action_handler_name: str
+    result_builder_name: str
+
+
+_APPLY_ROUTES = {
+    "apply": _ApplyRoute(
+        feature=wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1,
+        parser_name="parse_apply",
+        action_handler_name="_apply_action",
+        result_builder_name="build_apply_result",
+    ),
+    "binary_apply": _ApplyRoute(
+        feature=wire_protocol.FEATURE_HA_EXPORT_BINARY_V1,
+        parser_name="parse_binary_apply",
+        action_handler_name="_apply_binary_action",
+        result_builder_name="build_binary_apply_result",
+    ),
+}
+
+
 def _finite_number(value):
     """Return one finite protocol number, rejecting bool explicitly."""
     if type(value) not in (int, float) or not math.isfinite(value):
@@ -939,25 +964,11 @@ class DomoticzSyncPlugin:
         if not isinstance(payload, dict):
             raise wire_protocol.ProtocolFormatError
         message_type = payload.get("type")
-        if message_type == "apply":
-            if (
-                self._protocol_selection is None
-                or not self._protocol_selection.supports(
-                    wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1
-                )
-            ):
-                raise wire_protocol.ProtocolCompatibilityError
-            self._handle_apply_payload(payload)
-            return
-        if message_type == "binary_apply":
-            if (
-                self._protocol_selection is None
-                or not self._protocol_selection.supports(
-                    wire_protocol.FEATURE_HA_EXPORT_BINARY_V1
-                )
-            ):
-                raise wire_protocol.ProtocolCompatibilityError
-            self._handle_binary_apply_payload(payload)
+        apply_route = (
+            _APPLY_ROUTES.get(message_type) if isinstance(message_type, str) else None
+        )
+        if apply_route is not None:
+            self._handle_apply_route(payload, apply_route)
             return
         if message_type == "inventory_request":
             if (
@@ -1187,61 +1198,35 @@ class DomoticzSyncPlugin:
             result,
         )
 
-    def _handle_apply_payload(self, payload):
-        """Apply one correlated request and return only a sanitized result."""
-        request = wire_protocol.parse_apply(self._protocol_selection, payload)
+    def _handle_apply_route(self, payload, route):
+        """Apply one negotiated write route and return a sanitized result."""
+        selection = self._protocol_selection
+        if selection is None or not selection.supports(route.feature):
+            raise wire_protocol.ProtocolCompatibilityError
+
+        parser = getattr(wire_protocol, route.parser_name)
+        request = parser(selection, payload)
 
         try:
-            self._require_inventory_write_gate(
-                wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1
-            )
-            target_id = self._apply_action(request.action)
+            self._require_inventory_write_gate(route.feature)
+            action_handler = getattr(self, route.action_handler_name)
+            target_id = action_handler(request.action)
         except Exception:
-            result = wire_protocol.build_apply_result(
-                self._protocol_selection,
-                request.request_id,
-                wire_protocol.ApplyResultStatus.REJECTED,
-                None,
-                None,
-            )
+            status = wire_protocol.ApplyResultStatus.REJECTED
+            target_id = None
+            source = None
         else:
-            result = wire_protocol.build_apply_result(
-                self._protocol_selection,
-                request.request_id,
-                wire_protocol.ApplyResultStatus.CONFIRMED,
-                target_id,
-                request.action.capability.source,
-            )
-        self._send_signed(result)
+            status = wire_protocol.ApplyResultStatus.CONFIRMED
+            source = request.action.capability.source
 
-    def _handle_binary_apply_payload(self, payload):
-        """Apply one passive binary request and return a sanitized result."""
-        request = wire_protocol.parse_binary_apply(
-            self._protocol_selection,
-            payload,
+        result_builder = getattr(wire_protocol, route.result_builder_name)
+        result = result_builder(
+            selection,
+            request.request_id,
+            status,
+            target_id,
+            source,
         )
-
-        try:
-            self._require_inventory_write_gate(
-                wire_protocol.FEATURE_HA_EXPORT_BINARY_V1
-            )
-            target_id = self._apply_binary_action(request.action)
-        except Exception:
-            result = wire_protocol.build_binary_apply_result(
-                self._protocol_selection,
-                request.request_id,
-                wire_protocol.ApplyResultStatus.REJECTED,
-                None,
-                None,
-            )
-        else:
-            result = wire_protocol.build_binary_apply_result(
-                self._protocol_selection,
-                request.request_id,
-                wire_protocol.ApplyResultStatus.CONFIRMED,
-                target_id,
-                request.action.capability.source,
-            )
         self._send_signed(result)
 
     def _inventory_is_selected(self):

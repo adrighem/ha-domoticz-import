@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.instance_id import async_get as async_get_instance_id
@@ -208,6 +208,108 @@ class DomoticzBinarySessionTargetAdapter(DomoticzSessionTargetAdapter):
         return parse_binary_apply_result(self._session.selection, payload)
 
 
+class _ExportStorageFactory(Protocol):
+    """Construct destination-scoped storage through a stable keyword API."""
+
+    def __call__(
+        self,
+        hass: HomeAssistant,
+        *,
+        entry_id: str,
+        destination_id: str,
+    ) -> CatalogStorage:
+        """Build storage for one configured destination."""
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class _ExportKindStrategy:
+    """Bind one negotiated export kind to its transport and storage adapters."""
+
+    kind: CapabilityKind
+    feature: str
+    adapter_factory: Callable[[BridgeApplicationSession], DomoticzSessionTargetAdapter]
+    storage_factory: _ExportStorageFactory
+
+
+def _numeric_adapter_factory(
+    session: BridgeApplicationSession,
+) -> DomoticzSessionTargetAdapter:
+    """Build the numeric adapter using the current module implementation."""
+    return DomoticzSessionTargetAdapter(session)
+
+
+def _binary_adapter_factory(
+    session: BridgeApplicationSession,
+) -> DomoticzSessionTargetAdapter:
+    """Build the binary adapter using the current module implementation."""
+    return DomoticzBinarySessionTargetAdapter(session)
+
+
+def _numeric_storage_factory(
+    hass: HomeAssistant,
+    *,
+    entry_id: str,
+    destination_id: str,
+) -> CatalogStorage:
+    """Build numeric storage using the current module implementation."""
+    return HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry_id,
+        destination_id=destination_id,
+    )
+
+
+def _binary_storage_factory(
+    hass: HomeAssistant,
+    *,
+    entry_id: str,
+    destination_id: str,
+) -> CatalogStorage:
+    """Build binary storage using the current module implementation."""
+    return HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry_id,
+        destination_id=destination_id,
+    )
+
+
+_NUMERIC_EXPORT_STRATEGY = _ExportKindStrategy(
+    CapabilityKind.NUMERIC,
+    FEATURE_HA_EXPORT_NUMERIC_V1,
+    _numeric_adapter_factory,
+    _numeric_storage_factory,
+)
+_BINARY_EXPORT_STRATEGY = _ExportKindStrategy(
+    CapabilityKind.BINARY,
+    FEATURE_HA_EXPORT_BINARY_V1,
+    _binary_adapter_factory,
+    _binary_storage_factory,
+)
+
+# Execution remains numeric-first for wire compatibility. Catalog preflight remains
+# binary-first so its construction and load ordering are unchanged.
+_EXPORT_EXECUTION_STRATEGIES = (
+    _NUMERIC_EXPORT_STRATEGY,
+    _BINARY_EXPORT_STRATEGY,
+)
+_ALL_CATALOG_STRATEGIES = (
+    _BINARY_EXPORT_STRATEGY,
+    _NUMERIC_EXPORT_STRATEGY,
+)
+
+
+def _negotiated_export_strategies(
+    session: BridgeApplicationSession,
+) -> tuple[_ExportKindStrategy, ...]:
+    """Return negotiated export strategies in stable execution order."""
+    return tuple(
+        strategy
+        for strategy in _EXPORT_EXECUTION_STRATEGIES
+        if session.supports(strategy.feature)
+    )
+
+
 class HomeAssistantExportApplication:
     """Reconcile negotiated labelled entities when a bridge session connects."""
 
@@ -221,15 +323,12 @@ class HomeAssistantExportApplication:
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
         """Run one fail-closed reconciliation for each negotiated capability kind."""
-        numeric_enabled = session.supports(FEATURE_HA_EXPORT_NUMERIC_V1)
-        binary_enabled = session.supports(FEATURE_HA_EXPORT_BINARY_V1)
+        strategies = _negotiated_export_strategies(session)
         inventory_enabled = session.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
         continuous_enabled = session.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
-        if continuous_enabled and (
-            not inventory_enabled or not (numeric_enabled or binary_enabled)
-        ):
+        if continuous_enabled and (not inventory_enabled or not strategies):
             raise ProtocolError("continuous export is unavailable")
-        if not numeric_enabled and not binary_enabled:
+        if not strategies:
             return
 
         key = (session.entry_id, session.destination_id)
@@ -240,8 +339,7 @@ class HomeAssistantExportApplication:
         async with lock:
             await self._async_connected_locked(
                 session,
-                numeric_enabled=numeric_enabled,
-                binary_enabled=binary_enabled,
+                strategies=strategies,
                 inventory_enabled=inventory_enabled,
                 continuous_enabled=continuous_enabled,
             )
@@ -250,8 +348,7 @@ class HomeAssistantExportApplication:
         self,
         session: BridgeApplicationSession,
         *,
-        numeric_enabled: bool,
-        binary_enabled: bool,
+        strategies: tuple[_ExportKindStrategy, ...],
         inventory_enabled: bool,
         continuous_enabled: bool,
     ) -> None:
@@ -270,11 +367,7 @@ class HomeAssistantExportApplication:
         rejected_desired_records: dict[SourceIdentity, TargetRecord] = {}
         try:
             instance_id = await async_get_instance_id(self._hass)
-            included_kinds = set()
-            if numeric_enabled:
-                included_kinds.add(CapabilityKind.NUMERIC)
-            if binary_enabled:
-                included_kinds.add(CapabilityKind.BINARY)
+            included_kinds = frozenset(strategy.kind for strategy in strategies)
             if continuous_enabled:
                 dirty_signal = _ContinuousDirtySignal()
                 unsubscribe = async_subscribe_export_changes(
@@ -286,7 +379,7 @@ class HomeAssistantExportApplication:
                 self._hass,
                 instance_id=instance_id,
                 label_id=label_id,
-                included_kinds=frozenset(included_kinds),
+                included_kinds=included_kinds,
             )
             observations: tuple[TargetObservation, ...] | None = None
             staged_storages: dict[CapabilityKind, CatalogStorage] = {}
@@ -313,7 +406,7 @@ class HomeAssistantExportApplication:
                     collection.capabilities,
                     observations,
                     catalogs,
-                    frozenset(included_kinds),
+                    included_kinds,
                 )
                 reconciliation_capabilities = admission.capabilities
                 capacity_blocked_sources = set(admission.blocked_sources)
@@ -329,30 +422,18 @@ class HomeAssistantExportApplication:
             self._report_exclusions(session, collection.exclusions)
 
             reports: list[ExecutionReport] = []
-            if numeric_enabled:
+            for strategy in strategies:
                 report = await self._async_reconcile_kind(
                     session,
                     instance_id,
                     reconciliation_capabilities,
-                    kind=CapabilityKind.NUMERIC,
+                    strategy=strategy,
                     observations=observations,
-                    storage=staged_storages.get(CapabilityKind.NUMERIC),
+                    storage=staged_storages.get(strategy.kind),
                 )
                 self._ensure_persistence_confirmed(report)
                 reports.append(report)
-                catalogs[CapabilityKind.NUMERIC] = report.catalog
-            if binary_enabled:
-                report = await self._async_reconcile_kind(
-                    session,
-                    instance_id,
-                    reconciliation_capabilities,
-                    kind=CapabilityKind.BINARY,
-                    observations=observations,
-                    storage=staged_storages.get(CapabilityKind.BINARY),
-                )
-                self._ensure_persistence_confirmed(report)
-                reports.append(report)
-                catalogs[CapabilityKind.BINARY] = report.catalog
+                catalogs[strategy.kind] = report.catalog
 
             _update_rejected_desired_records(rejected_desired_records, reports)
             self._log_reports(reports)
@@ -371,9 +452,8 @@ class HomeAssistantExportApplication:
                     session,
                     instance_id=instance_id,
                     label_id=label_id,
-                    included_kinds=frozenset(included_kinds),
-                    numeric_enabled=numeric_enabled,
-                    binary_enabled=binary_enabled,
+                    strategies=strategies,
+                    included_kinds=included_kinds,
                     dirty_signal=dirty_signal,
                     blocked_sources=blocked_sources,
                     capacity_blocked_sources=capacity_blocked_sources,
@@ -424,9 +504,8 @@ class HomeAssistantExportApplication:
         *,
         instance_id: str,
         label_id: str,
+        strategies: tuple[_ExportKindStrategy, ...],
         included_kinds: frozenset[CapabilityKind],
-        numeric_enabled: bool,
-        binary_enabled: bool,
         dirty_signal: _ContinuousDirtySignal,
         blocked_sources: set[SourceIdentity],
         capacity_blocked_sources: set[SourceIdentity],
@@ -445,9 +524,8 @@ class HomeAssistantExportApplication:
                 session,
                 instance_id=instance_id,
                 label_id=label_id,
+                strategies=strategies,
                 included_kinds=included_kinds,
-                numeric_enabled=numeric_enabled,
-                binary_enabled=binary_enabled,
                 blocked_sources=blocked_sources,
                 capacity_blocked_sources=capacity_blocked_sources,
                 active_capacity_blocked_durable_sources=(
@@ -467,9 +545,8 @@ class HomeAssistantExportApplication:
         *,
         instance_id: str,
         label_id: str,
+        strategies: tuple[_ExportKindStrategy, ...],
         included_kinds: frozenset[CapabilityKind],
-        numeric_enabled: bool,
-        binary_enabled: bool,
         blocked_sources: set[SourceIdentity],
         capacity_blocked_sources: set[SourceIdentity],
         active_capacity_blocked_durable_sources: set[SourceIdentity],
@@ -506,27 +583,14 @@ class HomeAssistantExportApplication:
             raise ConnectionError("fresh inventory is required")
 
         reports: list[ExecutionReport] = []
-        if numeric_enabled:
+        for strategy in strategies:
             report = await self._async_reconcile_live_kind(
                 session,
                 instance_id,
                 collection.capabilities,
-                kind=CapabilityKind.NUMERIC,
-                catalog=catalogs[CapabilityKind.NUMERIC],
-                storage=staged_storages[CapabilityKind.NUMERIC],
-                capacity_blocked_sources=capacity_blocked_sources,
-                rejected_desired_records=rejected_desired_records,
-            )
-            self._ensure_persistence_confirmed(report)
-            reports.append(report)
-        if binary_enabled:
-            report = await self._async_reconcile_live_kind(
-                session,
-                instance_id,
-                collection.capabilities,
-                kind=CapabilityKind.BINARY,
-                catalog=catalogs[CapabilityKind.BINARY],
-                storage=staged_storages[CapabilityKind.BINARY],
+                strategy=strategy,
+                catalog=catalogs[strategy.kind],
+                storage=staged_storages[strategy.kind],
                 capacity_blocked_sources=capacity_blocked_sources,
                 rejected_desired_records=rejected_desired_records,
             )
@@ -550,23 +614,20 @@ class HomeAssistantExportApplication:
         instance_id: str,
         capabilities: tuple[Capability, ...],
         *,
-        kind: CapabilityKind,
+        strategy: _ExportKindStrategy,
         observations: tuple[TargetObservation, ...] | None = None,
         storage: CatalogStorage | None = None,
     ) -> ExecutionReport:
         """Reconcile one negotiated kind in its independent target catalog."""
-        if kind is CapabilityKind.NUMERIC:
-            adapter = DomoticzSessionTargetAdapter(session)
-        elif kind is CapabilityKind.BINARY:
-            adapter = DomoticzBinarySessionTargetAdapter(session)
-        else:
-            raise ValueError("unsupported export capability kind")
+        adapter = strategy.adapter_factory(session)
         if storage is None:
-            storage = self._storage_for_kind(session, kind)
+            storage = self._storage_for_strategy(session, strategy)
         executor = ReconciliationExecutor(adapter, storage)
         scope = SourceScope(_SOURCE_SYSTEM, instance_id)
         current = tuple(
-            capability for capability in capabilities if capability.kind is kind
+            capability
+            for capability in capabilities
+            if capability.kind is strategy.kind
         )
         if observations is None:
             return await executor.async_reconcile(scope, current)
@@ -578,23 +639,20 @@ class HomeAssistantExportApplication:
         instance_id: str,
         capabilities: tuple[Capability, ...],
         *,
-        kind: CapabilityKind,
+        strategy: _ExportKindStrategy,
         catalog: TargetCatalog,
         storage: CatalogStorage,
         capacity_blocked_sources: set[SourceIdentity],
         rejected_desired_records: dict[SourceIdentity, TargetRecord],
     ) -> ExecutionReport:
         """Apply only changed records that this session's catalogs already own."""
-        if kind is CapabilityKind.NUMERIC:
-            adapter = DomoticzSessionTargetAdapter(session)
-        elif kind is CapabilityKind.BINARY:
-            adapter = DomoticzBinarySessionTargetAdapter(session)
-        else:
-            raise ValueError("unsupported export capability kind")
+        adapter = strategy.adapter_factory(session)
 
         scope = SourceScope(_SOURCE_SYSTEM, instance_id)
         current = tuple(
-            capability for capability in capabilities if capability.kind is kind
+            capability
+            for capability in capabilities
+            if capability.kind is strategy.kind
         )
         planned = plan_reconciliation(scope, current, catalog.records)
         actions = tuple(
@@ -605,7 +663,7 @@ class HomeAssistantExportApplication:
             and not _action_matches_catalog(action, catalog)
         )
         actions = _suppress_unchanged_rejections(
-            kind,
+            strategy.kind,
             actions,
             rejected_desired_records,
         )
@@ -627,9 +685,9 @@ class HomeAssistantExportApplication:
         dict[CapabilityKind, TargetCatalog],
     ]:
         """Load and jointly validate all catalogs before the first target write."""
-        ordered_kinds = (CapabilityKind.BINARY, CapabilityKind.NUMERIC)
         storages = tuple(
-            self._storage_for_kind(session, kind) for kind in ordered_kinds
+            self._storage_for_strategy(session, strategy)
+            for strategy in _ALL_CATALOG_STRATEGIES
         )
         documents = await asyncio.gather(
             *(storage.async_load() for storage in storages)
@@ -644,30 +702,31 @@ class HomeAssistantExportApplication:
         )
         return (
             {
-                kind: _PreloadedCatalogStorage(storage, document)
-                for kind, storage, document in zip(
-                    ordered_kinds,
+                strategy.kind: _PreloadedCatalogStorage(storage, document)
+                for strategy, storage, document in zip(
+                    _ALL_CATALOG_STRATEGIES,
                     storages,
                     documents,
                     strict=True,
                 )
             },
-            dict(zip(ordered_kinds, catalogs, strict=True)),
+            {
+                strategy.kind: catalog
+                for strategy, catalog in zip(
+                    _ALL_CATALOG_STRATEGIES,
+                    catalogs,
+                    strict=True,
+                )
+            },
         )
 
-    def _storage_for_kind(
+    def _storage_for_strategy(
         self,
         session: BridgeApplicationSession,
-        kind: CapabilityKind,
+        strategy: _ExportKindStrategy,
     ) -> CatalogStorage:
         """Build one destination-scoped catalog adapter for a capability kind."""
-        if kind is CapabilityKind.NUMERIC:
-            storage_type = HomeAssistantCatalogStorage
-        elif kind is CapabilityKind.BINARY:
-            storage_type = HomeAssistantBinaryCatalogStorage
-        else:
-            raise ValueError("unsupported export capability kind")
-        return storage_type(
+        return strategy.storage_factory(
             self._hass,
             entry_id=session.entry_id,
             destination_id=session.destination_id,

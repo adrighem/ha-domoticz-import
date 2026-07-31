@@ -208,6 +208,30 @@ class InventoryResultStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class _ExportCodec:
+    """One feature-gated application message family for a capability kind."""
+
+    feature: str
+    capability_kind: CapabilityKind
+    request_type: str
+    result_type: str
+
+
+_NUMERIC_EXPORT_CODEC = _ExportCodec(
+    feature=FEATURE_HA_EXPORT_NUMERIC_V1,
+    capability_kind=CapabilityKind.NUMERIC,
+    request_type="apply",
+    result_type="apply_result",
+)
+_BINARY_EXPORT_CODEC = _ExportCodec(
+    feature=FEATURE_HA_EXPORT_BINARY_V1,
+    capability_kind=CapabilityKind.BINARY,
+    request_type="binary_apply",
+    result_type="binary_apply_result",
+)
+
+
+@dataclass(frozen=True)
 class ClientHello:
     """The identity and fresh nonce supplied by the Domoticz client."""
 
@@ -1361,18 +1385,7 @@ def build_apply(
     action: ReconciliationAction,
 ) -> Dict[str, object]:
     """Build one strict Home Assistant-to-Domoticz application request."""
-    _require_numeric_export_selection(selection)
-    request = ApplyRequest(request_id=request_id, action=action)
-    if request.action.capability.kind is not CapabilityKind.NUMERIC:
-        raise ProtocolFormatError("invalid protocol message")
-    return _normalize_payload(
-        {
-            "schema": 1,
-            "type": "apply",
-            "request_id": request.request_id,
-            "action": _action_to_dict(request.action),
-        }
-    )
+    return _build_export_apply(selection, request_id, action, _NUMERIC_EXPORT_CODEC)
 
 
 def parse_apply(
@@ -1380,22 +1393,7 @@ def parse_apply(
     document: object,
 ) -> ApplyRequest:
     """Parse one exact application request into the neutral action model."""
-    _require_numeric_export_selection(selection)
-    try:
-        data = _require_application_message(
-            _normalize_payload(document),
-            _APPLY_KEYS,
-            "apply",
-        )
-        request = ApplyRequest(
-            request_id=_require_string(data["request_id"]),
-            action=_action_from_dict(data["action"]),
-        )
-        if request.action.capability.kind is not CapabilityKind.NUMERIC:
-            raise ProtocolFormatError("invalid protocol message")
-        return request
-    except (KeyError, TypeError, ValueError, OverflowError):
-        raise ProtocolFormatError("invalid protocol message") from None
+    return _parse_export_apply(selection, document, _NUMERIC_EXPORT_CODEC)
 
 
 def build_apply_result(
@@ -1406,24 +1404,13 @@ def build_apply_result(
     source: Optional[SourceIdentity],
 ) -> Dict[str, object]:
     """Build one strict Domoticz-to-Home Assistant action result."""
-    _require_numeric_export_selection(selection)
-    result = ApplyResult(
-        request_id=request_id,
-        status=status,
-        target_id=target_id,
-        source=source,
-    )
-    return _normalize_payload(
-        {
-            "schema": 1,
-            "type": "apply_result",
-            "request_id": result.request_id,
-            "status": result.status.value,
-            "target_id": result.target_id,
-            "source": (
-                _source_to_dict(result.source) if result.source is not None else None
-            ),
-        }
+    return _build_export_apply_result(
+        selection,
+        request_id,
+        status,
+        target_id,
+        source,
+        _NUMERIC_EXPORT_CODEC,
     )
 
 
@@ -1432,24 +1419,7 @@ def parse_apply_result(
     document: object,
 ) -> ApplyResult:
     """Parse one exact action result without accepting remote error details."""
-    _require_numeric_export_selection(selection)
-    try:
-        data = _require_application_message(
-            _normalize_payload(document),
-            _APPLY_RESULT_KEYS,
-            "apply_result",
-        )
-        source_data = data["source"]
-        return ApplyResult(
-            request_id=_require_string(data["request_id"]),
-            status=ApplyResultStatus(data["status"]),
-            target_id=data["target_id"],
-            source=(
-                _source_from_dict(source_data) if source_data is not None else None
-            ),
-        )
-    except (KeyError, TypeError, ValueError, OverflowError):
-        raise ProtocolFormatError("invalid protocol message") from None
+    return _parse_export_apply_result(selection, document, _NUMERIC_EXPORT_CODEC)
 
 
 def build_binary_apply(
@@ -1458,18 +1428,7 @@ def build_binary_apply(
     action: ReconciliationAction,
 ) -> Dict[str, object]:
     """Build one strict binary Home Assistant-to-Domoticz request."""
-    _require_binary_export_selection(selection)
-    request = ApplyRequest(request_id=request_id, action=action)
-    if request.action.capability.kind is not CapabilityKind.BINARY:
-        raise ProtocolFormatError("invalid protocol message")
-    return _normalize_payload(
-        {
-            "schema": 1,
-            "type": "binary_apply",
-            "request_id": request.request_id,
-            "action": _action_to_dict(request.action),
-        }
-    )
+    return _build_export_apply(selection, request_id, action, _BINARY_EXPORT_CODEC)
 
 
 def parse_binary_apply(
@@ -1477,22 +1436,7 @@ def parse_binary_apply(
     document: object,
 ) -> ApplyRequest:
     """Parse one exact binary request into the neutral action model."""
-    _require_binary_export_selection(selection)
-    try:
-        data = _require_application_message(
-            _normalize_payload(document),
-            _APPLY_KEYS,
-            "binary_apply",
-        )
-        request = ApplyRequest(
-            request_id=_require_string(data["request_id"]),
-            action=_action_from_dict(data["action"]),
-        )
-        if request.action.capability.kind is not CapabilityKind.BINARY:
-            raise ProtocolFormatError("invalid protocol message")
-        return request
-    except (KeyError, TypeError, ValueError, OverflowError):
-        raise ProtocolFormatError("invalid protocol message") from None
+    return _parse_export_apply(selection, document, _BINARY_EXPORT_CODEC)
 
 
 def build_binary_apply_result(
@@ -1503,7 +1447,79 @@ def build_binary_apply_result(
     source: Optional[SourceIdentity],
 ) -> Dict[str, object]:
     """Build one strict binary Domoticz-to-Home Assistant action result."""
-    _require_binary_export_selection(selection)
+    return _build_export_apply_result(
+        selection,
+        request_id,
+        status,
+        target_id,
+        source,
+        _BINARY_EXPORT_CODEC,
+    )
+
+
+def parse_binary_apply_result(
+    selection: ProtocolSelection,
+    document: object,
+) -> ApplyResult:
+    """Parse one exact binary result without accepting remote error details."""
+    return _parse_export_apply_result(selection, document, _BINARY_EXPORT_CODEC)
+
+
+def _build_export_apply(
+    selection: ProtocolSelection,
+    request_id: str,
+    action: ReconciliationAction,
+    codec: _ExportCodec,
+) -> Dict[str, object]:
+    """Build one feature-gated export request with an exact discriminator."""
+    _require_export_selection(selection, codec.feature)
+    request = ApplyRequest(request_id=request_id, action=action)
+    if request.action.capability.kind is not codec.capability_kind:
+        raise ProtocolFormatError("invalid protocol message")
+    return _normalize_payload(
+        {
+            "schema": 1,
+            "type": codec.request_type,
+            "request_id": request.request_id,
+            "action": _action_to_dict(request.action),
+        }
+    )
+
+
+def _parse_export_apply(
+    selection: ProtocolSelection,
+    document: object,
+    codec: _ExportCodec,
+) -> ApplyRequest:
+    """Parse one feature-gated export request into the neutral action model."""
+    _require_export_selection(selection, codec.feature)
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _APPLY_KEYS,
+            codec.request_type,
+        )
+        request = ApplyRequest(
+            request_id=_require_string(data["request_id"]),
+            action=_action_from_dict(data["action"]),
+        )
+        if request.action.capability.kind is not codec.capability_kind:
+            raise ProtocolFormatError("invalid protocol message")
+        return request
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def _build_export_apply_result(
+    selection: ProtocolSelection,
+    request_id: str,
+    status: ApplyResultStatus,
+    target_id: Optional[str],
+    source: Optional[SourceIdentity],
+    codec: _ExportCodec,
+) -> Dict[str, object]:
+    """Build one feature-gated export result without remote error details."""
+    _require_export_selection(selection, codec.feature)
     result = ApplyResult(
         request_id=request_id,
         status=status,
@@ -1513,7 +1529,7 @@ def build_binary_apply_result(
     return _normalize_payload(
         {
             "schema": 1,
-            "type": "binary_apply_result",
+            "type": codec.result_type,
             "request_id": result.request_id,
             "status": result.status.value,
             "target_id": result.target_id,
@@ -1524,17 +1540,18 @@ def build_binary_apply_result(
     )
 
 
-def parse_binary_apply_result(
+def _parse_export_apply_result(
     selection: ProtocolSelection,
     document: object,
+    codec: _ExportCodec,
 ) -> ApplyResult:
-    """Parse one exact binary result without accepting remote error details."""
-    _require_binary_export_selection(selection)
+    """Parse one feature-gated export result without accepting error details."""
+    _require_export_selection(selection, codec.feature)
     try:
         data = _require_application_message(
             _normalize_payload(document),
             _APPLY_RESULT_KEYS,
-            "binary_apply_result",
+            codec.result_type,
         )
         source_data = data["source"]
         return ApplyResult(
@@ -1768,22 +1785,13 @@ def _require_v2_selection(selection: object) -> ProtocolSelection:
     return selection
 
 
-def _require_numeric_export_selection(
+def _require_export_selection(
     selection: object,
+    feature: str,
 ) -> ProtocolSelection:
-    """Require the negotiated Home Assistant numeric export behavior."""
+    """Require one negotiated Home Assistant export behavior."""
     validated = _require_v2_selection(selection)
-    if not validated.supports(FEATURE_HA_EXPORT_NUMERIC_V1):
-        raise ProtocolCompatibilityError("incompatible protocol")
-    return validated
-
-
-def _require_binary_export_selection(
-    selection: object,
-) -> ProtocolSelection:
-    """Require the negotiated Home Assistant binary export behavior."""
-    validated = _require_v2_selection(selection)
-    if not validated.supports(FEATURE_HA_EXPORT_BINARY_V1):
+    if not validated.supports(feature):
         raise ProtocolCompatibilityError("incompatible protocol")
     return validated
 
