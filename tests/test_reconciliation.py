@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -148,6 +149,40 @@ def test_unchanged_capability_needs_no_action() -> None:
         )
         == ()
     )
+
+
+def test_pending_unchanged_capability_is_retried_without_inventory() -> None:
+    """A durable pending intent recovers when the peer lacks inventory support."""
+    capability = _numeric("pending")
+
+    assert _plan(
+        [capability],
+        [TargetRecord("opaque-target", capability, pending=True)],
+    ) == (
+        ReconciliationAction(
+            kind=ReconciliationActionKind.UPDATE,
+            target_id="opaque-target",
+            capability=capability,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "availability", (Availability.UNKNOWN, Availability.UNAVAILABLE)
+)
+def test_pending_non_available_capability_is_retried_without_inventory(
+    availability: Availability,
+) -> None:
+    """Legacy recovery keeps the explicit non-available action kind."""
+    capability = _numeric("pending", None, availability)
+
+    actions = _plan(
+        [capability],
+        [TargetRecord("opaque-target", capability, pending=True)],
+    )
+
+    assert actions[0].kind is ReconciliationActionKind.MARK_UNAVAILABLE
+    assert not actions[0].stale
 
 
 @pytest.mark.parametrize(
@@ -596,6 +631,21 @@ def test_stale_requires_bool(stale: object) -> None:
         TargetRecord("target-1", _numeric("entity"), stale=stale)
 
 
+@pytest.mark.parametrize("pending", (None, "yes", 1))
+def test_pending_requires_bool(pending: object) -> None:
+    """Persistence cannot accidentally deserialize truthy pending flags."""
+    with pytest.raises(TypeError, match="pending must be a bool"):
+        TargetRecord("target-1", _numeric("entity"), pending=pending)
+
+
+def test_pending_target_record_cannot_also_be_stale() -> None:
+    """An unfinished write and a confirmed missing source are distinct states."""
+    capability = _numeric("entity", None, Availability.UNAVAILABLE)
+
+    with pytest.raises(ValueError, match="pending records must not be stale"):
+        TargetRecord("target-1", capability, stale=True, pending=True)
+
+
 def test_reconciliation_records_are_immutable() -> None:
     """Plans remain stable while an adapter applies them."""
     action = ReconciliationAction(
@@ -623,6 +673,90 @@ def test_inventory_reasserts_an_unchanged_owned_target() -> None:
             capability=capability,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("availability", "expected_kind"),
+    (
+        (Availability.AVAILABLE, ReconciliationActionKind.UPDATE),
+        (Availability.UNKNOWN, ReconciliationActionKind.MARK_UNAVAILABLE),
+        (Availability.UNAVAILABLE, ReconciliationActionKind.MARK_UNAVAILABLE),
+    ),
+)
+@pytest.mark.parametrize("observed_units", (None, (), (1,)))
+def test_inventory_retries_current_pending_target(
+    availability: Availability,
+    expected_kind: ReconciliationActionKind,
+    observed_units: tuple[int, ...] | None,
+) -> None:
+    """Durable intent repairs a missing, empty, or exact Unit 1 owned target."""
+    value = 21.5 if availability is Availability.AVAILABLE else None
+    capability = _numeric("pending", value, availability)
+    target_id = derive_domoticz_target_id(capability.source)
+    observations = (
+        [] if observed_units is None else [TargetObservation(target_id, observed_units)]
+    )
+
+    actions = _plan(
+        [capability],
+        [TargetRecord(target_id, capability, pending=True)],
+        observations,
+    )
+
+    assert actions == (
+        ReconciliationAction(
+            kind=expected_kind,
+            target_id=target_id,
+            capability=capability,
+        ),
+    )
+
+
+def test_inventory_blocks_pending_retry_when_owned_parent_has_sibling_units() -> None:
+    """Durable intent does not override ambiguous remote Unit ownership."""
+    capability = _numeric("pending-compound")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    assert (
+        _plan(
+            [capability],
+            [TargetRecord(target_id, capability, pending=True)],
+            [TargetObservation(target_id, (1, 2))],
+        )
+        == ()
+    )
+
+
+def test_inventory_does_not_resurrect_absent_pending_source_without_unit_one() -> None:
+    """A superseded intent stays local when its source and remote Unit 1 are gone."""
+    capability = _numeric("pending-removed")
+    target_id = derive_domoticz_target_id(capability.source)
+    record = TargetRecord(target_id, capability, pending=True)
+
+    assert _plan([], [record], []) == ()
+    assert (
+        _plan(
+            [],
+            [record],
+            [TargetObservation(target_id, ())],
+        )
+        == ()
+    )
+
+
+def test_inventory_marks_absent_pending_source_stale_when_unit_one_exists() -> None:
+    """A completed remote write is retired if its source disappeared meanwhile."""
+    capability = _numeric("pending-removed")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    actions = _plan(
+        [],
+        [TargetRecord(target_id, capability, pending=True)],
+        [TargetObservation(target_id, (1,))],
+    )
+
+    assert actions[0].kind is ReconciliationActionKind.MARK_UNAVAILABLE
+    assert actions[0].stale
 
 
 @pytest.mark.parametrize(
@@ -658,16 +792,22 @@ def test_inventory_does_not_claim_a_remote_only_deterministic_target() -> None:
     capability = _numeric("remote-only")
     target_id = derive_domoticz_target_id(capability.source)
 
-    assert _plan(
-        [capability],
-        [],
-        [TargetObservation(target_id, (1,))],
-    ) == ()
-    assert _plan(
-        [capability],
-        [],
-        [TargetObservation(target_id, ())],
-    ) == ()
+    assert (
+        _plan(
+            [capability],
+            [],
+            [TargetObservation(target_id, (1,))],
+        )
+        == ()
+    )
+    assert (
+        _plan(
+            [capability],
+            [],
+            [TargetObservation(target_id, ())],
+        )
+        == ()
+    )
 
 
 def test_inventory_still_creates_when_no_remote_target_exists() -> None:
@@ -700,11 +840,14 @@ def test_inventory_blocks_ambiguous_units_without_mutation() -> None:
     capability = _numeric("compound")
     target_id = derive_domoticz_target_id(capability.source)
 
-    assert _plan(
-        [capability],
-        [TargetRecord(target_id, capability)],
-        [TargetObservation(target_id, (1, 2))],
-    ) == ()
+    assert (
+        _plan(
+            [capability],
+            [TargetRecord(target_id, capability)],
+            [TargetObservation(target_id, (1, 2))],
+        )
+        == ()
+    )
 
 
 def test_inventory_repairs_a_current_binding_in_an_empty_parent() -> None:
@@ -726,17 +869,23 @@ def test_inventory_does_not_resurrect_a_missing_stale_target() -> None:
     capability = _numeric("stale", None, Availability.UNAVAILABLE)
     target_id = derive_domoticz_target_id(capability.source)
 
-    assert _plan(
-        [],
-        [TargetRecord(target_id, capability, stale=True)],
-        [],
-    ) == ()
+    assert (
+        _plan(
+            [],
+            [TargetRecord(target_id, capability, stale=True)],
+            [],
+        )
+        == ()
+    )
 
-    assert _plan(
-        [],
-        [TargetRecord(target_id, capability, stale=True)],
-        [TargetObservation(target_id, ())],
-    ) == ()
+    assert (
+        _plan(
+            [],
+            [TargetRecord(target_id, capability, stale=True)],
+            [TargetObservation(target_id, ())],
+        )
+        == ()
+    )
 
 
 def test_inventory_reasserts_a_present_stale_target() -> None:
@@ -814,23 +963,71 @@ def test_combined_ownership_reserves_a_source_for_its_catalog_kind() -> None:
         validate_deterministic_target_ownership([numeric], [binary_record])
 
 
-@pytest.mark.parametrize(
-    "object_id",
-    ("sensor." + "x" * (64 * 1024), "sensor.\ud800"),
-)
-def test_domoticz_target_id_rejects_noncanonical_source_identity(
-    object_id: str,
-) -> None:
-    """The shared helper retains the released canonical JSON safety bounds."""
-    source = SourceIdentity(
-        system="home_assistant",
-        instance_id="instance-1",
-        object_id=object_id,
-        capability_id="state",
+def _source_with_canonical_identity_size(size: int) -> SourceIdentity:
+    values = {
+        "system": "home_assistant",
+        "instance_id": "instance-1",
+        "object_id": "",
+        "capability_id": "state",
+    }
+    fixed_size = len(
+        json.dumps(
+            values,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    )
+    values["object_id"] = "x" * (size - fixed_size)
+    return SourceIdentity(**values)
+
+
+def test_domoticz_target_id_accepts_exactly_64_kib_canonical_identity() -> None:
+    """The released protocol limit is inclusive at exactly 64 KiB."""
+    target_id = derive_domoticz_target_id(
+        _source_with_canonical_identity_size(64 * 1024)
     )
 
-    with pytest.raises(ValueError, match="source identity"):
+    assert target_id.startswith("HA")
+    assert len(target_id) == 25
+
+
+def test_domoticz_target_id_rejects_identity_over_64_kib_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized provenance fails before consuming hashing resources."""
+    source = _source_with_canonical_identity_size(64 * 1024 + 1)
+
+    def unexpected_hash(_identity: bytes) -> object:
+        raise AssertionError("oversized identity reached hashing")
+
+    monkeypatch.setattr(reconciliation_module.hashlib, "sha256", unexpected_hash)
+
+    with pytest.raises(ValueError, match="canonical size limit"):
         derive_domoticz_target_id(source)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("system", "instance_id", "object_id", "capability_id"),
+)
+@pytest.mark.parametrize("surrogate", ("\ud800", "\udfff"))
+def test_domoticz_target_id_rejects_lone_surrogate_in_every_source_component(
+    field_name: str,
+    surrogate: str,
+) -> None:
+    """Invalid Unicode cannot produce a platform-dependent DeviceID."""
+    values = {
+        "system": "home_assistant",
+        "instance_id": "instance-1",
+        "object_id": "sensor.temperature",
+        "capability_id": "state",
+    }
+    values[field_name] += surrogate
+
+    with pytest.raises(ValueError, match="invalid Unicode"):
+        derive_domoticz_target_id(SourceIdentity(**values))
 
 
 def test_inventory_rejects_duplicate_target_observations() -> None:

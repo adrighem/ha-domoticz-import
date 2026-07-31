@@ -97,24 +97,13 @@ class _InventoryExchange:
     targets: tuple[InventoryTarget, ...]
 
 
-def _enable_inventory_negotiation(
-    monkeypatch: pytest.MonkeyPatch,
+def _assert_inventory_negotiation_enabled(
     plugin_module: ModuleType,
 ) -> None:
-    """Opt this test into the dormant Phase 5.2 inventory feature."""
-    features = tuple(
-        sorted(
-            {
-                *bridge_module.SUPPORTED_V2_FEATURES,
-                FEATURE_DOMOTICZ_INVENTORY_V1,
-            }
-        )
-    )
-    monkeypatch.setattr(bridge_module, "SUPPORTED_V2_FEATURES", features)
-    monkeypatch.setattr(
-        plugin_module.wire_protocol,
-        "SUPPORTED_V2_FEATURES",
-        features,
+    """Require both runtime peers to advertise the active inventory feature."""
+    assert FEATURE_DOMOTICZ_INVENTORY_V1 in (bridge_module.SUPPORTED_V2_FEATURES)
+    assert FEATURE_DOMOTICZ_INVENTORY_V1 in (
+        plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
     )
 
 
@@ -827,7 +816,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         link_id=link_id,
         pairing_key=pairing_key,
     )
-    _enable_inventory_negotiation(monkeypatch, plugin_module)
+    _assert_inventory_negotiation_enabled(plugin_module)
 
     # Force a two-page snapshot so the test observes that no apply is sent
     # after page 1. Empty containers are valid hardware-scoped inventory and
@@ -1071,7 +1060,7 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         link_id=link_id,
         pairing_key=pairing_key,
     )
-    _enable_inventory_negotiation(monkeypatch, plugin_module)
+    _assert_inventory_negotiation_enabled(plugin_module)
 
     async def open_and_reconcile(
         expected_call: int,

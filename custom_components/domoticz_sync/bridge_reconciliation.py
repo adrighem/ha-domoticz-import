@@ -176,6 +176,7 @@ class HomeAssistantExportApplication:
     def __init__(self, hass: HomeAssistant) -> None:
         """Store the Home Assistant instance used for source collection."""
         self._hass = hass
+        self._destination_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._reported_exclusions: dict[
             tuple[str, str], frozenset[ExportExclusion]
         ] = {}
@@ -186,6 +187,27 @@ class HomeAssistantExportApplication:
         binary_enabled = session.supports(FEATURE_HA_EXPORT_BINARY_V1)
         if not numeric_enabled and not binary_enabled:
             return
+
+        key = (session.entry_id, session.destination_id)
+        lock = self._destination_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._destination_locks[key] = lock
+        async with lock:
+            await self._async_connected_locked(
+                session,
+                numeric_enabled=numeric_enabled,
+                binary_enabled=binary_enabled,
+            )
+
+    async def _async_connected_locked(
+        self,
+        session: BridgeApplicationSession,
+        *,
+        numeric_enabled: bool,
+        binary_enabled: bool,
+    ) -> None:
+        """Run one complete destination transaction under its application lock."""
 
         entry = self._hass.config_entries.async_get_entry(session.entry_id)
         if entry is None:
@@ -327,9 +349,7 @@ class HomeAssistantExportApplication:
             *(storage.async_load() for storage in storages)
         )
         catalogs = tuple(
-            TargetCatalog()
-            if document is None
-            else catalog_from_document(document)
+            TargetCatalog() if document is None else catalog_from_document(document)
             for document in documents
         )
         validate_deterministic_target_ownership(
@@ -396,9 +416,7 @@ async def _async_fetch_inventory(
     previous_target_id: str | None = None
 
     async with asyncio.timeout(INVENTORY_TIMEOUT):
-        await session.async_send(
-            build_inventory_request(session.selection, request_id)
-        )
+        await session.async_send(build_inventory_request(session.selection, request_id))
         while True:
             payload = await session.async_receive()
             if isinstance(payload, dict) and payload.get("type") == "ping":

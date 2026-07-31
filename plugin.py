@@ -544,6 +544,7 @@ class DomoticzSyncPlugin:
         self._pending_ping_id = None
         self._pending_ping_tick = 0
         self._inventory_requested = False
+        self._inventory_confirmed = False
         self._reconnect_delay = 1
         self._reconnect_remaining = 0
 
@@ -991,6 +992,7 @@ class DomoticzSyncPlugin:
         if self._inventory_requested:
             raise wire_protocol.ProtocolFormatError
         self._inventory_requested = True
+        inventory_confirmed = False
 
         try:
             targets = self._collect_inventory_targets()
@@ -998,6 +1000,7 @@ class DomoticzSyncPlugin:
                 request_id,
                 targets,
             )
+            inventory_confirmed = True
         except Exception:
             rejected = wire_protocol.InventoryResult(
                 request_id=request_id,
@@ -1015,6 +1018,8 @@ class DomoticzSyncPlugin:
 
         for result_payload in result_payloads:
             self._send_signed(result_payload)
+        if inventory_confirmed:
+            self._inventory_confirmed = True
 
     @classmethod
     def _collect_inventory_targets(cls):
@@ -1187,6 +1192,7 @@ class DomoticzSyncPlugin:
         request = wire_protocol.parse_apply(self._protocol_selection, payload)
 
         try:
+            self._require_inventory_write_gate()
             target_id = self._apply_action(request.action)
         except Exception:
             result = wire_protocol.build_apply_result(
@@ -1214,6 +1220,7 @@ class DomoticzSyncPlugin:
         )
 
         try:
+            self._require_inventory_write_gate()
             target_id = self._apply_binary_action(request.action)
         except Exception:
             result = wire_protocol.build_binary_apply_result(
@@ -1232,6 +1239,20 @@ class DomoticzSyncPlugin:
                 request.action.capability.source,
             )
         self._send_signed(result)
+
+    def _inventory_is_selected(self):
+        """Return whether this session negotiated authoritative inventory."""
+        return (
+            self._protocol_selection is not None
+            and self._protocol_selection.supports(
+                wire_protocol.FEATURE_DOMOTICZ_INVENTORY_V1
+            )
+        )
+
+    def _require_inventory_write_gate(self):
+        """Block inventory-aware writes until every confirmed page was sent."""
+        if self._inventory_is_selected() and not self._inventory_confirmed:
+            raise DomoticzApplyError
 
     def _apply_action(self, action):
         """Idempotently converge and re-read one numeric Domoticz target."""
@@ -1252,6 +1273,9 @@ class DomoticzSyncPlugin:
 
     def _apply_profile_action(self, action, profile):
         """Idempotently converge one capability through an exact profile."""
+        if self._inventory_is_selected():
+            return self._apply_inventory_profile_action(action, profile)
+
         capability = action.capability
         action_kind = action.kind.value
         if action_kind not in {"create", "update", "mark_unavailable"}:
@@ -1319,6 +1343,288 @@ class DomoticzSyncPlugin:
         ):
             raise DomoticzApplyError
         return device_id
+
+    def _apply_inventory_profile_action(self, action, profile):
+        """Repair only a live target shape proven safe by inventory binding."""
+        capability = action.capability
+        action_kind = action.kind.value
+        if action_kind not in {"create", "update", "mark_unavailable"}:
+            raise DomoticzApplyError
+
+        device_id = _device_id_for_source(capability.source)
+        if action_kind != "create" and action.target_id != device_id:
+            raise DomoticzApplyError
+
+        available = capability.availability.value == "available"
+        desired_values = (
+            profile.encoder(capability.value, capability.unit) if available else None
+        )
+        desired_options = (
+            _custom_sensor_options(capability.unit) if profile.manages_options else None
+        )
+        device, unit_keys = self._read_inventory_target_shape(device_id)
+        created = False
+
+        if action_kind == "create":
+            if device is not None:
+                raise DomoticzApplyError
+            self._create_inventory_target(
+                device_id,
+                capability,
+                profile,
+                desired_options,
+                require_absent=True,
+            )
+            created = True
+        elif device is None or unit_keys == ():
+            if action.stale:
+                raise DomoticzApplyError
+            self._create_inventory_target(
+                device_id,
+                capability,
+                profile,
+                desired_options,
+                require_absent=False,
+            )
+            created = True
+        elif unit_keys != (_TARGET_UNIT,):
+            raise DomoticzApplyError
+        else:
+            self._require_inventory_target_unit(device_id, profile)
+
+        values_to_repair = desired_values
+        if not available:
+            values_to_repair = (0, "") if created else None
+        expected_options = self._converge_inventory_target(
+            device_id,
+            profile=profile,
+            name=capability.name,
+            desired_options=desired_options,
+            available=available,
+            values=values_to_repair,
+        )
+
+        _device, unit = self._require_inventory_target_unit(device_id, profile)
+        unit.Refresh()
+        confirmed_device, confirmed_unit = self._require_inventory_target_unit(
+            device_id,
+            profile,
+        )
+        if not self._inventory_target_matches(
+            confirmed_device,
+            confirmed_unit,
+            name=capability.name,
+            expected_options=expected_options,
+            available=available,
+            values=values_to_repair,
+        ):
+            raise DomoticzApplyError
+        return device_id
+
+    def _create_inventory_target(
+        self,
+        device_id,
+        capability,
+        profile,
+        desired_options,
+        *,
+        require_absent,
+    ):
+        """Create Unit 1 only while the complete live parent shape permits it."""
+        self._require_inventory_creation_shape(device_id, require_absent)
+        create_arguments = {
+            "Name": capability.name,
+            "DeviceID": device_id,
+            "Unit": _TARGET_UNIT,
+            "Type": profile.type_id,
+            "Subtype": profile.subtype,
+            "Switchtype": profile.switch_type,
+            "Used": 1,
+        }
+        if profile.manages_options:
+            create_arguments["Options"] = desired_options
+        creator = Domoticz.Unit(**create_arguments)
+        self._require_inventory_creation_shape(device_id, require_absent)
+        creator.Create()
+        self._require_inventory_target_unit(device_id, profile)
+
+    def _require_inventory_creation_shape(self, device_id, require_absent):
+        """Recheck absence or an exact empty bound parent before Create."""
+        device, unit_keys = self._read_inventory_target_shape(device_id)
+        if require_absent:
+            if device is not None:
+                raise DomoticzApplyError
+            return
+        if device is not None and unit_keys != ():
+            raise DomoticzApplyError
+
+    @staticmethod
+    def _read_inventory_target_shape(device_id):
+        """Read one complete, strict live parent shape from DomoticzEx."""
+        devices = globals().get("Devices")
+        if type(devices) is not dict:
+            raise DomoticzApplyError
+        if device_id not in devices:
+            return None, ()
+
+        device = devices[device_id]
+        if getattr(device, "DeviceID", None) != device_id:
+            raise DomoticzApplyError
+        units = getattr(device, "Units", None)
+        if type(units) is not dict:
+            raise DomoticzApplyError
+        unit_keys = tuple(units)
+        if any(
+            type(unit_number) is not int or not 1 <= unit_number <= 255
+            for unit_number in unit_keys
+        ):
+            raise DomoticzApplyError
+        return device, tuple(sorted(unit_keys))
+
+    @classmethod
+    def _require_inventory_target_unit(cls, device_id, profile):
+        """Require the only live unit to remain exact Unit 1 with its profile."""
+        device, unit_keys = cls._read_inventory_target_shape(device_id)
+        if device is None or unit_keys != (_TARGET_UNIT,):
+            raise DomoticzApplyError
+        unit = device.Units[_TARGET_UNIT]
+        if (
+            type(getattr(unit, "Unit", None)) is not int
+            or unit.Unit != _TARGET_UNIT
+            or not cls._is_strict_target_profile(unit, profile)
+        ):
+            raise DomoticzApplyError
+        return device, unit
+
+    @staticmethod
+    def _is_strict_target_profile(unit, profile):
+        """Require exact integers for immutable Domoticz profile fields."""
+        return all(
+            type(actual) is int and actual == expected
+            for actual, expected in (
+                (getattr(unit, "Type", None), profile.type_id),
+                (getattr(unit, "SubType", None), profile.subtype),
+                (getattr(unit, "SwitchType", None), profile.switch_type),
+            )
+        )
+
+    @staticmethod
+    def _validated_inventory_options(unit):
+        """Copy live options only when every key and value is a string."""
+        options = getattr(unit, "Options", None)
+        if type(options) is not dict or any(
+            type(key) is not str or type(value) is not str
+            for key, value in options.items()
+        ):
+            raise DomoticzApplyError
+        return dict(options)
+
+    @classmethod
+    def _converge_inventory_target(
+        cls,
+        device_id,
+        *,
+        profile,
+        name,
+        desired_options,
+        available,
+        values,
+    ):
+        """Repair mutable state with a complete live-shape check per write."""
+        device, unit = cls._require_inventory_target_unit(device_id, profile)
+        name_changed = getattr(unit, "Name", None) != name
+        used_changed = type(getattr(unit, "Used", None)) is not int or unit.Used != 1
+        options_changed = False
+        if profile.manages_options:
+            current_options = cls._validated_inventory_options(unit)
+            options_changed = current_options.get("Custom") != desired_options["Custom"]
+        values_changed = False
+        if values is not None:
+            n_value, s_value = values
+            values_changed = (
+                type(getattr(unit, "nValue", None)) is not type(n_value)
+                or unit.nValue != n_value
+                or type(getattr(unit, "sValue", None)) is not str
+                or unit.sValue != s_value
+            )
+
+        if name_changed:
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            current.Name = name
+        if used_changed:
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            current.Used = 1
+        if options_changed:
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            merged_options = cls._validated_inventory_options(current)
+            merged_options["Custom"] = desired_options["Custom"]
+            current.Options = merged_options
+        if values_changed:
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            current.nValue = n_value
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            current.sValue = s_value
+
+        if name_changed or used_changed or options_changed or values_changed:
+            _device, current = cls._require_inventory_target_unit(device_id, profile)
+            update = {"Log": False}
+            if name_changed or used_changed or options_changed:
+                update["UpdateProperties"] = True
+            if options_changed:
+                update["UpdateOptions"] = True
+            current.Update(**update)
+
+        device, unit = cls._require_inventory_target_unit(device_id, profile)
+        timed_out = 0 if available else 1
+        if (
+            type(getattr(device, "TimedOut", None)) is not int
+            or device.TimedOut != timed_out
+        ):
+            device, _unit = cls._require_inventory_target_unit(device_id, profile)
+            device.TimedOut = timed_out
+
+        _device, unit = cls._require_inventory_target_unit(device_id, profile)
+        if profile.manages_options:
+            return cls._validated_inventory_options(unit)
+        return None
+
+    @classmethod
+    def _inventory_target_matches(
+        cls,
+        device,
+        unit,
+        *,
+        name,
+        expected_options,
+        available,
+        values,
+    ):
+        """Confirm the exact mutable result after a fresh complete-shape read."""
+        timed_out = 0 if available else 1
+        if (
+            getattr(unit, "Name", None) != name
+            or type(getattr(unit, "Used", None)) is not int
+            or unit.Used != 1
+            or type(getattr(device, "TimedOut", None)) is not int
+            or device.TimedOut != timed_out
+        ):
+            return False
+        if expected_options is not None:
+            try:
+                actual_options = cls._validated_inventory_options(unit)
+            except DomoticzApplyError:
+                return False
+            if actual_options != expected_options:
+                return False
+        if values is None:
+            return True
+        n_value, s_value = values
+        return (
+            type(getattr(unit, "nValue", None)) is type(n_value)
+            and unit.nValue == n_value
+            and type(getattr(unit, "sValue", None)) is str
+            and unit.sValue == s_value
+        )
 
     @staticmethod
     def _get_device(device_id):
@@ -1614,6 +1920,7 @@ class DomoticzSyncPlugin:
         self._in_sequence = 0
         self._pending_ping_id = None
         self._inventory_requested = False
+        self._inventory_confirmed = False
         self._reset_fragments()
 
     def _reset_fragments(self):

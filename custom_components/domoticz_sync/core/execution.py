@@ -192,7 +192,7 @@ def _record_from_confirmation(
     action: ReconciliationAction,
     confirmation: ApplyConfirmation,
     *,
-    enforce_deterministic_create_target_ids: bool = False,
+    inventory_mode: bool = False,
 ) -> TargetRecord:
     """Build trusted catalog state from an action and a minimal confirmation."""
     if not isinstance(confirmation, ApplyConfirmation):
@@ -205,7 +205,7 @@ def _record_from_confirmation(
     ):
         raise ExecutionConflictError("adapter confirmed a different target ID")
     if (
-        enforce_deterministic_create_target_ids
+        inventory_mode
         and action.kind is ReconciliationActionKind.CREATE
         and confirmation.target_id
         != derive_domoticz_target_id(action.capability.source)
@@ -226,16 +226,19 @@ async def async_execute_reconciliation(
     adapter: TargetAdapter,
     storage: CatalogStorage,
     *,
-    enforce_deterministic_create_target_ids: bool = False,
+    inventory_mode: bool = False,
 ) -> ExecutionReport:
     """Apply a precomputed plan and commit each confirmed action atomically.
 
+    Inventory-aware creates first persist their deterministic ownership intent.
     Expected entity-specific failures are isolated. A catalog save failure
     stops the batch because it leaves persistence success uncertain.
     Callers must serialize the complete load-plan-execute cycle.
     """
     if not isinstance(catalog, TargetCatalog):
         raise TypeError("catalog must be a TargetCatalog")
+    if not isinstance(inventory_mode, bool):
+        raise TypeError("inventory_mode must be a bool")
     planned_actions = tuple(actions)
     _preflight_actions(catalog, planned_actions)
 
@@ -244,6 +247,22 @@ async def async_execute_reconciliation(
     persistence_uncertain = False
 
     for action in planned_actions:
+        if inventory_mode and action.kind is ReconciliationActionKind.CREATE:
+            try:
+                pending_catalog = committed.with_record(
+                    TargetRecord(
+                        target_id=derive_domoticz_target_id(action.capability.source),
+                        capability=action.capability,
+                        pending=True,
+                    )
+                )
+            except (CatalogFormatError, TypeError, ValueError) as error:
+                raise ExecutionConflictError(
+                    "pending ownership intent conflicts with the catalog"
+                ) from error
+            await storage.async_save(catalog_to_document(pending_catalog))
+            committed = pending_catalog
+
         try:
             confirmation = await adapter.async_apply(action)
         except TargetActionError:
@@ -258,9 +277,7 @@ async def async_execute_reconciliation(
         record = _record_from_confirmation(
             action,
             confirmation,
-            enforce_deterministic_create_target_ids=(
-                enforce_deterministic_create_target_ids
-            ),
+            inventory_mode=inventory_mode,
         )
         try:
             candidate = committed.with_record(record)
@@ -347,5 +364,5 @@ class ReconciliationExecutor:
                 actions,
                 self._adapter,
                 self._storage,
-                enforce_deterministic_create_target_ids=(observed_snapshot is not None),
+                inventory_mode=observed_snapshot is not None,
             )

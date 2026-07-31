@@ -114,6 +114,9 @@ class _FakeTargetAdapter:
         self.fail_globally = False
         self.confirm_wrong_source = False
         self.confirm_wrong_target = False
+        self.deterministic_create_ids = False
+        self.repair_missing_updates = False
+        self.cancel_after_mutation_sources: set[SourceIdentity] = set()
 
     async def async_apply(
         self,
@@ -137,13 +140,23 @@ class _FakeTargetAdapter:
             if matches:
                 target_id = matches[0].target_id
             else:
-                target_id = f"target-{self.remote.next_target_number}"
-                self.remote.next_target_number += 1
+                if self.deterministic_create_ids:
+                    target_id = derive_domoticz_target_id(source)
+                else:
+                    target_id = f"target-{self.remote.next_target_number}"
+                    self.remote.next_target_number += 1
         else:
             assert action.target_id is not None
             target_id = action.target_id
             existing = self.remote.targets.get(target_id)
-            if existing is None or existing.capability.source != source:
+            can_repair = (
+                self.repair_missing_updates
+                and action.kind is ReconciliationActionKind.UPDATE
+                and action.capability.availability is Availability.AVAILABLE
+            )
+            if existing is None and not can_repair:
+                raise TargetActionError("target mapping no longer exists")
+            if existing is not None and existing.capability.source != source:
                 raise TargetActionError("target mapping no longer exists")
 
         self.remote.targets[target_id] = _FakeTarget(
@@ -151,6 +164,8 @@ class _FakeTargetAdapter:
             action.capability,
             action.stale,
         )
+        if source in self.cancel_after_mutation_sources:
+            raise asyncio.CancelledError
         if source in self.mutate_then_fail_sources:
             raise TargetActionError("confirmation was lost after mutation")
 
@@ -176,6 +191,7 @@ class _FakeCatalogStorage:
         self.fail_load = False
         self.fail_before_save_calls: set[int] = set()
         self.fail_after_save_calls: set[int] = set()
+        self.cancel_before_save_calls: set[int] = set()
 
     async def async_load(self) -> Any:
         """Return an isolated copy of durable state."""
@@ -188,6 +204,8 @@ class _FakeCatalogStorage:
         """Atomically replace durable state or simulate uncertain failure."""
         self.save_calls += 1
         self.events.append(f"save:{self.save_calls}")
+        if self.save_calls in self.cancel_before_save_calls:
+            raise asyncio.CancelledError
         if self.save_calls in self.fail_before_save_calls:
             raise CatalogStorageError("save failed before replacement")
         self.document = deepcopy(document)
@@ -303,11 +321,285 @@ async def test_inventory_mode_never_adopts_a_remote_only_target() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inventory_create_saves_intent_before_remote_apply() -> None:
+    """A durable deterministic claim closes the create-before-save crash window."""
+    events: list[str] = []
+    remote = _FakeRemote(events)
+    storage = _FakeCatalogStorage(events=events)
+    adapter = _FakeTargetAdapter(remote)
+    adapter.deterministic_create_ids = True
+    capability = _numeric("sensor-a")
+
+    report = await ReconciliationExecutor(adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert events == ["save:1", "apply:sensor-a", "save:2"]
+    assert report.catalog.records[0].target_id == derive_domoticz_target_id(
+        capability.source
+    )
+    assert not report.catalog.records[0].pending
+    assert not storage.catalog().records[0].pending
+
+
+@pytest.mark.asyncio
+async def test_inventory_intent_save_failure_prevents_remote_apply() -> None:
+    """A failed ownership claim cannot be followed by a target mutation."""
+    events: list[str] = []
+    remote = _FakeRemote(events)
+    storage = _FakeCatalogStorage(events=events)
+    storage.fail_before_save_calls.add(1)
+    adapter = _FakeTargetAdapter(remote)
+    adapter.deterministic_create_ids = True
+
+    with pytest.raises(CatalogStorageError):
+        await ReconciliationExecutor(adapter, storage).async_reconcile(
+            _SCOPE,
+            [_numeric("sensor-a")],
+            observations=[],
+        )
+
+    assert events == ["save:1"]
+    assert adapter.calls == []
+    assert remote.targets == {}
+    assert storage.document is None
+
+
+@pytest.mark.asyncio
+async def test_inventory_intent_save_cancellation_prevents_remote_apply() -> None:
+    """Cancellation while claiming ownership cannot race a target mutation."""
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    storage.cancel_before_save_calls.add(1)
+    adapter = _FakeTargetAdapter(remote)
+    adapter.deterministic_create_ids = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await ReconciliationExecutor(adapter, storage).async_reconcile(
+            _SCOPE,
+            [_numeric("sensor-a")],
+            observations=[],
+        )
+
+    assert adapter.calls == []
+    assert remote.targets == {}
+    assert storage.document is None
+
+
+@pytest.mark.asyncio
+async def test_inventory_ambiguous_intent_save_recovers_without_create() -> None:
+    """A landed intent remains safe when its save acknowledgement is lost."""
+    capability = _numeric("sensor-a")
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    storage.fail_after_save_calls.add(1)
+    first_adapter = _FakeTargetAdapter(remote)
+    first_adapter.deterministic_create_ids = True
+
+    with pytest.raises(CatalogStorageError):
+        await ReconciliationExecutor(first_adapter, storage).async_reconcile(
+            _SCOPE,
+            [capability],
+            observations=[],
+        )
+
+    assert first_adapter.calls == []
+    assert storage.catalog().records[0].pending
+    assert remote.targets == {}
+
+    recovery_adapter = _FakeTargetAdapter(remote)
+    recovery_adapter.repair_missing_updates = True
+    recovered = await ReconciliationExecutor(
+        recovery_adapter,
+        storage,
+    ).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert recovered.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert not recovered.catalog.records[0].pending
+    assert set(remote.targets) == {derive_domoticz_target_id(capability.source)}
+
+
+@pytest.mark.asyncio
+async def test_inventory_apply_rejection_leaves_durable_intent() -> None:
+    """An entity rejection retains ownership evidence for a safe retry."""
+    capability = _numeric("sensor-a")
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    adapter = _FakeTargetAdapter(remote)
+    adapter.deterministic_create_ids = True
+    adapter.fail_sources.add(capability.source)
+
+    report = await ReconciliationExecutor(adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert report.results[0].status is ExecutionStatus.TARGET_NOT_CONFIRMED
+    assert report.catalog.records[0].pending
+    assert storage.catalog().records[0].pending
+    assert storage.save_calls == 1
+
+    recovery_adapter = _FakeTargetAdapter(remote)
+    recovery_adapter.repair_missing_updates = True
+    recovered = await ReconciliationExecutor(
+        recovery_adapter,
+        storage,
+    ).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert recovered.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert not recovered.catalog.records[0].pending
+    assert set(remote.targets) == {derive_domoticz_target_id(capability.source)}
+
+
+@pytest.mark.asyncio
+async def test_inventory_cancelled_create_recovers_from_durable_intent() -> None:
+    """Cancellation after mutation is repaired through the catalog-proven ID."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    first_adapter = _FakeTargetAdapter(remote)
+    first_adapter.deterministic_create_ids = True
+    first_adapter.cancel_after_mutation_sources.add(capability.source)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ReconciliationExecutor(first_adapter, storage).async_reconcile(
+            _SCOPE,
+            [capability],
+            observations=[],
+        )
+
+    assert storage.catalog().records[0].pending
+    assert set(remote.targets) == {target_id}
+
+    recovered = await ReconciliationExecutor(
+        _FakeTargetAdapter(remote),
+        storage,
+    ).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[TargetObservation(target_id, (1,))],
+    )
+
+    assert recovered.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert not recovered.catalog.records[0].pending
+    assert not storage.catalog().records[0].pending
+    assert len(remote.targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_inventory_lost_create_result_recovers_from_durable_intent() -> None:
+    """A mutated target with a lost result is finalized on reconnect."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    first_adapter = _FakeTargetAdapter(remote)
+    first_adapter.deterministic_create_ids = True
+    first_adapter.mutate_then_fail_sources.add(capability.source)
+
+    failed = await ReconciliationExecutor(first_adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert failed.results[0].status is ExecutionStatus.TARGET_NOT_CONFIRMED
+    assert failed.catalog.records[0].pending
+    assert storage.catalog().records[0].pending
+    assert set(remote.targets) == {target_id}
+
+    recovered = await ReconciliationExecutor(
+        _FakeTargetAdapter(remote),
+        storage,
+    ).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[TargetObservation(target_id, (1,))],
+    )
+
+    assert recovered.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert not recovered.catalog.records[0].pending
+    assert not storage.catalog().records[0].pending
+    assert len(remote.targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_inventory_final_save_failure_recovers_pending_intent() -> None:
+    """A reconnect finalizes an intent left by a failed post-apply save."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    storage.fail_before_save_calls.add(2)
+    first_adapter = _FakeTargetAdapter(remote)
+    first_adapter.deterministic_create_ids = True
+
+    failed = await ReconciliationExecutor(first_adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[],
+    )
+
+    assert failed.results[0].status is ExecutionStatus.APPLIED_NOT_COMMITTED
+    assert failed.catalog.records[0].pending
+    assert storage.catalog().records[0].pending
+    assert set(remote.targets) == {target_id}
+
+    recovered = await ReconciliationExecutor(
+        _FakeTargetAdapter(remote),
+        storage,
+    ).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[TargetObservation(target_id, (1,))],
+    )
+
+    assert recovered.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert recovered.results[0].status is ExecutionStatus.COMMITTED
+    assert not recovered.catalog.records[0].pending
+    assert not storage.catalog().records[0].pending
+    assert len(remote.targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_peer_finalizes_a_pending_inventory_intent() -> None:
+    """A feature downgrade still recovers a durable in-progress binding."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    pending = TargetCatalog([TargetRecord(target_id, capability, pending=True)])
+    remote = _FakeRemote()
+    remote.add(target_id, capability)
+    storage = _FakeCatalogStorage(pending.to_dict())
+
+    report = await ReconciliationExecutor(
+        _FakeTargetAdapter(remote),
+        storage,
+    ).async_reconcile(_SCOPE, [capability])
+
+    assert report.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert not report.catalog.records[0].pending
+    assert not storage.catalog().records[0].pending
+
+
+@pytest.mark.asyncio
 async def test_inventory_create_rejects_non_deterministic_confirmation() -> None:
     """Inventory mode cannot persist a peer-selected target ID."""
     remote = _FakeRemote()
     storage = _FakeCatalogStorage()
     adapter = _FakeTargetAdapter(remote)
+    adapter.deterministic_create_ids = True
     adapter.confirm_wrong_target = True
 
     with pytest.raises(ExecutionConflictError, match="non-deterministic target ID"):
@@ -317,8 +609,10 @@ async def test_inventory_create_rejects_non_deterministic_confirmation() -> None
             observations=[],
         )
 
-    assert storage.save_calls == 0
-    assert storage.document is None
+    assert storage.save_calls == 1
+    intent = storage.catalog().records[0]
+    assert intent.target_id == derive_domoticz_target_id(intent.capability.source)
+    assert intent.pending
 
 
 @pytest.mark.asyncio

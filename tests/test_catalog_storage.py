@@ -381,7 +381,7 @@ async def test_catalog_schema_is_validated_on_load_and_before_save(
         await writer.async_save(invalid_catalog)
 
 
-@pytest.mark.parametrize("catalog_version", [1, 3])
+@pytest.mark.parametrize("catalog_version", [1, 4])
 async def test_unsupported_catalog_version_is_not_rewritten(
     hass: HomeAssistant,
     catalog_version: int,

@@ -12,10 +12,12 @@ from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
 from .reconciliation import TargetRecord
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
+_PREVIOUS_CATALOG_SCHEMA_VERSION = 2
 
 _ROOT_KEYS = {"version", "targets"}
-_TARGET_KEYS = {"target_id", "capability", "stale"}
+_TARGET_KEYS_V2 = {"target_id", "capability", "stale"}
+_TARGET_KEYS_V3 = _TARGET_KEYS_V2 | {"pending"}
 _CAPABILITY_KEYS = {
     "source",
     "kind",
@@ -115,7 +117,7 @@ class TargetCatalog:
         return self.with_record(record)
 
     def to_dict(self) -> Dict[str, object]:
-        """Serialize the complete catalog to the JSON-compatible v2 schema."""
+        """Serialize the complete catalog to the JSON-compatible v3 schema."""
         targets: List[Dict[str, object]] = []
         for record in self._records:
             capability = record.capability
@@ -139,6 +141,7 @@ class TargetCatalog:
                         "state_class": capability.state_class,
                     },
                     "stale": record.stale,
+                    "pending": record.pending,
                 }
             )
         return {
@@ -148,18 +151,22 @@ class TargetCatalog:
 
     @classmethod
     def from_dict(cls, data: object) -> TargetCatalog:
-        """Deserialize a strict v2 schema or raise one safe format error."""
+        """Deserialize strict v2/v3 schemas or raise one safe format error."""
         try:
             _require_object(data, _ROOT_KEYS)
             if type(data["version"]) is not int:
                 raise ValueError("invalid schema version")
-            if data["version"] != CATALOG_SCHEMA_VERSION:
+            version = data["version"]
+            if version not in (
+                _PREVIOUS_CATALOG_SCHEMA_VERSION,
+                CATALOG_SCHEMA_VERSION,
+            ):
                 raise ValueError("unsupported schema version")
 
             targets = data["targets"]
             if not isinstance(targets, list):
                 raise TypeError("targets must be a list")
-            return cls(_record_from_dict(item) for item in targets)
+            return cls(_record_from_dict(item, version) for item in targets)
         except _CATALOG_PARSE_ERRORS:
             raise CatalogFormatError("invalid target catalog") from None
 
@@ -184,9 +191,14 @@ def _require_object(value: object, expected_keys: Set[str]) -> None:
         raise ValueError("invalid object fields")
 
 
-def _record_from_dict(data: object) -> TargetRecord:
-    """Build one fully validated record from its strict v2 representation."""
-    _require_object(data, _TARGET_KEYS)
+def _record_from_dict(data: object, version: int) -> TargetRecord:
+    """Build one fully validated record, migrating v2 pending state safely."""
+    target_keys = (
+        _TARGET_KEYS_V2
+        if version == _PREVIOUS_CATALOG_SCHEMA_VERSION
+        else _TARGET_KEYS_V3
+    )
+    _require_object(data, target_keys)
     capability_data = data["capability"]
     _require_object(capability_data, _CAPABILITY_KEYS)
     source_data = capability_data["source"]
@@ -212,4 +224,7 @@ def _record_from_dict(data: object) -> TargetRecord:
         target_id=data["target_id"],
         capability=capability,
         stale=data["stale"],
+        pending=(
+            False if version == _PREVIOUS_CATALOG_SCHEMA_VERSION else data["pending"]
+        ),
     )

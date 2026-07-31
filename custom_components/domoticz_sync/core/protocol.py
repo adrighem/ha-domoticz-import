@@ -36,6 +36,7 @@ FEATURE_HA_EXPORT_BINARY_V1 = "ha-export.binary.v1"
 FEATURE_HA_EXPORT_NUMERIC_V1 = "ha-export.numeric.v1"
 SUPPORTED_WEBSOCKET_SUBPROTOCOLS = (WEBSOCKET_SUBPROTOCOL_V2,)
 SUPPORTED_V2_FEATURES = (
+    FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
 )
@@ -484,9 +485,7 @@ class InventoryResult:
             if not isinstance(target, InventoryTarget):
                 raise ProtocolFormatError("invalid protocol message")
             target_ids.append(target.target_id)
-        if target_ids != sorted(target_ids) or len(target_ids) != len(
-            set(target_ids)
-        ):
+        if target_ids != sorted(target_ids) or len(target_ids) != len(set(target_ids)):
             raise ProtocolFormatError("invalid protocol message")
 
         if self.status is InventoryResultStatus.REJECTED:
@@ -2024,9 +2023,7 @@ def _inventory_result_to_dict(result: InventoryResult) -> Dict[str, object]:
         "status": result.status.value,
         "page": result.page,
         "complete": result.complete,
-        "targets": [
-            _inventory_target_to_dict(target) for target in result.targets
-        ],
+        "targets": [_inventory_target_to_dict(target) for target in result.targets],
     }
 
 

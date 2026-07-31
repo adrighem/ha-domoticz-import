@@ -152,6 +152,22 @@ class _MemoryStorage:
         self.saved_documents.append(deepcopy(document))
 
 
+class _GatedSaveStorage(_MemoryStorage):
+    """Pause persistence so concurrent application calls can be observed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.save_entered = asyncio.Event()
+        self.release_save = asyncio.Event()
+
+    async def async_save(self, document):
+        """Wait at the final create persistence boundary until released."""
+        if len(self.saved_documents) == 1:
+            self.save_entered.set()
+            await self.release_save.wait()
+        await super().async_save(document)
+
+
 class _Session:
     """Sequential bridge application session with scripted responses."""
 
@@ -163,12 +179,14 @@ class _Session:
         response_builder=None,
         *,
         selection: ProtocolSelection = _SELECTION,
+        destination_id: str = "destination-1",
     ) -> None:
         self.sent: list[dict[str, object]] = []
         self._responses: deque[dict[str, object]] = deque()
         self._response_builder = response_builder
         self._never_respond = asyncio.Event()
         self.selection = selection
+        self.destination_id = destination_id
 
     def supports(self, feature: str) -> bool:
         """Return whether one optional application behavior was negotiated."""
@@ -178,8 +196,7 @@ class _Session:
         """Record a payload and enqueue responses to apply requests."""
         self.sent.append(deepcopy(payload))
         if (
-            payload.get("type")
-            in {"apply", "binary_apply", "inventory_request"}
+            payload.get("type") in {"apply", "binary_apply", "inventory_request"}
             and self._response_builder is not None
         ):
             self._responses.extend(self._response_builder(payload))
@@ -190,6 +207,19 @@ class _Session:
             return self._responses.popleft()
         await self._never_respond.wait()
         raise AssertionError("unreachable")
+
+
+class _StartObservedSession(_Session):
+    """Signal when a session has reached its pre-lock feature gate."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.started = asyncio.Event()
+
+    def supports(self, feature: str) -> bool:
+        """Record that the application call has started running."""
+        self.started.set()
+        return super().supports(feature)
 
 
 def _source(object_id: str) -> SourceIdentity:
@@ -529,8 +559,8 @@ async def test_inventory_is_complete_before_either_catalog_is_loaded(
     ]
     assert numeric_storage.load_calls == 1
     assert binary_storage.load_calls == 1
-    assert len(numeric_storage.saved_documents) == 1
-    assert len(binary_storage.saved_documents) == 1
+    assert len(numeric_storage.saved_documents) == 2
+    assert len(binary_storage.saved_documents) == 2
 
 
 @pytest.mark.asyncio
@@ -794,6 +824,126 @@ async def test_inventory_preflights_inactive_catalog_ownership(
     assert storage.saved_documents == []
     assert binary_storage.saved_documents == []
     assert [payload["type"] for payload in session.sent] == ["inventory_request"]
+
+
+@pytest.mark.asyncio
+async def test_same_destination_reconciliations_are_serialized_through_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement session waits before collection until persistence completes."""
+    capability = _capability("sensor-a")
+    storage = _GatedSaveStorage()
+    _configure_application(monkeypatch, [capability], storage)
+    original_collect = app_module.collect_export_selection
+    collection_calls = 0
+
+    def collect(hass, *, instance_id: str, label_id: str, included_kinds):
+        nonlocal collection_calls
+        collection_calls += 1
+        return original_collect(
+            hass,
+            instance_id=instance_id,
+            label_id=label_id,
+            included_kinds=included_kinds,
+        )
+
+    monkeypatch.setattr(app_module, "collect_export_selection", collect)
+    application = HomeAssistantExportApplication(_Hass())
+    responses = _inventory_and_apply_responses(_INVENTORY_SELECTION)
+    first = _Session(responses, selection=_INVENTORY_SELECTION)
+    second = _StartObservedSession(responses, selection=_INVENTORY_SELECTION)
+
+    first_task = asyncio.create_task(application.async_connected(first))
+    await asyncio.wait_for(storage.save_entered.wait(), 1)
+    second_task = asyncio.create_task(application.async_connected(second))
+    await asyncio.wait_for(second.started.wait(), 1)
+    try:
+        assert collection_calls == 1
+        assert second.sent == []
+        assert storage.load_calls == 1
+        assert len(storage.saved_documents) == 1
+    finally:
+        storage.release_save.set()
+        await asyncio.gather(first_task, second_task)
+
+    assert collection_calls == 2
+    assert [payload["type"] for payload in first.sent] == [
+        "inventory_request",
+        "apply",
+    ]
+    assert [payload["type"] for payload in second.sent] == [
+        "inventory_request",
+        "apply",
+    ]
+    assert storage.load_calls == 2
+    assert len(storage.saved_documents) == 2
+
+
+@pytest.mark.asyncio
+async def test_different_destinations_reconcile_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked save for one destination does not hold another destination."""
+    capability = _capability("sensor-a")
+    first_storage = _GatedSaveStorage()
+    second_storage = _MemoryStorage()
+    first_binary_storage = _MemoryStorage()
+    second_binary_storage = _MemoryStorage()
+    _configure_application(monkeypatch, [capability], first_storage)
+    numeric_storages = {
+        "destination-1": first_storage,
+        "destination-2": second_storage,
+    }
+    binary_storages = {
+        "destination-1": first_binary_storage,
+        "destination-2": second_binary_storage,
+    }
+
+    def make_numeric_storage(_hass, *, entry_id: str, destination_id: str):
+        assert entry_id == "entry-1"
+        return numeric_storages[destination_id]
+
+    def make_binary_storage(_hass, *, entry_id: str, destination_id: str):
+        assert entry_id == "entry-1"
+        return binary_storages[destination_id]
+
+    monkeypatch.setattr(
+        app_module,
+        "HomeAssistantCatalogStorage",
+        make_numeric_storage,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "HomeAssistantBinaryCatalogStorage",
+        make_binary_storage,
+    )
+    application = HomeAssistantExportApplication(_Hass())
+    responses = _inventory_and_apply_responses(_INVENTORY_SELECTION)
+    first = _Session(responses, selection=_INVENTORY_SELECTION)
+    second = _Session(
+        responses,
+        selection=_INVENTORY_SELECTION,
+        destination_id="destination-2",
+    )
+
+    first_task = asyncio.create_task(application.async_connected(first))
+    await asyncio.wait_for(first_storage.save_entered.wait(), 1)
+    second_task = asyncio.create_task(application.async_connected(second))
+    try:
+        await asyncio.wait_for(second_task, 1)
+        assert not first_task.done()
+        assert len(second_storage.saved_documents) == 2
+        assert second_binary_storage.load_calls == 1
+    finally:
+        first_storage.release_save.set()
+        await first_task
+
+    assert len(first_storage.saved_documents) == 2
+    assert first_binary_storage.load_calls == 1
+    assert [payload["type"] for payload in second.sent] == [
+        "inventory_request",
+        "apply",
+    ]
 
 
 @pytest.mark.asyncio

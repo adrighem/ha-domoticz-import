@@ -110,9 +110,10 @@ and are harmless when they are not in the intersection.
 ## Authenticated Domoticz Inventory
 
 `domoticz-inventory.v1` lets Home Assistant obtain one read-only snapshot of
-the targets owned by the connected Domoticz plugin hardware instance. It does
-not enumerate other Domoticz hardware. Home Assistant sends the request only
-after `application_ready`, and only when the feature is in `selected_features`.
+the targets visible to the connected Domoticz plugin hardware instance. It does
+not enumerate other Domoticz hardware, but hardware scope alone is not proof
+that a target is owned by this sync. Home Assistant sends the request only after
+`application_ready`, and only when the feature is in `selected_features`.
 
 The request is the exact schema below. `request_id` follows the existing
 non-empty application identifier rules and correlates every result page with
@@ -267,9 +268,54 @@ this schema in place.
 
 This contract authenticates and integrity-protects inventory but does not
 encrypt it. Use the WSS, trusted-network, and VPN guidance under Transport
-Confidentiality. This section defines the Phase 5 wire contract only. It does
-not authorize deletion, claiming unrelated devices, or any repair action;
-reconciliation and safe repair require their own implementation and tests.
+Confidentiality. The inventory feature is read-only and does not itself
+authorize deletion, retyping, claiming an unrelated device, or any export
+write. The separately negotiated numeric or binary export feature still gates
+each repair action.
+
+### Inventory-aware reconciliation
+
+After accepting the complete snapshot, Home Assistant loads both local target
+catalogs and validates their deterministic source bindings before the first
+write. It then applies these ownership and repair rules independently for each
+negotiated export kind:
+
+- A remote target is sync-owned only when an existing local catalog record
+  binds the same source to its deterministic `target_id`. A populated remote
+  layout must contain exactly Unit 1 with no sibling units. A DeviceID prefix,
+  name, idx, or matching profile is not ownership proof.
+- A current source without a catalog record may be created only when its
+  deterministic DeviceID is absent from the remote snapshot. If that DeviceID
+  already exists remotely, it remains remote-only and is not adopted or
+  changed.
+- A missing or empty catalog-owned target with a current selected source is
+  recreated with the same DeviceID. Domoticz may allocate a new idx because idx
+  is observational, not identity. A missing stale target is not recreated.
+- A catalog-owned Unit 1 with the expected Type, SubType, and SwitchType is
+  converged to the source name, an enabled `Used` flag, the encoded state, and
+  the timeout state. For Custom Sensors, the bridge manages the `Custom` option
+  while preserving unrelated native and calibration options.
+- A deleted, selected, unavailable target is recreated with `nValue` equal to
+  `0`, an empty `sValue`, and its parent timed out. Its previous Domoticz value
+  cannot be recovered after the device was deleted.
+- An immutable profile mismatch, a unit other than Unit 1, sibling units, or an
+  ambiguous identity is refused and left untouched. No repair deletes or
+  retypes a Domoticz target.
+
+Removing an export label therefore cannot delete the previous target. A
+catalog-owned target that is no longer present in the current Home Assistant
+selection is retained and marked unavailable when its remote layout is safe.
+
+Inventory-aware reconciliation preserves the existing confirmation and local
+persistence boundary. Each remote change is re-read and confirmed before its
+catalog record is stored. If persistence becomes uncertain, the batch stops;
+the deterministic action can be retried safely after reconnect. A rejected or
+incomplete inventory never reaches this stage and cannot change a target or
+catalog.
+
+When `domoticz-inventory.v1` is not selected, no inventory messages are sent.
+Mutually selected numeric and binary features retain the earlier catalog-only
+connect-time export behavior, without remote drift detection or repair.
 
 ## Mixed Installations
 
@@ -280,7 +326,7 @@ intermediate states are safe:
 | --- | --- | --- |
 | New, v1 and v2 aware | Old, v1 only | Authenticated v1 heartbeat session; export is disabled |
 | Old, v1 only | New, v1 and v2 aware | Authenticated v1 heartbeat session; export is disabled |
-| Current, v1 and v2 aware | Current, v2 aware | Authenticated v2 session; numeric and binary export run independently when their features are selected |
+| Current, inventory-aware peer | Current, inventory-aware peer | Authenticated v2 session; inventory is confirmed before numeric and binary export, then enables safe drift repair when all three features are selected |
 | Current binary-aware peer | Earlier numeric-only v2 peer | Authenticated v2 session; numeric export continues and binary export stays disabled |
 | Inventory-aware peer | Earlier v2 peer without inventory | Authenticated v2 session; common export features continue and remote inventory and drift repair stay disabled |
 | Both support v2 but not the same optional feature | Mixed feature support | The v2 session may run its common baseline, but the unsupported feature is not used |
@@ -324,9 +370,10 @@ credentials.
 
 Finish both sequences on the same matching release tag. Confirm the installed
 tag in HACS and PyPluginStore, or in both manual installations. The ready status
-must report protocol v2 and the expected numeric and binary features. Verify a
-representative native numeric device, Custom Sensor fallback, and passive binary
-device, then reconnect once more and confirm that the target count is unchanged.
+must report protocol v2 and the expected inventory, numeric, and binary
+features. Verify a representative native numeric device, Custom Sensor
+fallback, and passive binary device, then reconnect once more and confirm that
+the target count is unchanged.
 
 ## Future Compatibility Rules
 
@@ -374,13 +421,22 @@ from treating the other capability kind as missing. Their versions are
 independent of the wire protocol:
 
 - the outer Home Assistant Store container remains version `1`;
-- the current inner target catalog uses exact schema version `2`; and
-- wire protocol v2 does not imply catalog schema v2, or the reverse.
+- the current inner target catalog uses exact schema version `3`; and
+- wire protocol v2 does not imply catalog schema v3, or the reverse.
 
-Catalog schema v2 is the first shape containing the required `state_class`
-field. Inner catalog v1 and unknown future versions fail closed and are not
+Catalog schema v2 is the first released shape containing the required
+`state_class` field. Schema v3 adds one exact Boolean `pending` field to each
+record. In inventory mode, Home Assistant persists a deterministic pending
+ownership intent before asking Domoticz to create a new target. A confirmed
+apply replaces it with the normal record. If the apply, connection, or final
+save is interrupted, the pending record lets a later reconnect retry the same
+DeviceID without treating the resulting remote target as unrelated.
+
+Schema v2 records load as schema v3 records with `pending` equal to `false`.
+Inner catalog v1 and unknown future versions fail closed and are not
 overwritten. No v1 migration or automatic rebuild is provided because export
-was unused before this release.
+was unused before this release. Older software that does not understand schema
+v3 must likewise leave it untouched.
 
 After the first export release, a catalog schema change requires an explicit,
 tested migration or another documented preservation strategy. Older software
@@ -392,7 +448,8 @@ inventory formats receive their own independently negotiated version.
 ## Transport Confidentiality
 
 The pairing-key protocol authenticates both peers and every application
-envelope, but signed JSON is not encrypted.
+envelope, but signed JSON is not encrypted. Inventory target names, values, and
+device metadata are application data under this rule.
 
 - `WS` exposes message contents to anyone who can observe the network. Use it
   only on a trusted LAN or inside a VPN.

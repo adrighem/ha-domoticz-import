@@ -1428,27 +1428,31 @@ def test_application_ready_is_exact_and_does_not_require_optional_features() -> 
 
 def test_inventory_feature_negotiates_independently_for_mixed_v2_peers() -> None:
     """Inventory is selected only when both authenticated peers advertise it."""
-    old_features = SUPPORTED_V2_FEATURES
-    inventory_features = tuple(
-        sorted((*SUPPORTED_V2_FEATURES, FEATURE_DOMOTICZ_INVENTORY_V1))
+    legacy_features = (
+        FEATURE_HA_EXPORT_BINARY_V1,
+        FEATURE_HA_EXPORT_NUMERIC_V1,
     )
 
-    assert FEATURE_DOMOTICZ_INVENTORY_V1 not in SUPPORTED_V2_FEATURES
+    assert FEATURE_DOMOTICZ_INVENTORY_V1 in SUPPORTED_V2_FEATURES
     assert SUPPORTED_V2_FEATURES == tuple(sorted(SUPPORTED_V2_FEATURES))
-    assert _fixed_v2_context(
-        client_features=inventory_features,
-        server_features=old_features,
-    ).selection.features == old_features
-    assert _fixed_v2_context(
-        client_features=old_features,
-        server_features=inventory_features,
-    ).selection.features == old_features
-    assert _fixed_v2_context(
-        client_features=inventory_features,
-        server_features=inventory_features,
-    ).selection.supports(
-        FEATURE_DOMOTICZ_INVENTORY_V1
+    assert (
+        _fixed_v2_context(
+            client_features=SUPPORTED_V2_FEATURES,
+            server_features=legacy_features,
+        ).selection.features
+        == legacy_features
     )
+    assert (
+        _fixed_v2_context(
+            client_features=legacy_features,
+            server_features=SUPPORTED_V2_FEATURES,
+        ).selection.features
+        == legacy_features
+    )
+    assert _fixed_v2_context(
+        client_features=SUPPORTED_V2_FEATURES,
+        server_features=SUPPORTED_V2_FEATURES,
+    ).selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
 
 
 def test_domoticz_target_id_derivation_is_shared_and_stable() -> None:
@@ -1621,10 +1625,7 @@ def test_rejected_inventory_result_is_sanitized_and_not_an_empty_snapshot() -> N
 
 def test_inventory_messages_round_trip_inside_signed_ordered_envelopes() -> None:
     """Request and response correlation is protected by the v2 session MAC."""
-    inventory_features = tuple(
-        sorted((*SUPPORTED_V2_FEATURES, FEATURE_DOMOTICZ_INVENTORY_V1))
-    )
-    session_key, context, session_id = _v2_session(inventory_features)
+    session_key, context, session_id = _v2_session()
     selection = context.selection
     request_envelope = sign_envelope(
         session_key,
@@ -1778,10 +1779,13 @@ def test_inventory_strings_use_explicit_utf8_byte_bounds() -> None:
             ),
         ),
     )
-    assert parse_inventory_result(
-        selection,
-        build_inventory_result(selection, at_limit),
-    ) == at_limit
+    assert (
+        parse_inventory_result(
+            selection,
+            build_inventory_result(selection, at_limit),
+        )
+        == at_limit
+    )
 
     multibyte_at_limit = _inventory_unit(
         name="\N{LATIN SMALL LETTER E WITH ACUTE}"
@@ -1792,9 +1796,7 @@ def test_inventory_strings_use_explicit_utf8_byte_bounds() -> None:
     )
 
     invalid_factories = (
-        lambda: _inventory_target(
-            "a" * (protocol.MAX_INVENTORY_TARGET_ID_BYTES + 1)
-        ),
+        lambda: _inventory_target("a" * (protocol.MAX_INVENTORY_TARGET_ID_BYTES + 1)),
         lambda: _inventory_unit(
             name="\N{LATIN SMALL LETTER E WITH ACUTE}"
             * ((protocol.MAX_INVENTORY_NAME_BYTES // 2) + 1)
@@ -1856,21 +1858,27 @@ def test_inventory_page_requires_deterministic_target_and_unit_order() -> None:
     empty_parent = _inventory_result(
         targets=(_inventory_target(units=()),),
     )
-    assert parse_inventory_result(
-        selection,
-        build_inventory_result(selection, empty_parent),
-    ) == empty_parent
+    assert (
+        parse_inventory_result(
+            selection,
+            build_inventory_result(selection, empty_parent),
+        )
+        == empty_parent
+    )
 
 
 def test_inventory_assembly_distinguishes_empty_from_incomplete() -> None:
     """Only a correlated terminal confirmation can authorize reconciliation."""
     selection = _inventory_selection()
     empty = _inventory_result(targets=())
-    assert assemble_inventory_results(
-        selection,
-        "inventory-1",
-        (empty,),
-    ) == ()
+    assert (
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            (empty,),
+        )
+        == ()
+    )
 
     incomplete = _inventory_result(
         complete=False,
@@ -1902,11 +1910,14 @@ def test_inventory_assembly_requires_one_contiguous_terminal_page_sequence() -> 
         page=2,
         targets=(_inventory_target("HA00000000000000000000002"),),
     )
-    assert assemble_inventory_results(
-        selection,
-        "inventory-1",
-        (first, second),
-    ) == first.targets + second.targets
+    assert (
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            (first, second),
+        )
+        == first.targets + second.targets
+    )
 
     invalid_sequences = (
         (second,),
@@ -2029,11 +2040,14 @@ def test_inventory_accepts_exact_aggregate_limits_and_rejects_one_more() -> None
         )
         for page in pages
     )
-    assert assemble_inventory_results(
-        selection,
-        "inventory-1",
-        wire_pages,
-    ) == all_targets
+    assert (
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            wire_pages,
+        )
+        == all_targets
+    )
 
     too_many_units = list(all_targets)
     too_many_units[0] = _inventory_target(
@@ -2079,9 +2093,7 @@ def test_inventory_accepts_exact_aggregate_limits_and_rejects_one_more() -> None
         ),
         _inventory_result(
             page=last_page.page + 1,
-            targets=(
-                _inventory_target(f"HA{protocol.MAX_INVENTORY_TARGETS:023d}"),
-            ),
+            targets=(_inventory_target(f"HA{protocol.MAX_INVENTORY_TARGETS:023d}"),),
         ),
     )
     with pytest.raises(ProtocolFormatError):
@@ -2103,9 +2115,10 @@ def test_inventory_page_count_is_capped_at_512() -> None:
         )
         for index in range(protocol.MAX_INVENTORY_PAGES)
     )
-    assert len(
-        assemble_inventory_results(selection, "inventory-1", pages)
-    ) == protocol.MAX_INVENTORY_TARGETS
+    assert (
+        len(assemble_inventory_results(selection, "inventory-1", pages))
+        == protocol.MAX_INVENTORY_TARGETS
+    )
 
     with pytest.raises(ProtocolFormatError):
         _inventory_result(

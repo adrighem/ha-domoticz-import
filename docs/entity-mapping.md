@@ -84,6 +84,32 @@ Once released, these mappings are part of the `ha-export.binary.v1`
 compatibility contract. A future change that would retype existing devices
 needs an explicit migration or a new feature version.
 
+## Inventory-aware drift repair
+
+When `domoticz-inventory.v1` is negotiated, Home Assistant stages and validates
+the complete inventory before planning any export action. Ownership comes only
+from a local target-catalog binding between the source and its deterministic
+DeviceID. Before mutation, the corresponding remote container must be absent,
+empty, or contain exactly Unit 1 with no siblings. A matching DeviceID, name,
+idx, or profile by itself is never enough to claim a remote-only device.
+
+For a catalog-owned target with the expected Type, SubType, and SwitchType, a
+reconnect restores the source name, enables its `Used` flag, restores its
+current encoded value, timeout state, and the managed `Custom` option used by
+Custom Sensors. Other native and calibration options are preserved. If the
+whole catalog-owned
+target is missing and its source is still selected, the bridge recreates its
+deterministic DeviceID; Domoticz may assign a different idx. A deleted,
+selected, unavailable target is recreated timed out with a neutral value
+because its previous Domoticz value no longer exists.
+
+The bridge refuses and leaves untouched an unexpected Type, SubType,
+SwitchType, Unit number, or container with sibling units. It also leaves all
+remote-only targets untouched. It never deletes or retypes a Domoticz device,
+and removing a Home Assistant export label does not delete the existing target.
+If the inventory is incomplete, rejected, malformed, or ambiguous, no
+inventory-aware repair or catalog change is performed.
+
 ## Selection Diagnostics
 
 Directly labelled numeric entities that use Custom Sensor and binary entities

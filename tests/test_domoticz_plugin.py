@@ -230,6 +230,15 @@ def _start_and_upgrade(module, *, subprotocol=MISSING):
     return plugin, connection
 
 
+def _legacy_v2_features(protocol):
+    """Return the feature set advertised by a pre-inventory v2 peer."""
+    return tuple(
+        feature
+        for feature in protocol.SUPPORTED_V2_FEATURES
+        if feature != protocol.FEATURE_DOMOTICZ_INVENTORY_V1
+    )
+
+
 def _complete_handshake(
     module,
     plugin,
@@ -246,7 +255,7 @@ def _complete_handshake(
             protocol.generate_nonce(),
             server_protocols=protocol.SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
             server_features=(
-                protocol.SUPPORTED_V2_FEATURES
+                _legacy_v2_features(protocol)
                 if server_features is None
                 else server_features
             ),
@@ -664,20 +673,10 @@ def _send_binary_apply(
     )
 
 
-def _inventory_features(monkeypatch, protocol):
-    """Temporarily advertise the dormant inventory feature for runtime tests."""
-    features = tuple(
-        sorted(
-            set(
-                (
-                    *protocol.SUPPORTED_V2_FEATURES,
-                    protocol.FEATURE_DOMOTICZ_INVENTORY_V1,
-                )
-            )
-        )
-    )
-    monkeypatch.setattr(protocol, "SUPPORTED_V2_FEATURES", features)
-    return features
+def _inventory_features(_monkeypatch, protocol):
+    """Return the active feature set used by inventory runtime tests."""
+    assert protocol.FEATURE_DOMOTICZ_INVENTORY_V1 in (protocol.SUPPORTED_V2_FEATURES)
+    return protocol.SUPPORTED_V2_FEATURES
 
 
 def _send_inventory_request(
@@ -728,6 +727,20 @@ def _send_inventory_request(
             )
         )
     return tuple(results)
+
+
+def _start_inventory_session(module, monkeypatch):
+    """Start one authenticated v2 session with inventory negotiated."""
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    return plugin, connection, session_key, session_id
 
 
 def test_inventory_request_returns_complete_deterministic_hardware_snapshot(
@@ -826,11 +839,14 @@ def test_inventory_request_returns_complete_deterministic_hardware_snapshot(
             ),
         ),
     )
-    assert protocol.assemble_inventory_results(
-        plugin._protocol_selection,
-        "inventory-1",
-        results,
-    ) == results[0].targets
+    assert (
+        protocol.assemble_inventory_results(
+            plugin._protocol_selection,
+            "inventory-1",
+            results,
+        )
+        == results[0].targets
+    )
 
 
 def test_empty_inventory_has_one_confirmed_terminal_page(
@@ -910,6 +926,88 @@ def test_inventory_request_pages_one_complete_snapshot(
     )
 
 
+def test_inventory_write_gate_opens_only_after_every_page_is_sent(
+    loaded_plugin,
+    monkeypatch,
+):
+    """The terminal inventory send must return before writes become eligible."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    target_count = protocol.MAX_INVENTORY_TARGETS_PER_PAGE + 1
+    for index in range(target_count):
+        target_id = f"gate-parent-{index:03d}"
+        domoticz.devices[target_id] = FakeDevice(domoticz, target_id)
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    gate_states = []
+    original_send = plugin._send_signed
+
+    def recording_send(payload):
+        original_send(payload)
+        if payload.get("type") == "inventory_result":
+            gate_states.append(plugin._inventory_confirmed)
+            with pytest.raises(module.DomoticzApplyError):
+                plugin._require_inventory_write_gate()
+
+    monkeypatch.setattr(plugin, "_send_signed", recording_send)
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert len(results) == 2
+    assert gate_states == [False, False]
+    assert plugin._inventory_confirmed
+    plugin._require_inventory_write_gate()
+
+
+def test_terminal_inventory_send_failure_leaves_write_gate_closed(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A partial result transmission never authorizes later mutations."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    target_count = protocol.MAX_INVENTORY_TARGETS_PER_PAGE + 1
+    for index in range(target_count):
+        target_id = f"failed-send-parent-{index:03d}"
+        domoticz.devices[target_id] = FakeDevice(domoticz, target_id)
+    plugin, _connection, _session_key, _session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    original_send = plugin._send_signed
+    sent_pages = []
+
+    def fail_terminal_send(payload):
+        if payload.get("type") == "inventory_result":
+            sent_pages.append(payload["page"])
+            if payload["complete"]:
+                raise RuntimeError
+        original_send(payload)
+
+    monkeypatch.setattr(plugin, "_send_signed", fail_terminal_send)
+
+    with pytest.raises(RuntimeError):
+        plugin._handle_inventory_request(
+            protocol.build_inventory_request(
+                plugin._protocol_selection,
+                "failed-terminal-send",
+            )
+        )
+
+    assert sent_pages == [1, 2]
+    assert not plugin._inventory_confirmed
+    with pytest.raises(module.DomoticzApplyError):
+        plugin._require_inventory_write_gate()
+
+
 def test_inventory_request_pages_snapshot_by_canonical_byte_size(
     loaded_plugin,
     monkeypatch,
@@ -926,8 +1024,7 @@ def test_inventory_request_pages_snapshot_by_canonical_byte_size(
         server_features=features,
     )
     target_count = (
-        protocol.MAX_INVENTORY_PAYLOAD_BYTES
-        // protocol.MAX_INVENTORY_S_VALUE_BYTES
+        protocol.MAX_INVENTORY_PAYLOAD_BYTES // protocol.MAX_INVENTORY_S_VALUE_BYTES
     ) + 1
     for index in range(target_count):
         target_id = f"large-parent-{index:03d}"
@@ -980,8 +1077,7 @@ def test_inventory_target_larger_than_one_page_is_safely_rejected(
     target_id = "oversized-parent"
     device = FakeDevice(domoticz, target_id)
     unit_count = (
-        protocol.MAX_INVENTORY_PAYLOAD_BYTES
-        // protocol.MAX_INVENTORY_S_VALUE_BYTES
+        protocol.MAX_INVENTORY_PAYLOAD_BYTES // protocol.MAX_INVENTORY_S_VALUE_BYTES
     ) + 1
     for unit_number in range(1, unit_count + 1):
         device.Units[unit_number] = FakeUnit(
@@ -1156,7 +1252,7 @@ def test_second_inventory_request_in_one_session_is_a_protocol_violation(
 def test_inventory_request_without_negotiated_feature_closes_without_result(
     loaded_plugin,
 ):
-    """A dormant inventory feature cannot be invoked by an older v2 peer."""
+    """An inventory request cannot be invoked by an older v2 peer."""
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
     plugin, connection = _start_and_upgrade(module)
@@ -1164,6 +1260,7 @@ def test_inventory_request_without_negotiated_feature_closes_without_result(
         module,
         plugin,
         connection,
+        server_features=_legacy_v2_features(protocol),
     )
     assert not plugin._protocol_selection.supports(
         protocol.FEATURE_DOMOTICZ_INVENTORY_V1
@@ -1233,6 +1330,15 @@ def test_inventory_request_guard_resets_after_reconnect(
         reconnected,
         server_features=features,
     )
+    blocked = _send_apply(
+        module,
+        plugin,
+        reconnected,
+        next_key,
+        next_session_id,
+        request_id="reconnected-before-inventory",
+        action=_numeric_action(protocol),
+    )
 
     second = _send_inventory_request(
         module,
@@ -1243,8 +1349,684 @@ def test_inventory_request_guard_resets_after_reconnect(
         request_id="inventory-2",
     )
 
+    assert blocked.status is protocol.ApplyResultStatus.REJECTED
     assert second[0].status is protocol.InventoryResultStatus.CONFIRMED
     assert second[0].request_id == "inventory-2"
+
+
+@pytest.mark.parametrize("capability_kind", ["numeric", "binary"])
+def test_inventory_selected_apply_waits_for_confirmed_snapshot(
+    loaded_plugin,
+    monkeypatch,
+    capability_kind,
+):
+    """Neither application message can write before confirmed inventory."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    if capability_kind == "numeric":
+        action = _numeric_action(protocol)
+        send = _send_apply
+    else:
+        action = _binary_action(protocol)
+        send = _send_binary_apply
+
+    blocked = send(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id=f"{capability_kind}-before-inventory",
+        action=action,
+    )
+    inventory = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    allowed = send(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id=f"{capability_kind}-after-inventory",
+        action=action,
+    )
+
+    assert blocked.status is protocol.ApplyResultStatus.REJECTED
+    assert inventory[-1].status is protocol.InventoryResultStatus.CONFIRMED
+    assert allowed.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == 1
+
+
+def test_rejected_inventory_keeps_application_writes_gated(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A rejected snapshot never turns the inventory safety gate green."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    module.Devices = None
+    inventory = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    module.Devices = domoticz.devices
+
+    blocked = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="after-rejected-inventory",
+        action=_numeric_action(protocol),
+    )
+
+    assert inventory[-1].status is protocol.InventoryResultStatus.REJECTED
+    assert blocked.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert domoticz.devices == {}
+
+
+def test_inventory_create_rechecks_parent_absence_after_unit_factory(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A parent appearing during CREATE preparation is never adopted."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    original_factory = domoticz.Unit
+    collision = FakeUnit(
+        domoticz,
+        DeviceID=target_id,
+        Unit=1,
+        Name="Unrelated target",
+        Type=243,
+        Subtype=31,
+        Options={"Custom": "1;private"},
+    )
+
+    def racing_factory(**kwargs):
+        creator = original_factory(**kwargs)
+        device = FakeDevice(domoticz, target_id)
+        device.Units[1] = collision
+        domoticz.devices[target_id] = device
+        return creator
+
+    monkeypatch.setattr(domoticz, "Unit", racing_factory)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-parent-race",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert domoticz.devices[target_id].Units[1] is collision
+    assert collision.Name == "Unrelated target"
+    assert collision.Options == {"Custom": "1;private"}
+
+
+def test_inventory_create_rejects_an_existing_empty_parent(
+    loaded_plugin,
+    monkeypatch,
+):
+    """An unbound CREATE cannot claim even an empty hardware container."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    empty_parent = FakeDevice(domoticz, target_id)
+    domoticz.devices[target_id] = empty_parent
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-empty-parent",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.devices[target_id] is empty_parent
+    assert empty_parent.Units == {}
+    assert domoticz.create_calls == []
+
+
+def test_inventory_bound_update_rejects_sibling_added_after_snapshot(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A new sibling unit invalidates an otherwise owned Unit 1 binding."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    module.Domoticz.Unit(
+        Name="Original",
+        DeviceID=target_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;deg C"},
+        Used=1,
+        nValue=0,
+        sValue="4",
+    ).Create()
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    device = domoticz.devices[target_id]
+    unit = device.Units[1]
+    device.Units[2] = FakeUnit(
+        domoticz,
+        DeviceID=target_id,
+        Unit=2,
+        Name="Unrelated sibling",
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="sibling-race",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            value=19,
+            name="Changed",
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert unit.Name == "Original"
+    assert unit.sValue == "4"
+    assert unit.updates == []
+    assert set(device.Units) == {1, 2}
+
+
+def test_inventory_bound_update_repairs_an_empty_parent(
+    loaded_plugin,
+    monkeypatch,
+):
+    """An exact catalog binding may recreate Unit 1 in an empty parent."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    parent = FakeDevice(domoticz, target_id)
+    domoticz.devices[target_id] = parent
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="repair-empty-parent",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            value=19.25,
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert domoticz.devices[target_id] is parent
+    assert set(parent.Units) == {1}
+    assert parent.Units[1].sValue == "19.25"
+
+
+@pytest.mark.parametrize(
+    ("empty_parent", "stale", "expected_status", "expected_creates"),
+    [
+        (False, False, "confirmed", 1),
+        (False, True, "rejected", 0),
+        (True, False, "confirmed", 1),
+        (True, True, "rejected", 0),
+    ],
+)
+def test_inventory_absent_or_empty_unavailable_current_differs_from_stale(
+    loaded_plugin,
+    monkeypatch,
+    empty_parent,
+    stale,
+    expected_status,
+    expected_creates,
+):
+    """Current unavailable targets are restored; stale missing ones stay gone."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    source_action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(source_action.capability.source)
+    original_parent = None
+    if empty_parent:
+        original_parent = FakeDevice(domoticz, target_id)
+        domoticz.devices[target_id] = original_parent
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id=f"missing-unavailable-{stale}",
+        action=_numeric_action(
+            protocol,
+            kind="mark_unavailable",
+            target_id=target_id,
+            value=None,
+            availability="unavailable",
+            stale=stale,
+        ),
+    )
+
+    assert result.status.value == expected_status
+    assert len(domoticz.create_calls) == expected_creates
+    if not stale:
+        device = domoticz.devices[target_id]
+        unit = device.Units[1]
+        if original_parent is not None:
+            assert device is original_parent
+        assert (unit.nValue, unit.sValue) == (0, "")
+        assert device.TimedOut == 1
+    elif original_parent is not None:
+        assert domoticz.devices[target_id] is original_parent
+        assert original_parent.Units == {}
+    else:
+        assert target_id not in domoticz.devices
+
+
+def test_inventory_repairs_mutable_custom_state_and_retains_other_options(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Owned mutable fields converge without replacing unmanaged options."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    source_action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Old name",
+        DeviceID=target_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;old", "Calibration": "keep"},
+        Used=0,
+        nValue=7,
+        sValue="old",
+    ).Create()
+    device = domoticz.devices[target_id]
+    device.TimedOut = 1
+    unit = device.Units[1]
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="repair-custom-drift",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            value=18,
+            name="Garden temperature",
+            unit="C",
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert device.Units[1] is unit
+    assert unit.Name == "Garden temperature"
+    assert unit.Used == 1
+    assert (unit.nValue, unit.sValue) == (0, "18")
+    assert device.TimedOut == 0
+    assert unit.Options == {"Custom": "1;C", "Calibration": "keep"}
+
+
+def test_inventory_native_repair_leaves_options_untouched(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Native profile options are outside the plugin's repair ownership."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    source_action = _numeric_action(
+        protocol,
+        semantic="temperature",
+        unit="°C",
+    )
+    target_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Old name",
+        DeviceID=target_id,
+        Unit=1,
+        Type=80,
+        Subtype=5,
+        Switchtype=0,
+        Options={"Calibration": "keep", "Native": "private"},
+        Used=0,
+        nValue=0,
+        sValue="-1",
+    ).Create()
+    device = domoticz.devices[target_id]
+    device.TimedOut = 1
+    unit = device.Units[1]
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="repair-native-options",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            semantic="temperature",
+            unit="°C",
+            value=20,
+            name="Current name",
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert unit.Name == "Current name"
+    assert unit.Used == 1
+    assert unit.sValue == "20"
+    assert device.TimedOut == 0
+    assert unit.Options == {"Calibration": "keep", "Native": "private"}
+
+
+def test_inventory_incompatible_profile_is_left_untouched(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Inventory ownership never permits retyping a mismatched Unit 1."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    module.Domoticz.Unit(
+        Name="Do not replace",
+        DeviceID=target_id,
+        Unit=1,
+        Type=244,
+        Subtype=73,
+        Switchtype=0,
+        Options={"Private": "keep"},
+        Used=0,
+        nValue=9,
+        sValue="private",
+    ).Create()
+    unit = domoticz.devices[target_id].Units[1]
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="incompatible-profile",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            value=19,
+            name="Must not change",
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.devices[target_id].Units[1] is unit
+    assert unit.Name == "Do not replace"
+    assert (unit.Type, unit.SubType, unit.SwitchType) == (244, 73, 0)
+    assert unit.Options == {"Private": "keep"}
+    assert (unit.Used, unit.nValue, unit.sValue) == (0, 9, "private")
+    assert unit.updates == []
+    assert not unit.deleted
+
+
+def test_inventory_rechecks_complete_unit_keys_after_create(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A sibling appearing during Create prevents later target mutation."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    original_factory = domoticz.Unit
+
+    def racing_factory(**kwargs):
+        creator = original_factory(**kwargs)
+        original_create = creator.Create
+
+        def create_with_sibling():
+            created = original_create()
+            device = domoticz.devices[kwargs["DeviceID"]]
+            device.Units[2] = FakeUnit(
+                domoticz,
+                DeviceID=kwargs["DeviceID"],
+                Unit=2,
+                Name="Racing sibling",
+            )
+            return created
+
+        creator.Create = create_with_sibling
+        return creator
+
+    monkeypatch.setattr(domoticz, "Unit", racing_factory)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="sibling-after-create",
+        action=_numeric_action(protocol),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    target_id = module._device_id_for_source(
+        _numeric_action(protocol).capability.source
+    )
+    assert set(domoticz.devices[target_id].Units) == {1, 2}
+    assert domoticz.devices[target_id].Units[1].updates == []
+
+
+def test_inventory_rechecks_complete_unit_keys_after_refresh(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A sibling exposed by Refresh prevents a false confirmation."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    source_action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(source_action.capability.source)
+    module.Domoticz.Unit(
+        Name="Outdoor temperature",
+        DeviceID=target_id,
+        Unit=1,
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;deg C"},
+        Used=1,
+        nValue=0,
+        sValue="12.5",
+    ).Create()
+    device = domoticz.devices[target_id]
+    unit = device.Units[1]
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    original_refresh = unit.Refresh
+
+    def refresh_with_sibling():
+        original_refresh()
+        device.Units[2] = FakeUnit(
+            domoticz,
+            DeviceID=target_id,
+            Unit=2,
+            Name="Racing sibling",
+        )
+
+    monkeypatch.setattr(unit, "Refresh", refresh_with_sibling)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="sibling-after-refresh",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+        ),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert set(device.Units) == {1, 2}
 
 
 def test_plugin_metadata_supports_direct_repository_clone():
@@ -1475,12 +2257,18 @@ def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
     module, domoticz = loaded_plugin
     protocol = module.wire_protocol
     plugin, connection = _start_and_upgrade(module)
-    session_key, session_id = _complete_handshake(module, plugin, connection)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=protocol.SUPPORTED_V2_FEATURES,
+    )
 
     assert domoticz.statuses == [
         "Authenticated Home Assistant connection is ready; "
         "protocol=ha-domoticz-sync.v2; "
-        "features=ha-export.binary.v1,ha-export.numeric.v1."
+        "features=domoticz-inventory.v1,ha-export.binary.v1,"
+        "ha-export.numeric.v1."
     ]
 
     server_ping_id = protocol.generate_nonce()

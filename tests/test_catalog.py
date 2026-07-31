@@ -63,11 +63,13 @@ def _record(
     *,
     capability: Capability | None = None,
     stale: bool = False,
+    pending: bool = False,
 ) -> TargetRecord:
     return TargetRecord(
         target_id=target_id or "target-" + object_id,
         capability=capability or _capability(object_id),
         stale=stale,
+        pending=pending,
     )
 
 
@@ -203,12 +205,12 @@ def test_catalog_deliberately_has_no_removal_api() -> None:
     assert not hasattr(TargetCatalog, "discard")
 
 
-def test_v2_serialization_contains_the_complete_record() -> None:
-    """All identity, value, metadata, target, and stale fields are persisted."""
+def test_v3_serialization_contains_the_complete_record() -> None:
+    """All identity, value, metadata, target, and lifecycle fields persist."""
     record = _record("sensor-1")
 
     assert catalog_to_document(TargetCatalog([record])) == {
-        "version": 2,
+        "version": 3,
         "targets": [
             {
                 "target_id": "target-sensor-1",
@@ -228,12 +230,13 @@ def test_v2_serialization_contains_the_complete_record() -> None:
                     "state_class": "measurement",
                 },
                 "stale": False,
+                "pending": False,
             }
         ],
     }
 
 
-def test_v2_serialization_preserves_absent_state_class_as_null() -> None:
+def test_v3_serialization_preserves_absent_state_class_as_null() -> None:
     """The strict schema retains an explicit nullable metadata field."""
     capability = _capability("sensor-1", state_class=None)
     catalog = TargetCatalog([_record("sensor-1", capability=capability)])
@@ -245,7 +248,7 @@ def test_v2_serialization_preserves_absent_state_class_as_null() -> None:
 
 
 def test_all_capability_shapes_round_trip_through_json() -> None:
-    """Schema v2 preserves each value kind and availability state exactly."""
+    """Schema v3 preserves each value kind and availability state exactly."""
     stale_capability = _capability(
         "stale",
         value=None,
@@ -284,12 +287,53 @@ def test_all_capability_shapes_round_trip_through_json() -> None:
             ),
         ),
         _record("stale", capability=stale_capability, stale=True),
+        _record("pending", pending=True),
     ]
     catalog = TargetCatalog(records)
 
     encoded = json.dumps(catalog.to_dict(), allow_nan=False)
 
     assert TargetCatalog.from_dict(json.loads(encoded)) == catalog
+
+
+def test_v2_catalog_migrates_pending_to_false_without_mutating_input() -> None:
+    """Released v2 records become confirmed records when loaded by v3."""
+    document = TargetCatalog([_record("sensor-1", pending=True)]).to_dict()
+    document["version"] = 2
+    document["targets"][0].pop("pending")
+    original = deepcopy(document)
+
+    catalog = TargetCatalog.from_dict(document)
+
+    assert catalog.records == (_record("sensor-1", pending=False),)
+    assert catalog.to_dict()["version"] == CATALOG_SCHEMA_VERSION
+    assert catalog.to_dict()["targets"][0]["pending"] is False
+    assert document == original
+
+
+def test_v2_catalog_rejects_v3_pending_field() -> None:
+    """Version selection cannot be used to weaken exact record fields."""
+    document = TargetCatalog([_record("sensor-1")]).to_dict()
+    document["version"] = 2
+
+    with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
+        TargetCatalog.from_dict(document)
+
+
+def test_v3_catalog_rejects_pending_stale_record() -> None:
+    """A target cannot be both awaiting confirmation and known stale."""
+    capability = _capability(
+        "sensor-1",
+        value=None,
+        availability=Availability.UNAVAILABLE,
+    )
+    document = TargetCatalog(
+        [_record("sensor-1", capability=capability, stale=True)]
+    ).to_dict()
+    document["targets"][0]["pending"] = True
+
+    with pytest.raises(CatalogFormatError, match="^invalid target catalog$"):
+        TargetCatalog.from_dict(document)
 
 
 def test_serialized_target_order_is_deterministic() -> None:
@@ -315,6 +359,7 @@ def test_released_v1_is_rejected_without_mutating_the_document() -> None:
     """The released pre-state-class schema is not silently reinterpreted."""
     document = TargetCatalog([_record("sensor-1")]).to_dict()
     document["version"] = 1
+    document["targets"][0].pop("pending")
     document["targets"][0]["capability"].pop("state_class")
     original = deepcopy(document)
 
@@ -342,13 +387,15 @@ def test_unknown_future_version_is_rejected_without_mutating_the_document() -> N
         lambda data: data.pop("version"),
         lambda data: data.update(version=0),
         lambda data: data.update(version=True),
-        lambda data: data.update(version=2.0),
+        lambda data: data.update(version=3.0),
         lambda data: data.update(extra=True),
         lambda data: data.update(targets={}),
         lambda data: data["targets"].append("not-a-record"),
         lambda data: data["targets"][0].pop("stale"),
+        lambda data: data["targets"][0].pop("pending"),
         lambda data: data["targets"][0].update(extra=True),
         lambda data: data["targets"][0].update(stale=1),
+        lambda data: data["targets"][0].update(pending=1),
         lambda data: data["targets"][0].update(target_id=" "),
         lambda data: data["targets"][0]["capability"].pop("unit"),
         lambda data: data["targets"][0]["capability"].pop("state_class"),

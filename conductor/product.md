@@ -36,5 +36,7 @@ friendly migration or coexistence path without maintaining separate bridges.
 Domoticz to Home Assistant import is established and read-only. The companion
 plugin can pair with Home Assistant and perform a connect-time export of
 directly labeled numeric and passive binary sensors. Native numeric mappings
-use Custom Sensor as a safe fallback. Remote inventory, continuous
-synchronization, and controls remain later roadmap phases.
+use Custom Sensor as a safe fallback. Authenticated Domoticz inventory now lets
+the bridge repair safe mutable drift and recreate missing catalog-owned targets
+on reconnect without deleting, retyping, or claiming unrelated devices.
+Continuous synchronization and controls remain later roadmap phases.

@@ -120,6 +120,7 @@ class TargetRecord:
     target_id: str
     capability: Capability
     stale: bool = False
+    pending: bool = False
 
     def __post_init__(self) -> None:
         """Validate persisted target state before planning."""
@@ -127,6 +128,10 @@ class TargetRecord:
         if not isinstance(self.capability, Capability):
             raise TypeError("capability must be a Capability")
         _validate_stale(self.stale, self.capability)
+        if not isinstance(self.pending, bool):
+            raise TypeError("pending must be a bool")
+        if self.pending and self.stale:
+            raise ValueError("pending records must not be stale")
 
 
 @dataclass(frozen=True)
@@ -262,8 +267,7 @@ def validate_deterministic_target_ownership(
     target_records = tuple(targets)
     validate_deterministic_target_bindings(target_records)
     catalog_kinds = {
-        target.capability.source: target.capability.kind
-        for target in target_records
+        target.capability.source: target.capability.kind for target in target_records
     }
 
     source_identities: Set[SourceIdentity] = set()
@@ -276,9 +280,7 @@ def validate_deterministic_target_ownership(
         if catalog_kind is not None and capability.kind is not catalog_kind:
             raise TargetBindingError("source capability kind conflicts with catalog")
         source_identities.add(capability.source)
-    source_identities.update(
-        target.capability.source for target in target_records
-    )
+    source_identities.update(target.capability.source for target in target_records)
 
     sources_by_target_id: Dict[str, SourceIdentity] = {}
     for source in source_identities:
@@ -380,7 +382,8 @@ def plan_reconciliation(
                 )
             )
         elif (
-            target.stale
+            target.pending
+            or target.stale
             or capability != target.capability
             or capability.availability is not Availability.AVAILABLE
         ):
