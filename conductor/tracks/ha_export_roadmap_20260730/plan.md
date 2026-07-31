@@ -72,14 +72,18 @@
     - Live 2026-07-31: exact plugin `v0.2.0` recreated the v1-only mixed
       checkpoint under HA `v0.3.1`; updating the plugin to `v0.3.1` negotiated
       numeric v2 with the same two persistent targets
+    - The current-release replay kept plugin `v0.3.1` while HA moved to
+      `v0.5.0`; the mixed session selected only numeric v2 before the plugin
+      update
   - [x] Manually verify the Domoticz plugin-first order (`7347ca3`)
     - Live 2026-07-31: HA `v0.2.0` negotiated heartbeat-only v1 with two
       persistent targets; restoring `v0.3.1` negotiated numeric v2 with the
       same two targets
   - [x] Manually verify a matching-tag installation (`d5ab4d4`)
     - Live 2026-07-31: HACS and the remote plugin checkout both reported exact
-      `v0.3.1`; an unchanged `domoticz.service` restart negotiated numeric v2
-      and preserved both target identities without duplicates
+      `v0.5.0`; an unchanged `domoticz.service` restart negotiated binary and
+      numeric v2 features and preserved both target identities without
+      duplicates
 
 ## Phase 4: First Export Release
 
