@@ -20,7 +20,9 @@ from .reconciliation import (
     ReconciliationAction,
     ReconciliationActionKind,
     SourceScope,
+    TargetObservation,
     TargetRecord,
+    derive_domoticz_target_id,
     plan_reconciliation,
 )
 
@@ -189,6 +191,8 @@ def _preflight_actions(
 def _record_from_confirmation(
     action: ReconciliationAction,
     confirmation: ApplyConfirmation,
+    *,
+    enforce_deterministic_create_target_ids: bool = False,
 ) -> TargetRecord:
     """Build trusted catalog state from an action and a minimal confirmation."""
     if not isinstance(confirmation, ApplyConfirmation):
@@ -200,6 +204,15 @@ def _record_from_confirmation(
         and confirmation.target_id != action.target_id
     ):
         raise ExecutionConflictError("adapter confirmed a different target ID")
+    if (
+        enforce_deterministic_create_target_ids
+        and action.kind is ReconciliationActionKind.CREATE
+        and confirmation.target_id
+        != derive_domoticz_target_id(action.capability.source)
+    ):
+        raise ExecutionConflictError(
+            "adapter confirmed a non-deterministic target ID for create"
+        )
     return TargetRecord(
         target_id=confirmation.target_id,
         capability=action.capability,
@@ -212,6 +225,8 @@ async def async_execute_reconciliation(
     actions: Iterable[ReconciliationAction],
     adapter: TargetAdapter,
     storage: CatalogStorage,
+    *,
+    enforce_deterministic_create_target_ids: bool = False,
 ) -> ExecutionReport:
     """Apply a precomputed plan and commit each confirmed action atomically.
 
@@ -240,13 +255,29 @@ async def async_execute_reconciliation(
             )
             continue
 
-        record = _record_from_confirmation(action, confirmation)
+        record = _record_from_confirmation(
+            action,
+            confirmation,
+            enforce_deterministic_create_target_ids=(
+                enforce_deterministic_create_target_ids
+            ),
+        )
         try:
             candidate = committed.with_record(record)
         except (CatalogFormatError, TypeError, ValueError) as error:
             raise ExecutionConflictError(
                 "confirmed target conflicts with the catalog"
             ) from error
+
+        if candidate == committed:
+            results.append(
+                ActionExecutionResult(
+                    action=action,
+                    status=ExecutionStatus.COMMITTED,
+                    target_id=confirmation.target_id,
+                )
+            )
+            continue
 
         try:
             await storage.async_save(catalog_to_document(candidate))
@@ -295,18 +326,26 @@ class ReconciliationExecutor:
         self,
         scope: SourceScope,
         current: Iterable[Capability],
+        observations: Optional[Iterable[TargetObservation]] = None,
     ) -> ExecutionReport:
         """Load, plan, apply, and persist one authoritative source snapshot."""
         snapshot = tuple(current)
+        observed_snapshot = None if observations is None else tuple(observations)
         async with self._lock:
             document = await self._storage.async_load()
             catalog = (
                 TargetCatalog() if document is None else catalog_from_document(document)
             )
-            actions = plan_reconciliation(scope, snapshot, catalog.records)
+            actions = plan_reconciliation(
+                scope,
+                snapshot,
+                catalog.records,
+                observations=observed_snapshot,
+            )
             return await async_execute_reconciliation(
                 catalog,
                 actions,
                 self._adapter,
                 self._storage,
+                enforce_deterministic_create_target_ids=(observed_snapshot is not None),
             )

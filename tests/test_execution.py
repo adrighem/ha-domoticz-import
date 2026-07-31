@@ -36,7 +36,9 @@ from custom_components.domoticz_sync.core.reconciliation import (
     ReconciliationAction,
     ReconciliationActionKind,
     SourceScope,
+    TargetObservation,
     TargetRecord,
+    derive_domoticz_target_id,
 )
 
 _SCOPE = SourceScope("home_assistant", "instance-1")
@@ -252,6 +254,71 @@ async def test_restart_with_committed_catalog_is_a_no_op() -> None:
     assert second_adapter.calls == []
     assert storage.save_calls == saves_after_first_run
     assert len(remote.targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_inventory_reassertion_does_not_rewrite_an_unchanged_catalog() -> None:
+    """Remote convergence can be confirmed without durable catalog churn."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    catalog = TargetCatalog([TargetRecord(target_id, capability)])
+    remote = _FakeRemote()
+    remote.add(target_id, capability)
+    storage = _FakeCatalogStorage(catalog.to_dict())
+    adapter = _FakeTargetAdapter(remote)
+
+    report = await ReconciliationExecutor(adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[TargetObservation(target_id, (1,))],
+    )
+
+    assert report.actions[0].kind is ReconciliationActionKind.UPDATE
+    assert report.results[0].status is ExecutionStatus.COMMITTED
+    assert report.catalog == catalog
+    assert storage.save_calls == 0
+    assert adapter.calls == list(report.actions)
+
+
+@pytest.mark.asyncio
+async def test_inventory_mode_never_adopts_a_remote_only_target() -> None:
+    """Authoritative remote presence without a local binding remains untouched."""
+    capability = _numeric("sensor-a")
+    target_id = derive_domoticz_target_id(capability.source)
+    remote = _FakeRemote()
+    remote.add(target_id, capability)
+    storage = _FakeCatalogStorage()
+    adapter = _FakeTargetAdapter(remote)
+
+    report = await ReconciliationExecutor(adapter, storage).async_reconcile(
+        _SCOPE,
+        [capability],
+        observations=[TargetObservation(target_id, (1,))],
+    )
+
+    assert report.actions == ()
+    assert report.catalog == TargetCatalog()
+    assert adapter.calls == []
+    assert storage.save_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_inventory_create_rejects_non_deterministic_confirmation() -> None:
+    """Inventory mode cannot persist a peer-selected target ID."""
+    remote = _FakeRemote()
+    storage = _FakeCatalogStorage()
+    adapter = _FakeTargetAdapter(remote)
+    adapter.confirm_wrong_target = True
+
+    with pytest.raises(ExecutionConflictError, match="non-deterministic target ID"):
+        await ReconciliationExecutor(adapter, storage).async_reconcile(
+            _SCOPE,
+            [_numeric("sensor-a")],
+            observations=[],
+        )
+
+    assert storage.save_calls == 0
+    assert storage.document is None
 
 
 @pytest.mark.asyncio

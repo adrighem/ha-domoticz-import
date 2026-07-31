@@ -14,9 +14,15 @@ from custom_components.domoticz_sync.core import (
     ReconciliationActionKind,
     SourceIdentity,
     SourceScope,
+    TargetBindingError,
+    TargetObservation,
     TargetRecord,
+    derive_domoticz_target_id,
     plan_reconciliation,
+    validate_deterministic_target_bindings,
+    validate_deterministic_target_ownership,
 )
+from custom_components.domoticz_sync.core import reconciliation as reconciliation_module
 
 _SCOPE = SourceScope(system="home_assistant", instance_id="instance-1")
 
@@ -72,8 +78,14 @@ def _target(
 def _plan(
     current: list[Capability],
     known_targets: list[TargetRecord],
+    observations: list[TargetObservation] | None = None,
 ) -> tuple[ReconciliationAction, ...]:
-    return plan_reconciliation(_SCOPE, current, known_targets)
+    return plan_reconciliation(
+        _SCOPE,
+        current,
+        known_targets,
+        observations=observations,
+    )
 
 
 def test_empty_snapshots_need_no_actions() -> None:
@@ -593,3 +605,249 @@ def test_reconciliation_records_are_immutable() -> None:
 
     with pytest.raises(FrozenInstanceError):
         action.target_id = "target-1"
+
+
+def test_inventory_reasserts_an_unchanged_owned_target() -> None:
+    """A real Unit 1 observation triggers idempotent remote convergence."""
+    capability = _numeric("same")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    assert _plan(
+        [capability],
+        [TargetRecord(target_id, capability)],
+        [TargetObservation(target_id, (1,))],
+    ) == (
+        ReconciliationAction(
+            kind=ReconciliationActionKind.UPDATE,
+            target_id=target_id,
+            capability=capability,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "availability",
+    (Availability.AVAILABLE, Availability.UNKNOWN, Availability.UNAVAILABLE),
+)
+def test_inventory_repairs_a_missing_current_owned_target(
+    availability: Availability,
+) -> None:
+    """A catalog binding remains ownership proof after remote deletion."""
+    value = 21.5 if availability is Availability.AVAILABLE else None
+    capability = _numeric("missing-remotely", value, availability)
+    target_id = derive_domoticz_target_id(capability.source)
+
+    actions = _plan(
+        [capability],
+        [TargetRecord(target_id, capability)],
+        [],
+    )
+
+    expected_kind = (
+        ReconciliationActionKind.UPDATE
+        if availability is Availability.AVAILABLE
+        else ReconciliationActionKind.MARK_UNAVAILABLE
+    )
+    assert actions[0].kind is expected_kind
+    assert actions[0].target_id == target_id
+    assert not actions[0].stale
+
+
+def test_inventory_does_not_claim_a_remote_only_deterministic_target() -> None:
+    """An exact DeviceID without a local binding is still not ownership proof."""
+    capability = _numeric("remote-only")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    assert _plan(
+        [capability],
+        [],
+        [TargetObservation(target_id, (1,))],
+    ) == ()
+    assert _plan(
+        [capability],
+        [],
+        [TargetObservation(target_id, ())],
+    ) == ()
+
+
+def test_inventory_still_creates_when_no_remote_target_exists() -> None:
+    """An empty authoritative inventory permits a genuinely new target."""
+    capability = _numeric("new")
+
+    assert _plan([capability], [], []) == (
+        ReconciliationAction(
+            kind=ReconciliationActionKind.CREATE,
+            capability=capability,
+        ),
+    )
+
+
+def test_inventory_ignores_unrelated_remote_targets() -> None:
+    """Unrelated hardware-local devices neither block nor become catalog state."""
+    capability = _numeric("new")
+
+    actions = _plan(
+        [capability],
+        [],
+        [TargetObservation("UNRELATED", (1,))],
+    )
+
+    assert actions[0].kind is ReconciliationActionKind.CREATE
+
+
+def test_inventory_blocks_ambiguous_units_without_mutation() -> None:
+    """Unit siblings prevent the exporter from claiming a parent container."""
+    capability = _numeric("compound")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    assert _plan(
+        [capability],
+        [TargetRecord(target_id, capability)],
+        [TargetObservation(target_id, (1, 2))],
+    ) == ()
+
+
+def test_inventory_repairs_a_current_binding_in_an_empty_parent() -> None:
+    """A catalog-owned empty container may safely regain its expected Unit 1."""
+    capability = _numeric("empty-parent")
+    target_id = derive_domoticz_target_id(capability.source)
+
+    actions = _plan(
+        [capability],
+        [TargetRecord(target_id, capability)],
+        [TargetObservation(target_id, ())],
+    )
+
+    assert actions[0].kind is ReconciliationActionKind.UPDATE
+
+
+def test_inventory_does_not_resurrect_a_missing_stale_target() -> None:
+    """A deleted target for an unselected source remains deleted."""
+    capability = _numeric("stale", None, Availability.UNAVAILABLE)
+    target_id = derive_domoticz_target_id(capability.source)
+
+    assert _plan(
+        [],
+        [TargetRecord(target_id, capability, stale=True)],
+        [],
+    ) == ()
+
+    assert _plan(
+        [],
+        [TargetRecord(target_id, capability, stale=True)],
+        [TargetObservation(target_id, ())],
+    ) == ()
+
+
+def test_inventory_reasserts_a_present_stale_target() -> None:
+    """A retained stale target gets its runtime timeout restored."""
+    capability = _numeric("stale", None, Availability.UNAVAILABLE)
+    target_id = derive_domoticz_target_id(capability.source)
+
+    actions = _plan(
+        [],
+        [TargetRecord(target_id, capability, stale=True)],
+        [TargetObservation(target_id, (1,))],
+    )
+
+    assert actions[0].kind is ReconciliationActionKind.MARK_UNAVAILABLE
+    assert actions[0].stale
+
+
+def test_inventory_rejects_a_non_deterministic_catalog_binding() -> None:
+    """Local persistence cannot redirect an inventory-aware repair."""
+    capability = _numeric("redirected")
+
+    with pytest.raises(TargetBindingError, match="deterministic target identity"):
+        _plan(
+            [capability],
+            [TargetRecord("HAWRONG", capability)],
+            [],
+        )
+
+
+def test_combined_catalog_binding_validation_rejects_duplicates() -> None:
+    """Catalogs combined across capability kinds remain globally unambiguous."""
+    capability = _numeric("duplicate")
+    record = TargetRecord(
+        derive_domoticz_target_id(capability.source),
+        capability,
+    )
+
+    with pytest.raises(TargetBindingError, match="duplicate source identity"):
+        validate_deterministic_target_bindings([record, record])
+
+
+def test_combined_ownership_validation_rejects_a_derived_id_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct current sources cannot plan writes to one target identity."""
+    monkeypatch.setattr(
+        reconciliation_module,
+        "derive_domoticz_target_id",
+        lambda _source: "HACOLLISION",
+    )
+
+    with pytest.raises(TargetBindingError, match="duplicate deterministic"):
+        validate_deterministic_target_ownership(
+            [_numeric("first"), _numeric("second")],
+            [],
+        )
+
+
+def test_combined_ownership_reserves_a_source_for_its_catalog_kind() -> None:
+    """A source cannot cross from an inactive catalog into another kind."""
+    numeric = _numeric("reserved")
+    target_id = derive_domoticz_target_id(numeric.source)
+    numeric_record = TargetRecord(target_id, numeric)
+    validate_deterministic_target_ownership([numeric], [numeric_record])
+
+    binary = Capability(
+        source=numeric.source,
+        kind=CapabilityKind.BINARY,
+        name="Reserved",
+        value=True,
+    )
+    binary_record = TargetRecord(target_id, binary)
+
+    with pytest.raises(TargetBindingError, match="kind conflicts"):
+        validate_deterministic_target_ownership([numeric], [binary_record])
+
+
+@pytest.mark.parametrize(
+    "object_id",
+    ("sensor." + "x" * (64 * 1024), "sensor.\ud800"),
+)
+def test_domoticz_target_id_rejects_noncanonical_source_identity(
+    object_id: str,
+) -> None:
+    """The shared helper retains the released canonical JSON safety bounds."""
+    source = SourceIdentity(
+        system="home_assistant",
+        instance_id="instance-1",
+        object_id=object_id,
+        capability_id="state",
+    )
+
+    with pytest.raises(ValueError, match="source identity"):
+        derive_domoticz_target_id(source)
+
+
+def test_inventory_rejects_duplicate_target_observations() -> None:
+    """One hardware snapshot cannot describe a target parent twice."""
+    with pytest.raises(TargetBindingError, match="duplicate observed"):
+        _plan(
+            [],
+            [],
+            [
+                TargetObservation("HAOBSERVED", ()),
+                TargetObservation("HAOBSERVED", ()),
+            ],
+        )
+
+
+@pytest.mark.parametrize("units", ((2, 1), (1, 1), (True,), [1]))
+def test_target_observation_requires_canonical_unique_units(units: object) -> None:
+    """Remote unit identities are immutable, ordered, and duplicate-free."""
+    with pytest.raises((TypeError, ValueError)):
+        TargetObservation("HAOBSERVED", units)  # type: ignore[arg-type]

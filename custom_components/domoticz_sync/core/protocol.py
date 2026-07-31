@@ -18,7 +18,11 @@ from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
-from .reconciliation import ReconciliationAction, ReconciliationActionKind
+from .reconciliation import (
+    ReconciliationAction,
+    ReconciliationActionKind,
+    derive_domoticz_target_id,
+)
 
 PROTOCOL_VERSION_V1 = 1
 # Backward-compatible public name retained for the frozen legacy v1 codec.
@@ -2192,6 +2196,7 @@ __all__ = [
     "create_server_proof",
     "create_v2_client_proof",
     "create_v2_server_proof",
+    "derive_domoticz_target_id",
     "derive_session_id",
     "derive_session_key",
     "derive_v2_session_id",

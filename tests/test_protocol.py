@@ -70,6 +70,7 @@ from custom_components.domoticz_sync.core.protocol import (
     create_server_proof,
     create_v2_client_proof,
     create_v2_server_proof,
+    derive_domoticz_target_id,
     derive_session_id,
     derive_session_key,
     derive_v2_session_id,
@@ -1447,6 +1448,13 @@ def test_inventory_feature_negotiates_independently_for_mixed_v2_peers() -> None
         server_features=inventory_features,
     ).selection.supports(
         FEATURE_DOMOTICZ_INVENTORY_V1
+    )
+
+
+def test_domoticz_target_id_derivation_is_shared_and_stable() -> None:
+    """Both hosts derive the released Domoticz DeviceID from exact provenance."""
+    assert derive_domoticz_target_id(_source_identity()) == (
+        "HAO6H4NLE3AFBHD73RPWCZMPG"
     )
 
 

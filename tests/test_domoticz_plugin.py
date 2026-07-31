@@ -53,8 +53,8 @@ class FakeUnit:
 
     def __init__(self, domoticz, **kwargs):
         self._domoticz = domoticz
+        self._device_id = kwargs.get("DeviceID")
         self.Name = kwargs.get("Name")
-        self.DeviceID = kwargs.get("DeviceID")
         self.Unit = kwargs.get("Unit", 1)
         self.Type = kwargs.get("Type", 0)
         self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
@@ -77,7 +77,7 @@ class FakeUnit:
 
     def Delete(self):
         self.deleted = True
-        device = self._domoticz.devices.get(self.DeviceID)
+        device = self._domoticz.devices.get(self._device_id)
         if device is not None:
             device.Units.pop(self.Unit, None)
 
@@ -85,8 +85,9 @@ class FakeUnit:
 class FakeDevice:
     """Container matching DomoticzEx's extended device model."""
 
-    def __init__(self, domoticz):
+    def __init__(self, domoticz, device_id):
         self._domoticz = domoticz
+        self.DeviceID = device_id
         self._timed_out = 0
         self.Units = {}
 
@@ -111,8 +112,8 @@ class FakeUnitCreator:
         unit = FakeUnit(self._domoticz, **self._kwargs)
         if self._domoticz.persist_creates:
             device = self._domoticz.devices.setdefault(
-                unit.DeviceID,
-                FakeDevice(self._domoticz),
+                unit._device_id,
+                FakeDevice(self._domoticz, unit._device_id),
             )
             device.Units[unit.Unit] = unit
         return unit
@@ -661,6 +662,589 @@ def _send_binary_apply(
         plugin._protocol_selection,
         response.payload,
     )
+
+
+def _inventory_features(monkeypatch, protocol):
+    """Temporarily advertise the dormant inventory feature for runtime tests."""
+    features = tuple(
+        sorted(
+            set(
+                (
+                    *protocol.SUPPORTED_V2_FEATURES,
+                    protocol.FEATURE_DOMOTICZ_INVENTORY_V1,
+                )
+            )
+        )
+    )
+    monkeypatch.setattr(protocol, "SUPPORTED_V2_FEATURES", features)
+    return features
+
+
+def _send_inventory_request(
+    module,
+    plugin,
+    connection,
+    session_key,
+    session_id,
+    *,
+    request_id="inventory-1",
+):
+    """Send one signed inventory request and parse every queued result page."""
+    protocol = module.wire_protocol
+    payload = protocol.build_inventory_request(
+        plugin._protocol_selection,
+        request_id,
+    )
+    envelope = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload=payload,
+    )
+    sent_position = len(connection.sent)
+    last_sequence = plugin._out_sequence
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(envelope)},
+    )
+
+    results = []
+    for sent in connection.sent[sent_position:]:
+        verified = protocol.verify_envelope(
+            session_key,
+            protocol.canonical_json_loads(sent["Payload"]),
+            protocol_version=plugin._protocol_version,
+            expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=session_id,
+            last_sequence=last_sequence,
+        )
+        last_sequence = verified.sequence
+        results.append(
+            protocol.parse_inventory_result(
+                plugin._protocol_selection,
+                verified.payload,
+            )
+        )
+    return tuple(results)
+
+
+def test_inventory_request_returns_complete_deterministic_hardware_snapshot(
+    loaded_plugin,
+    monkeypatch,
+):
+    """The plugin snapshots outer DeviceIDs, empty parents, and ordered Units."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+
+    domoticz.devices["alpha-parent"] = FakeDevice(domoticz, "alpha-parent")
+    module.Domoticz.Unit(
+        Name="Second unit",
+        DeviceID="zulu-parent",
+        Unit=2,
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;ppm", "Calibration": "7"},
+        Used=0,
+        nValue=-1,
+        sValue="12.5",
+    ).Create()
+    module.Domoticz.Unit(
+        Name="First unit",
+        DeviceID="zulu-parent",
+        Unit=1,
+        Type=244,
+        Subtype=73,
+        Switchtype=8,
+        Used=1,
+        nValue=0,
+        sValue="Off",
+    ).Create()
+    domoticz.devices["zulu-parent"].TimedOut = 1
+    assert not hasattr(domoticz.devices["zulu-parent"].Units[1], "DeviceID")
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert results == (
+        protocol.InventoryResult(
+            request_id="inventory-1",
+            status=protocol.InventoryResultStatus.CONFIRMED,
+            page=1,
+            complete=True,
+            targets=(
+                protocol.InventoryTarget(
+                    target_id="alpha-parent",
+                    timed_out=False,
+                    units=(),
+                ),
+                protocol.InventoryTarget(
+                    target_id="zulu-parent",
+                    timed_out=True,
+                    units=(
+                        protocol.InventoryUnit(
+                            unit=1,
+                            name="First unit",
+                            type=244,
+                            subtype=73,
+                            switch_type=8,
+                            used=True,
+                            n_value=0,
+                            s_value="Off",
+                            custom_option=None,
+                            has_other_options=False,
+                        ),
+                        protocol.InventoryUnit(
+                            unit=2,
+                            name="Second unit",
+                            type=243,
+                            subtype=31,
+                            switch_type=0,
+                            used=False,
+                            n_value=-1,
+                            s_value="12.5",
+                            custom_option="1;ppm",
+                            has_other_options=True,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert protocol.assemble_inventory_results(
+        plugin._protocol_selection,
+        "inventory-1",
+        results,
+    ) == results[0].targets
+
+
+def test_empty_inventory_has_one_confirmed_terminal_page(
+    loaded_plugin,
+    monkeypatch,
+):
+    """An empty hardware registry is distinct from an inventory rejection."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+
+    assert _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    ) == (
+        protocol.InventoryResult(
+            request_id="inventory-1",
+            status=protocol.InventoryResultStatus.CONFIRMED,
+            page=1,
+            complete=True,
+            targets=(),
+        ),
+    )
+
+
+def test_inventory_request_pages_one_complete_snapshot(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A large snapshot is sent in ordered, contiguous, bounded pages."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    target_count = protocol.MAX_INVENTORY_TARGETS_PER_PAGE + 1
+    for index in reversed(range(target_count)):
+        target_id = f"parent-{index:03d}"
+        domoticz.devices[target_id] = FakeDevice(domoticz, target_id)
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert tuple(result.page for result in results) == (1, 2)
+    assert tuple(result.complete for result in results) == (False, True)
+    assert tuple(len(result.targets) for result in results) == (
+        protocol.MAX_INVENTORY_TARGETS_PER_PAGE,
+        1,
+    )
+    assembled = protocol.assemble_inventory_results(
+        plugin._protocol_selection,
+        "inventory-1",
+        results,
+    )
+    assert tuple(target.target_id for target in assembled) == tuple(
+        f"parent-{index:03d}" for index in range(target_count)
+    )
+
+
+def test_inventory_request_pages_snapshot_by_canonical_byte_size(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Payload bytes can split a page before its target-count ceiling."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    target_count = (
+        protocol.MAX_INVENTORY_PAYLOAD_BYTES
+        // protocol.MAX_INVENTORY_S_VALUE_BYTES
+    ) + 1
+    for index in range(target_count):
+        target_id = f"large-parent-{index:03d}"
+        device = FakeDevice(domoticz, target_id)
+        device.Units[1] = FakeUnit(
+            domoticz,
+            DeviceID=target_id,
+            Unit=1,
+            Name="Large unit",
+            sValue="v" * protocol.MAX_INVENTORY_S_VALUE_BYTES,
+        )
+        domoticz.devices[target_id] = device
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert len(results) > 1
+    assert all(
+        len(result.targets) < protocol.MAX_INVENTORY_TARGETS_PER_PAGE
+        for result in results
+    )
+    assembled = protocol.assemble_inventory_results(
+        plugin._protocol_selection,
+        "inventory-1",
+        results,
+    )
+    assert len(assembled) == target_count
+
+
+def test_inventory_target_larger_than_one_page_is_safely_rejected(
+    loaded_plugin,
+    monkeypatch,
+):
+    """One atomic parent that cannot fit a page never produces partial data."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    target_id = "oversized-parent"
+    device = FakeDevice(domoticz, target_id)
+    unit_count = (
+        protocol.MAX_INVENTORY_PAYLOAD_BYTES
+        // protocol.MAX_INVENTORY_S_VALUE_BYTES
+    ) + 1
+    for unit_number in range(1, unit_count + 1):
+        device.Units[unit_number] = FakeUnit(
+            domoticz,
+            DeviceID=target_id,
+            Unit=unit_number,
+            Name="Large unit",
+            sValue="v" * protocol.MAX_INVENTORY_S_VALUE_BYTES,
+        )
+    domoticz.devices[target_id] = device
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert results == (
+        protocol.InventoryResult(
+            request_id="inventory-1",
+            status=protocol.InventoryResultStatus.REJECTED,
+            page=1,
+            complete=True,
+            targets=(),
+        ),
+    )
+
+
+def test_inventory_pages_are_prebuilt_before_any_confirmed_page_is_sent(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A later page build failure produces only one sanitized rejection."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    for index in reversed(range(protocol.MAX_INVENTORY_TARGETS_PER_PAGE + 1)):
+        target_id = f"parent-{index:03d}"
+        domoticz.devices[target_id] = FakeDevice(domoticz, target_id)
+
+    original_builder = protocol.build_inventory_result
+
+    def fail_second_confirmed_page(selection, result):
+        if (
+            result.status is protocol.InventoryResultStatus.CONFIRMED
+            and result.page == 2
+        ):
+            raise protocol.ProtocolFormatError("invalid protocol message")
+        return original_builder(selection, result)
+
+    monkeypatch.setattr(
+        protocol,
+        "build_inventory_result",
+        fail_second_confirmed_page,
+    )
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert results == (
+        protocol.InventoryResult(
+            request_id="inventory-1",
+            status=protocol.InventoryResultStatus.REJECTED,
+            page=1,
+            complete=True,
+            targets=(),
+        ),
+    )
+
+
+def test_invalid_domoticz_inventory_is_rejected_without_value_disclosure(
+    loaded_plugin,
+    monkeypatch,
+):
+    """Invalid local fields never become partial results or log details."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    secret_marker = "inventory-private-value"
+    module.Domoticz.Unit(
+        Name=secret_marker,
+        DeviceID="invalid-parent",
+        Unit=1,
+        Type=244,
+        Subtype=73,
+        Switchtype=0,
+        Used=1,
+        nValue=0,
+        sValue=secret_marker,
+    ).Create()
+    domoticz.devices["invalid-parent"].Units[1].Used = 2
+
+    results = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+
+    assert results[0].status is protocol.InventoryResultStatus.REJECTED
+    assert results[0].targets == ()
+    logs = "\n".join(domoticz.logs + domoticz.statuses + domoticz.errors)
+    assert secret_marker not in logs
+
+
+def test_second_inventory_request_in_one_session_is_a_protocol_violation(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A completed snapshot cannot be replaced later in the same session."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    repeated = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload=protocol.build_inventory_request(
+            plugin._protocol_selection,
+            "inventory-2",
+        ),
+    )
+
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(repeated)},
+    )
+
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert connection.sent[-1]["Operation"] == "Close"
+
+
+def test_inventory_request_without_negotiated_feature_closes_without_result(
+    loaded_plugin,
+):
+    """A dormant inventory feature cannot be invoked by an older v2 peer."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+    )
+    assert not plugin._protocol_selection.supports(
+        protocol.FEATURE_DOMOTICZ_INVENTORY_V1
+    )
+    request = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload={
+            "schema": 1,
+            "type": "inventory_request",
+            "request_id": "inventory-1",
+        },
+    )
+    sent_position = len(connection.sent)
+
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(request)},
+    )
+
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
+    assert connection.sent[sent_position:] == [connection.sent[-1]]
+    assert connection.sent[-1]["Operation"] == "Close"
+    assert "Payload" not in connection.sent[-1]
+
+
+def test_inventory_request_guard_resets_after_reconnect(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A fresh authenticated session may request its own single snapshot."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    features = _inventory_features(monkeypatch, protocol)
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=features,
+    )
+    first = _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    assert first[0].status is protocol.InventoryResultStatus.CONFIRMED
+    assert plugin._inventory_requested
+
+    plugin.onDisconnect(connection)
+    assert not plugin._inventory_requested
+    plugin.onHeartbeat()
+    reconnected = plugin.connection
+    reconnected.connecting = False
+    reconnected.connected = True
+    plugin.onConnect(reconnected, 0, "ignored")
+    plugin.onMessage(reconnected, _upgrade_response(reconnected))
+    next_key, next_session_id = _complete_handshake(
+        module,
+        plugin,
+        reconnected,
+        server_features=features,
+    )
+
+    second = _send_inventory_request(
+        module,
+        plugin,
+        reconnected,
+        next_key,
+        next_session_id,
+        request_id="inventory-2",
+    )
+
+    assert second[0].status is protocol.InventoryResultStatus.CONFIRMED
+    assert second[0].request_id == "inventory-2"
 
 
 def test_plugin_metadata_supports_direct_repository_clone():

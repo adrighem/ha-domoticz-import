@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
@@ -15,9 +16,10 @@ from .catalog_storage import (
 )
 from .const import CONF_EXPORT_LABEL_ID
 from .core.capabilities import Capability, CapabilityKind
-from .core.catalog import CatalogFormatError
+from .core.catalog import CatalogFormatError, TargetCatalog, catalog_from_document
 from .core.execution import (
     ApplyConfirmation,
+    CatalogStorage,
     CatalogStorageError,
     ExecutionConflictError,
     ExecutionReport,
@@ -26,22 +28,36 @@ from .core.execution import (
     TargetActionError,
 )
 from .core.protocol import (
+    FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
+    INVENTORY_TIMEOUT_SECONDS,
+    MAX_INVENTORY_PAGES,
+    MAX_INVENTORY_TARGETS,
+    MAX_INVENTORY_UNITS,
     ApplyResult,
     ApplyResultStatus,
+    InventoryResult,
+    InventoryTarget,
     ProtocolError,
+    ProtocolFormatError,
+    assemble_inventory_results,
     build_apply,
     build_binary_apply,
+    build_inventory_request,
     generate_request_id,
     parse_apply_result,
     parse_binary_apply_result,
+    parse_inventory_result,
     validate_nonce,
 )
 from .core.reconciliation import (
     ReconciliationAction,
     ReconciliationActionKind,
     SourceScope,
+    TargetBindingError,
+    TargetObservation,
+    validate_deterministic_target_ownership,
 )
 from .home_assistant_source import (
     ExportExclusion,
@@ -55,7 +71,33 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 APPLY_TIMEOUT = 10.0
+INVENTORY_TIMEOUT = float(INVENTORY_TIMEOUT_SECONDS)
 _SOURCE_SYSTEM = "home_assistant"
+
+
+class _PreloadedCatalogStorage:
+    """Reuse one catalog document loaded during inventory preflight."""
+
+    def __init__(
+        self,
+        storage: CatalogStorage,
+        document: Mapping[str, object] | None,
+    ) -> None:
+        """Keep the delegate and its already validated load result."""
+        self._storage = storage
+        self._document = document
+        self._loaded = False
+
+    async def async_load(self) -> Mapping[str, object] | None:
+        """Return the preflight document exactly once to its executor."""
+        if self._loaded:
+            raise CatalogStorageError("target catalog storage is unavailable")
+        self._loaded = True
+        return self._document
+
+    async def async_save(self, document: Mapping[str, object]) -> None:
+        """Delegate atomic persistence after inventory-aware execution."""
+        await self._storage.async_save(document)
 
 
 class DomoticzSessionTargetAdapter:
@@ -166,7 +208,23 @@ class HomeAssistantExportApplication:
                 label_id=label_id,
                 included_kinds=frozenset(included_kinds),
             )
+            observations: tuple[TargetObservation, ...] | None = None
+            staged_storages: dict[CapabilityKind, CatalogStorage] = {}
+            if session.supports(FEATURE_DOMOTICZ_INVENTORY_V1):
+                inventory = await _async_fetch_inventory(session)
+                observations = tuple(
+                    TargetObservation(
+                        target.target_id,
+                        tuple(unit.unit for unit in target.units),
+                    )
+                    for target in inventory
+                )
+                staged_storages = await self._async_preload_catalogs(
+                    session,
+                    collection.capabilities,
+                )
             self._report_exclusions(session, collection.exclusions)
+
             reports: list[ExecutionReport] = []
             if numeric_enabled:
                 report = await self._async_reconcile_kind(
@@ -174,6 +232,8 @@ class HomeAssistantExportApplication:
                     instance_id,
                     collection.capabilities,
                     kind=CapabilityKind.NUMERIC,
+                    observations=observations,
+                    storage=staged_storages.get(CapabilityKind.NUMERIC),
                 )
                 self._ensure_persistence_confirmed(report)
                 reports.append(report)
@@ -183,6 +243,8 @@ class HomeAssistantExportApplication:
                     instance_id,
                     collection.capabilities,
                     kind=CapabilityKind.BINARY,
+                    observations=observations,
+                    storage=staged_storages.get(CapabilityKind.BINARY),
                 )
                 self._ensure_persistence_confirmed(report)
                 reports.append(report)
@@ -191,6 +253,7 @@ class HomeAssistantExportApplication:
             CatalogStorageError,
             ExecutionConflictError,
             ExportLabelNotFoundError,
+            TargetBindingError,
         ) as error:
             raise ProtocolError("export reconciliation is unavailable") from error
 
@@ -229,28 +292,76 @@ class HomeAssistantExportApplication:
         capabilities: tuple[Capability, ...],
         *,
         kind: CapabilityKind,
+        observations: tuple[TargetObservation, ...] | None = None,
+        storage: CatalogStorage | None = None,
     ) -> ExecutionReport:
         """Reconcile one negotiated kind in its independent target catalog."""
         if kind is CapabilityKind.NUMERIC:
             adapter = DomoticzSessionTargetAdapter(session)
-            storage = HomeAssistantCatalogStorage(
-                self._hass,
-                entry_id=session.entry_id,
-                destination_id=session.destination_id,
-            )
         elif kind is CapabilityKind.BINARY:
             adapter = DomoticzBinarySessionTargetAdapter(session)
-            storage = HomeAssistantBinaryCatalogStorage(
-                self._hass,
-                entry_id=session.entry_id,
-                destination_id=session.destination_id,
-            )
         else:
             raise ValueError("unsupported export capability kind")
+        if storage is None:
+            storage = self._storage_for_kind(session, kind)
         executor = ReconciliationExecutor(adapter, storage)
-        return await executor.async_reconcile(
-            SourceScope(_SOURCE_SYSTEM, instance_id),
-            (capability for capability in capabilities if capability.kind is kind),
+        scope = SourceScope(_SOURCE_SYSTEM, instance_id)
+        current = tuple(
+            capability for capability in capabilities if capability.kind is kind
+        )
+        if observations is None:
+            return await executor.async_reconcile(scope, current)
+        return await executor.async_reconcile(scope, current, observations)
+
+    async def _async_preload_catalogs(
+        self,
+        session: BridgeApplicationSession,
+        capabilities: tuple[Capability, ...],
+    ) -> dict[CapabilityKind, CatalogStorage]:
+        """Load and jointly validate all catalogs before the first target write."""
+        ordered_kinds = (CapabilityKind.BINARY, CapabilityKind.NUMERIC)
+        storages = tuple(
+            self._storage_for_kind(session, kind) for kind in ordered_kinds
+        )
+        documents = await asyncio.gather(
+            *(storage.async_load() for storage in storages)
+        )
+        catalogs = tuple(
+            TargetCatalog()
+            if document is None
+            else catalog_from_document(document)
+            for document in documents
+        )
+        validate_deterministic_target_ownership(
+            capabilities,
+            (record for catalog in catalogs for record in catalog.records),
+        )
+        return {
+            kind: _PreloadedCatalogStorage(storage, document)
+            for kind, storage, document in zip(
+                ordered_kinds,
+                storages,
+                documents,
+                strict=True,
+            )
+        }
+
+    def _storage_for_kind(
+        self,
+        session: BridgeApplicationSession,
+        kind: CapabilityKind,
+    ) -> CatalogStorage:
+        """Build one destination-scoped catalog adapter for a capability kind."""
+        if kind is CapabilityKind.NUMERIC:
+            storage_type = HomeAssistantCatalogStorage
+        elif kind is CapabilityKind.BINARY:
+            storage_type = HomeAssistantBinaryCatalogStorage
+        else:
+            raise ValueError("unsupported export capability kind")
+        return storage_type(
+            self._hass,
+            entry_id=session.entry_id,
+            destination_id=session.destination_id,
         )
 
     def _report_exclusions(
@@ -272,6 +383,60 @@ class HomeAssistantExportApplication:
                 exclusion.reason.value,
             )
         self._reported_exclusions[key] = current
+
+
+async def _async_fetch_inventory(
+    session: BridgeApplicationSession,
+) -> tuple[InventoryTarget, ...]:
+    """Request and fully stage one bounded inventory before reconciliation."""
+    request_id = generate_request_id()
+    pages: list[InventoryResult] = []
+    target_count = 0
+    unit_count = 0
+    previous_target_id: str | None = None
+
+    async with asyncio.timeout(INVENTORY_TIMEOUT):
+        await session.async_send(
+            build_inventory_request(session.selection, request_id)
+        )
+        while True:
+            payload = await session.async_receive()
+            if isinstance(payload, dict) and payload.get("type") == "ping":
+                ping_id = _parse_ping(payload)
+                await session.async_send({"id": ping_id, "type": "pong"})
+                continue
+
+            result = parse_inventory_result(session.selection, payload)
+            expected_page = len(pages) + 1
+            if (
+                expected_page > MAX_INVENTORY_PAGES
+                or result.request_id != request_id
+                or result.page != expected_page
+            ):
+                raise ProtocolFormatError("invalid protocol message")
+
+            for target in result.targets:
+                if (
+                    previous_target_id is not None
+                    and target.target_id <= previous_target_id
+                ):
+                    raise ProtocolFormatError("invalid protocol message")
+                previous_target_id = target.target_id
+                target_count += 1
+                unit_count += len(target.units)
+                if (
+                    target_count > MAX_INVENTORY_TARGETS
+                    or unit_count > MAX_INVENTORY_UNITS
+                ):
+                    raise ProtocolFormatError("invalid protocol message")
+
+            pages.append(result)
+            if result.complete:
+                return assemble_inventory_results(
+                    session.selection,
+                    request_id,
+                    pages,
+                )
 
 
 def _parse_ping(payload: dict[str, object]) -> str:

@@ -7,6 +7,7 @@ import base64
 import importlib.util
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -46,6 +47,7 @@ from pytest_homeassistant_custom_component.typing import (  # noqa: E402
     ClientSessionGenerator,
 )
 
+from custom_components.domoticz_sync import bridge as bridge_module  # noqa: E402
 from custom_components.domoticz_sync.bridge import (  # noqa: E402
     BridgeApplicationSession,
     DomoticzBridgeManager,
@@ -67,12 +69,53 @@ from custom_components.domoticz_sync.core.catalog import (  # noqa: E402
     catalog_from_document,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
+    DIRECTION_DOMOTICZ_TO_HA,
+    DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_DOMOTICZ_INVENTORY_V1,
+    InventoryResult,
+    InventoryTarget,
+    ProtocolSelection,
+    assemble_inventory_results,
+    canonical_json_loads,
     generate_link_id,
     generate_pairing_key,
+    parse_inventory_request,
+    parse_inventory_result,
+    verify_envelope,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 _MISSING = object()
+
+
+@dataclass(frozen=True)
+class _InventoryExchange:
+    """One authenticated, fully assembled inventory observed by the test."""
+
+    request_id: str
+    pages: tuple[InventoryResult, ...]
+    targets: tuple[InventoryTarget, ...]
+
+
+def _enable_inventory_negotiation(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_module: ModuleType,
+) -> None:
+    """Opt this test into the dormant Phase 5.2 inventory feature."""
+    features = tuple(
+        sorted(
+            {
+                *bridge_module.SUPPORTED_V2_FEATURES,
+                FEATURE_DOMOTICZ_INVENTORY_V1,
+            }
+        )
+    )
+    monkeypatch.setattr(bridge_module, "SUPPORTED_V2_FEATURES", features)
+    monkeypatch.setattr(
+        plugin_module.wire_protocol,
+        "SUPPORTED_V2_FEATURES",
+        features,
+    )
 
 
 class _FakeConnection:
@@ -109,7 +152,6 @@ class _FakeUnit:
     def __init__(self, domoticz: _FakeDomoticz, **kwargs: object) -> None:
         self._domoticz = domoticz
         self.Name = kwargs.get("Name")
-        self.DeviceID = kwargs.get("DeviceID")
         self.Unit = kwargs.get("Unit", 1)
         self.Type = kwargs.get("Type", 0)
         self.SubType = kwargs.get("Subtype", kwargs.get("SubType", 0))
@@ -131,7 +173,8 @@ class _FakeUnit:
 class _FakeDevice:
     """Container matching DomoticzEx's extended device model."""
 
-    def __init__(self) -> None:
+    def __init__(self, target_id: str) -> None:
+        self.DeviceID = target_id
         self.TimedOut = 0
         self.Units: dict[int, _FakeUnit] = {}
 
@@ -149,12 +192,13 @@ class _FakeUnitCreator:
 
     def Create(self) -> _FakeUnit:
         self._domoticz.create_calls.append(dict(self._kwargs))
+        target_id = self._kwargs.get("DeviceID")
+        assert isinstance(target_id, str)
         unit = _FakeUnit(self._domoticz, **self._kwargs)
-        assert isinstance(unit.DeviceID, str)
         assert isinstance(unit.Unit, int)
         device = self._domoticz.devices.setdefault(
-            unit.DeviceID,
-            _FakeDevice(),
+            target_id,
+            _FakeDevice(target_id),
         )
         device.Units[unit.Unit] = unit
         return unit
@@ -258,6 +302,82 @@ async def _receive_text(websocket: object) -> str:
     return message.data
 
 
+def _selected_protocol(plugin: object) -> ProtocolSelection:
+    """Translate the plugin's isolated vendored selection into the HA core."""
+    selected = plugin._protocol_selection
+    return ProtocolSelection(
+        version=selected.version,
+        websocket_subprotocol=selected.websocket_subprotocol,
+        features=tuple(selected.features),
+    )
+
+
+async def _exchange_complete_inventory(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+) -> tuple[int, _InventoryExchange]:
+    """Exchange and independently verify one complete signed inventory."""
+    selection = _selected_protocol(plugin)
+    assert selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+
+    request_text = await _receive_text(websocket)
+    request_document = canonical_json_loads(request_text)
+    request = verify_envelope(
+        plugin._session_key,
+        request_document,
+        protocol_version=selection.version,
+        expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+        expected_session_id=plugin._session_id,
+        last_sequence=plugin._in_sequence,
+    )
+    request_id = parse_inventory_request(selection, request.payload)
+    response_sequence = plugin._out_sequence
+    plugin.onMessage(connection, {"Payload": request_text})
+
+    pages = []
+    while True:
+        result_text, send_position = _next_text_payload(
+            connection,
+            send_position,
+        )
+        result_document = canonical_json_loads(result_text)
+        verified = verify_envelope(
+            plugin._session_key,
+            result_document,
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=plugin._session_id,
+            last_sequence=response_sequence,
+        )
+        response_sequence = verified.sequence
+        result = parse_inventory_result(selection, verified.payload)
+        assert result.request_id == request_id
+        pages.append(result)
+        await websocket.send_str(result_text)
+        if result.complete:
+            break
+
+        # A partial snapshot cannot authorize an apply. A multi-page test below
+        # makes this assertion observable with a selected HA source present.
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await websocket.receive()
+
+    targets = assemble_inventory_results(
+        selection,
+        request_id,
+        tuple(pages),
+    )
+    assert pages[-1].complete is True
+    return send_position, _InventoryExchange(
+        request_id=request_id,
+        pages=tuple(pages),
+        targets=targets,
+    )
+
+
 class _ObservedApplication:
     """Record successful runs while delegating to the real application."""
 
@@ -337,7 +457,13 @@ async def _open_plugin_connection(
     fake_domoticz: _FakeDomoticz,
     client: object,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[object, _FakeConnection, object, int]:
+) -> tuple[
+    object,
+    _FakeConnection,
+    object,
+    int,
+    _InventoryExchange | None,
+]:
     """Connect the real plugin through authentication and application ready."""
     plugin = plugin_module.DomoticzSyncPlugin()
     plugin.onStart()
@@ -398,15 +524,26 @@ async def _open_plugin_connection(
         {"Payload": await _receive_text(websocket)},
     )
 
-    inventory, send_position = _next_text_payload(connection, send_position)
-    await websocket.send_str(inventory)
+    application_ready, send_position = _next_text_payload(
+        connection,
+        send_position,
+    )
+    await websocket.send_str(application_ready)
     plugin.onMessage(
         connection,
         {"Payload": await _receive_text(websocket)},
     )
 
     assert plugin.phase == plugin_module.PHASE_READY
-    return plugin, connection, websocket, send_position
+    inventory = None
+    if _selected_protocol(plugin).supports(FEATURE_DOMOTICZ_INVENTORY_V1):
+        send_position, inventory = await _exchange_complete_inventory(
+            plugin,
+            connection,
+            websocket,
+            send_position,
+        )
+    return plugin, connection, websocket, send_position, inventory
 
 
 async def _exchange_one_apply(
@@ -540,8 +677,11 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
             {"Payload": await _receive_text(websocket)},
         )
 
-        inventory, send_position = _next_text_payload(connection, send_position)
-        await websocket.send_str(inventory)
+        application_ready, send_position = _next_text_payload(
+            connection,
+            send_position,
+        )
+        await websocket.send_str(application_ready)
         plugin.onMessage(
             connection,
             {"Payload": await _receive_text(websocket)},
@@ -687,12 +827,21 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         link_id=link_id,
         pairing_key=pairing_key,
     )
+    _enable_inventory_negotiation(monkeypatch, plugin_module)
+
+    # Force a two-page snapshot so the test observes that no apply is sent
+    # after page 1. Empty containers are valid hardware-scoped inventory and
+    # remain unrelated to the HA catalog.
+    for index in range(65):
+        target_id = f"FOREIGN{index:018d}"
+        fake_domoticz.devices[target_id] = _FakeDevice(target_id)
 
     (
         first,
         first_connection,
         first_websocket,
         first_position,
+        first_inventory,
     ) = await _open_plugin_connection(
         plugin_module,
         fake_domoticz,
@@ -701,6 +850,10 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
     )
     destination_id = first._destination_id
     assert isinstance(destination_id, str)
+    assert first_inventory is not None
+    assert len(first_inventory.pages) == 2
+    assert len(first_inventory.targets) == 65
+    assert all(not target.units for target in first_inventory.targets)
     try:
         first_position = await _exchange_one_apply(
             first,
@@ -750,6 +903,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         second_connection,
         second_websocket,
         second_position,
+        second_inventory,
     ) = await _open_plugin_connection(
         plugin_module,
         fake_domoticz,
@@ -757,6 +911,33 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         monkeypatch,
     )
     try:
+        assert second_inventory is not None
+        assert len(second_inventory.pages) == 2
+        assert len(second_inventory.targets) == 66
+        observed_target = next(
+            target
+            for target in second_inventory.targets
+            if target.target_id == target_id
+        )
+        assert observed_target.timed_out is False
+        assert len(observed_target.units) == 1
+        observed_unit = observed_target.units[0]
+        assert observed_unit.unit == 1
+        assert observed_unit.name == source_name
+        assert observed_unit.type == expected_type
+        assert observed_unit.subtype == expected_subtype
+        assert observed_unit.switch_type == 0
+        assert observed_unit.used is True
+        assert observed_unit.n_value == 0
+        assert observed_unit.s_value == "12.5"
+        second_position = await _exchange_one_apply(
+            second,
+            second_connection,
+            second_websocket,
+            second_position,
+            application,
+            2,
+        )
         await application.async_wait_for_calls(2)
         assert second._destination_id == destination_id
         assert second_position == len(second_connection.sent)
@@ -782,6 +963,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         third_connection,
         third_websocket,
         third_position,
+        third_inventory,
     ) = await _open_plugin_connection(
         plugin_module,
         fake_domoticz,
@@ -789,6 +971,13 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
         monkeypatch,
     )
     try:
+        assert third_inventory is not None
+        before_update = next(
+            target
+            for target in third_inventory.targets
+            if target.target_id == target_id
+        )
+        assert before_update.units[0].s_value == "12.5"
         third_position = await _exchange_one_apply(
             third,
             third_connection,
@@ -882,19 +1071,27 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         link_id=link_id,
         pairing_key=pairing_key,
     )
+    _enable_inventory_negotiation(monkeypatch, plugin_module)
 
     async def open_and_reconcile(
         expected_call: int,
         *,
         expect_apply: bool,
-    ) -> tuple[object, _FakeConnection, object, int]:
+    ) -> tuple[
+        object,
+        _FakeConnection,
+        object,
+        int,
+        _InventoryExchange,
+    ]:
         opened = await _open_plugin_connection(
             plugin_module,
             fake_domoticz,
             client,
             monkeypatch,
         )
-        plugin, connection, websocket, position = opened
+        plugin, connection, websocket, position, inventory = opened
+        assert inventory is not None
         if expect_apply:
             position = await _exchange_one_apply(
                 plugin,
@@ -905,11 +1102,15 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
                 expected_call,
             )
         await application.async_wait_for_calls(expected_call)
-        return plugin, connection, websocket, position
+        return plugin, connection, websocket, position, inventory
 
-    first, first_connection, first_websocket, first_position = await open_and_reconcile(
-        1, expect_apply=True
-    )
+    (
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+        first_inventory,
+    ) = await open_and_reconcile(1, expect_apply=True)
     destination_id = first._destination_id
     assert isinstance(destination_id, str)
     binary_storage = HomeAssistantBinaryCatalogStorage(
@@ -923,6 +1124,7 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         destination_id=destination_id,
     )
     try:
+        assert first_inventory.targets == ()
         catalog = catalog_from_document(await binary_storage.async_load())
         assert len(catalog.records) == 1
         record = catalog.records[0]
@@ -956,8 +1158,23 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         second_connection,
         second_websocket,
         second_position,
-    ) = await open_and_reconcile(2, expect_apply=False)
+        second_inventory,
+    ) = await open_and_reconcile(2, expect_apply=True)
     try:
+        assert len(second_inventory.targets) == 1
+        observed_target = second_inventory.targets[0]
+        assert observed_target.target_id == target_id
+        assert observed_target.timed_out is False
+        assert len(observed_target.units) == 1
+        observed_unit = observed_target.units[0]
+        assert observed_unit.unit == 1
+        assert observed_unit.name == "Hall motion"
+        assert observed_unit.type == 244
+        assert observed_unit.subtype == 73
+        assert observed_unit.switch_type == 8
+        assert observed_unit.used is True
+        assert observed_unit.n_value == 1
+        assert observed_unit.s_value == "On"
         assert second._destination_id == destination_id
         assert second_position == len(second_connection.sent)
         assert len(fake_domoticz.create_calls) == 1
@@ -972,10 +1189,15 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         )
 
     hass.states.async_set(source_entry.entity_id, STATE_OFF, state_attributes)
-    third, third_connection, third_websocket, third_position = await open_and_reconcile(
-        3, expect_apply=True
-    )
+    (
+        third,
+        third_connection,
+        third_websocket,
+        third_position,
+        third_inventory,
+    ) = await open_and_reconcile(3, expect_apply=True)
     try:
+        assert third_inventory.targets[0].units[0].s_value == "On"
         updated_storage = HomeAssistantBinaryCatalogStorage(
             hass,
             entry_id=entry.entry_id,
@@ -1009,8 +1231,11 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         fourth_connection,
         fourth_websocket,
         fourth_position,
+        fourth_inventory,
     ) = await open_and_reconcile(4, expect_apply=True)
     try:
+        assert fourth_inventory.targets[0].units[0].s_value == "Off"
+        assert fourth_inventory.targets[0].timed_out is False
         unavailable_storage = HomeAssistantBinaryCatalogStorage(
             hass,
             entry_id=entry.entry_id,
@@ -1041,10 +1266,15 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
     # restart clearing it while Home Assistant still has the same unavailable
     # snapshot and catalog record.
     fake_domoticz.devices[target_id].TimedOut = 0
-    fifth, fifth_connection, fifth_websocket, fifth_position = await open_and_reconcile(
-        5, expect_apply=True
-    )
+    (
+        fifth,
+        fifth_connection,
+        fifth_websocket,
+        fifth_position,
+        fifth_inventory,
+    ) = await open_and_reconcile(5, expect_apply=True)
     try:
+        assert fifth_inventory.targets[0].timed_out is False
         assert fifth._destination_id == destination_id
         assert len(fake_domoticz.create_calls) == 1
         assert fake_domoticz.devices[target_id].Units[1] is unit

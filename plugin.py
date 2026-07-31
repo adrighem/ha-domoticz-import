@@ -149,6 +149,10 @@ class DomoticzApplyError(Exception):
     """Raised when a requested target state cannot be confirmed."""
 
 
+class DomoticzInventoryError(Exception):
+    """Raised when a complete local inventory cannot be represented safely."""
+
+
 def _canonical_destination_id(value):
     if not isinstance(value, str):
         raise PluginConfigurationError
@@ -183,22 +187,9 @@ def _header_count(headers, name):
     )
 
 
-def _source_document(source):
-    """Return the exact canonical identity document used for target IDs."""
-    return {
-        "system": source.system,
-        "instance_id": source.instance_id,
-        "object_id": source.object_id,
-        "capability_id": source.capability_id,
-    }
-
-
 def _device_id_for_source(source):
     """Derive one stable Domoticz DeviceID from a complete source identity."""
-    identity = wire_protocol.canonical_json_bytes(_source_document(source))
-    digest = hashlib.sha256(identity).digest()
-    encoded = base64.b32encode(digest).decode("ascii").rstrip("=")
-    return "HA" + encoded[:23]
+    return wire_protocol.derive_domoticz_target_id(source)
 
 
 def _numeric_s_value(value):
@@ -552,6 +543,7 @@ class DomoticzSyncPlugin:
         self._last_ping_tick = 0
         self._pending_ping_id = None
         self._pending_ping_tick = 0
+        self._inventory_requested = False
         self._reconnect_delay = 1
         self._reconnect_remaining = 0
 
@@ -966,6 +958,16 @@ class DomoticzSyncPlugin:
                 raise wire_protocol.ProtocolCompatibilityError
             self._handle_binary_apply_payload(payload)
             return
+        if message_type == "inventory_request":
+            if (
+                self._protocol_selection is None
+                or not self._protocol_selection.supports(
+                    wire_protocol.FEATURE_DOMOTICZ_INVENTORY_V1
+                )
+            ):
+                raise wire_protocol.ProtocolCompatibilityError
+            self._handle_inventory_request(payload)
+            return
 
         message_id = payload.get("id")
         if set(payload) != {"type", "id"}:
@@ -979,6 +981,206 @@ class DomoticzSyncPlugin:
             self._last_ping_tick = self._heartbeat_tick
             return
         raise wire_protocol.ProtocolFormatError
+
+    def _handle_inventory_request(self, payload):
+        """Return one complete, bounded snapshot or one sanitized rejection."""
+        request_id = wire_protocol.parse_inventory_request(
+            self._protocol_selection,
+            payload,
+        )
+        if self._inventory_requested:
+            raise wire_protocol.ProtocolFormatError
+        self._inventory_requested = True
+
+        try:
+            targets = self._collect_inventory_targets()
+            result_payloads = self._build_inventory_result_payloads(
+                request_id,
+                targets,
+            )
+        except Exception:
+            rejected = wire_protocol.InventoryResult(
+                request_id=request_id,
+                status=wire_protocol.InventoryResultStatus.REJECTED,
+                page=1,
+                complete=True,
+                targets=(),
+            )
+            result_payloads = (
+                wire_protocol.build_inventory_result(
+                    self._protocol_selection,
+                    rejected,
+                ),
+            )
+
+        for result_payload in result_payloads:
+            self._send_signed(result_payload)
+
+    @classmethod
+    def _collect_inventory_targets(cls):
+        """Snapshot every parent and unit owned by this plugin hardware."""
+        devices = globals().get("Devices")
+        if type(devices) is not dict:
+            raise DomoticzInventoryError
+
+        device_items = tuple(devices.items())
+        if len(device_items) > wire_protocol.MAX_INVENTORY_TARGETS:
+            raise DomoticzInventoryError
+        if any(type(target_id) is not str for target_id, _device in device_items):
+            raise DomoticzInventoryError
+
+        targets = []
+        total_units = 0
+        for target_id, device in sorted(device_items, key=lambda item: item[0]):
+            if getattr(device, "DeviceID", None) != target_id:
+                raise DomoticzInventoryError
+            timed_out = cls._inventory_flag(getattr(device, "TimedOut", None))
+            units = getattr(device, "Units", None)
+            if type(units) is not dict:
+                raise DomoticzInventoryError
+
+            unit_items = tuple(units.items())
+            if any(type(unit_number) is not int for unit_number, _unit in unit_items):
+                raise DomoticzInventoryError
+            total_units += len(unit_items)
+            if total_units > wire_protocol.MAX_INVENTORY_UNITS:
+                raise DomoticzInventoryError
+
+            inventory_units = tuple(
+                cls._collect_inventory_unit(unit_number, unit)
+                for unit_number, unit in sorted(unit_items, key=lambda item: item[0])
+            )
+            targets.append(
+                wire_protocol.InventoryTarget(
+                    target_id=target_id,
+                    timed_out=timed_out,
+                    units=inventory_units,
+                )
+            )
+        return tuple(targets)
+
+    @classmethod
+    def _collect_inventory_unit(cls, unit_number, unit):
+        """Normalize one real DomoticzEx Unit without exposing extra options."""
+        actual_unit = getattr(unit, "Unit", None)
+        if type(actual_unit) is not int or actual_unit != unit_number:
+            raise DomoticzInventoryError
+
+        options = getattr(unit, "Options", None)
+        if type(options) is not dict or any(
+            type(key) is not str or type(value) is not str
+            for key, value in options.items()
+        ):
+            raise DomoticzInventoryError
+
+        return wire_protocol.InventoryUnit(
+            unit=actual_unit,
+            name=getattr(unit, "Name", None),
+            type=getattr(unit, "Type", None),
+            subtype=getattr(unit, "SubType", None),
+            switch_type=getattr(unit, "SwitchType", None),
+            used=cls._inventory_flag(getattr(unit, "Used", None)),
+            n_value=getattr(unit, "nValue", None),
+            s_value=getattr(unit, "sValue", None),
+            custom_option=options.get("Custom"),
+            has_other_options=any(key != "Custom" for key in options),
+        )
+
+    @staticmethod
+    def _inventory_flag(value):
+        """Normalize one exact Domoticz integer flag to a wire boolean."""
+        if type(value) is not int or value not in {0, 1}:
+            raise DomoticzInventoryError
+        return value == 1
+
+    def _build_inventory_result_payloads(self, request_id, targets):
+        """Build every final page before allowing the first one to be sent."""
+        if not targets:
+            empty = wire_protocol.InventoryResult(
+                request_id=request_id,
+                status=wire_protocol.InventoryResultStatus.CONFIRMED,
+                page=1,
+                complete=True,
+                targets=(),
+            )
+            return (
+                wire_protocol.build_inventory_result(
+                    self._protocol_selection,
+                    empty,
+                ),
+            )
+
+        chunks = []
+        current = ()
+        for position, target in enumerate(targets):
+            candidate = current + (target,)
+            page = len(chunks) + 1
+            complete = position == len(targets) - 1
+            if len(candidate) > wire_protocol.MAX_INVENTORY_TARGETS_PER_PAGE:
+                chunks.append(current)
+                current = (target,)
+                page += 1
+                self._build_inventory_confirmed_payload(
+                    request_id,
+                    page,
+                    complete,
+                    current,
+                )
+                continue
+
+            try:
+                self._build_inventory_confirmed_payload(
+                    request_id,
+                    page,
+                    complete,
+                    candidate,
+                )
+            except wire_protocol.ProtocolFormatError:
+                if not current:
+                    raise
+                chunks.append(current)
+                current = (target,)
+                self._build_inventory_confirmed_payload(
+                    request_id,
+                    page + 1,
+                    complete,
+                    current,
+                )
+            else:
+                current = candidate
+        chunks.append(current)
+
+        if len(chunks) > wire_protocol.MAX_INVENTORY_PAGES:
+            raise DomoticzInventoryError
+        return tuple(
+            self._build_inventory_confirmed_payload(
+                request_id,
+                page,
+                page == len(chunks),
+                chunk,
+            )
+            for page, chunk in enumerate(chunks, start=1)
+        )
+
+    def _build_inventory_confirmed_payload(
+        self,
+        request_id,
+        page,
+        complete,
+        targets,
+    ):
+        """Build and byte-check one confirmed inventory result page."""
+        result = wire_protocol.InventoryResult(
+            request_id=request_id,
+            status=wire_protocol.InventoryResultStatus.CONFIRMED,
+            page=page,
+            complete=complete,
+            targets=targets,
+        )
+        return wire_protocol.build_inventory_result(
+            self._protocol_selection,
+            result,
+        )
 
     def _handle_apply_payload(self, payload):
         """Apply one correlated request and return only a sanitized result."""
@@ -1411,6 +1613,7 @@ class DomoticzSyncPlugin:
         self._out_sequence = 0
         self._in_sequence = 0
         self._pending_ping_id = None
+        self._inventory_requested = False
         self._reset_fragments()
 
     def _reset_fragments(self):

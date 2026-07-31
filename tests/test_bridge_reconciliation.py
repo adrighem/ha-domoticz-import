@@ -27,6 +27,9 @@ from custom_components.domoticz_sync.const import (  # noqa: E402
 from custom_components.domoticz_sync.core import (
     protocol as protocol_module,  # noqa: E402
 )
+from custom_components.domoticz_sync.core import (
+    reconciliation as reconciliation_module,  # noqa: E402
+)
 from custom_components.domoticz_sync.core.capabilities import (  # noqa: E402
     Availability,
     Capability,
@@ -34,28 +37,39 @@ from custom_components.domoticz_sync.core.capabilities import (  # noqa: E402
     SourceIdentity,
 )
 from custom_components.domoticz_sync.core.catalog import (  # noqa: E402
+    TargetCatalog,
     catalog_from_document,
+    catalog_to_document,
 )
 from custom_components.domoticz_sync.core.execution import (  # noqa: E402
     TargetActionError,
 )
 from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
+    FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     PROTOCOL_VERSION_V2,
     WEBSOCKET_SUBPROTOCOL_V2,
     ApplyResultStatus,
+    InventoryResult,
+    InventoryResultStatus,
+    InventoryTarget,
+    InventoryUnit,
     ProtocolError,
     ProtocolSelection,
     build_apply_result,
     build_binary_apply_result,
+    build_inventory_result,
     generate_nonce,
     parse_apply,
     parse_binary_apply,
+    parse_inventory_request,
 )
 from custom_components.domoticz_sync.core.reconciliation import (  # noqa: E402
     ReconciliationAction,
     ReconciliationActionKind,
+    TargetRecord,
+    derive_domoticz_target_id,
 )
 from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E402
     ExportCollection,
@@ -77,6 +91,23 @@ _MIXED_SELECTION = ProtocolSelection(
     version=PROTOCOL_VERSION_V2,
     websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
     features=(
+        FEATURE_HA_EXPORT_BINARY_V1,
+        FEATURE_HA_EXPORT_NUMERIC_V1,
+    ),
+)
+_INVENTORY_SELECTION = ProtocolSelection(
+    version=PROTOCOL_VERSION_V2,
+    websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+    features=(
+        FEATURE_DOMOTICZ_INVENTORY_V1,
+        FEATURE_HA_EXPORT_NUMERIC_V1,
+    ),
+)
+_INVENTORY_MIXED_SELECTION = ProtocolSelection(
+    version=PROTOCOL_VERSION_V2,
+    websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+    features=(
+        FEATURE_DOMOTICZ_INVENTORY_V1,
         FEATURE_HA_EXPORT_BINARY_V1,
         FEATURE_HA_EXPORT_NUMERIC_V1,
     ),
@@ -108,9 +139,11 @@ class _MemoryStorage:
     def __init__(self) -> None:
         self.document = None
         self.saved_documents: list[dict[str, object]] = []
+        self.load_calls = 0
 
     async def async_load(self):
         """Return an isolated durable document."""
+        self.load_calls += 1
         return deepcopy(self.document)
 
     async def async_save(self, document):
@@ -145,7 +178,8 @@ class _Session:
         """Record a payload and enqueue responses to apply requests."""
         self.sent.append(deepcopy(payload))
         if (
-            payload.get("type") in {"apply", "binary_apply"}
+            payload.get("type")
+            in {"apply", "binary_apply", "inventory_request"}
             and self._response_builder is not None
         ):
             self._responses.extend(self._response_builder(payload))
@@ -180,6 +214,69 @@ def _capability(
         name=object_id,
         value=12.5 if kind is CapabilityKind.NUMERIC else True,
         unit="celsius" if kind is CapabilityKind.NUMERIC else None,
+    )
+
+
+def _inventory_unit(
+    *,
+    unit: int = 1,
+    name: str = "sensor-a",
+    type_id: int = 243,
+    subtype: int = 31,
+    switch_type: int = 0,
+    used: bool = True,
+    n_value: int = 0,
+    s_value: str = "12.5",
+    custom_option: str | None = "1;celsius",
+    has_other_options: bool = False,
+) -> InventoryUnit:
+    """Build one representative strict Domoticz inventory unit."""
+    return InventoryUnit(
+        unit=unit,
+        name=name,
+        type=type_id,
+        subtype=subtype,
+        switch_type=switch_type,
+        used=used,
+        n_value=n_value,
+        s_value=s_value,
+        custom_option=custom_option,
+        has_other_options=has_other_options,
+    )
+
+
+def _inventory_target(
+    capability: Capability,
+    *,
+    units: tuple[InventoryUnit, ...] | None = None,
+) -> InventoryTarget:
+    """Build one deterministic inventory target for a source capability."""
+    return InventoryTarget(
+        target_id=derive_domoticz_target_id(capability.source),
+        timed_out=False,
+        units=units if units is not None else (_inventory_unit(name=capability.name),),
+    )
+
+
+def _inventory_page(
+    selection: ProtocolSelection,
+    request_id: str,
+    *,
+    page: int = 1,
+    complete: bool = True,
+    targets: tuple[InventoryTarget, ...] = (),
+    status: InventoryResultStatus = InventoryResultStatus.CONFIRMED,
+) -> dict[str, object]:
+    """Build one exact scripted inventory result payload."""
+    return build_inventory_result(
+        selection,
+        InventoryResult(
+            request_id=request_id,
+            status=status,
+            page=page,
+            complete=complete,
+            targets=targets,
+        ),
     )
 
 
@@ -230,6 +327,41 @@ def _confirmed_mixed_response(
     return _confirmed_response(payload)
 
 
+def _inventory_and_apply_responses(
+    selection: ProtocolSelection,
+    targets: tuple[InventoryTarget, ...] = (),
+):
+    """Build a responder for one inventory followed by normal apply traffic."""
+
+    def responses(payload: dict[str, object]) -> list[dict[str, object]]:
+        if payload.get("type") == "inventory_request":
+            request_id = parse_inventory_request(selection, payload)
+            return [_inventory_page(selection, request_id, targets=targets)]
+        if payload.get("type") == "binary_apply":
+            request = parse_binary_apply(selection, payload)
+            return [
+                build_binary_apply_result(
+                    selection,
+                    request.request_id,
+                    ApplyResultStatus.CONFIRMED,
+                    derive_domoticz_target_id(request.action.capability.source),
+                    request.action.capability.source,
+                )
+            ]
+        request = parse_apply(selection, payload)
+        return [
+            build_apply_result(
+                selection,
+                request.request_id,
+                ApplyResultStatus.CONFIRMED,
+                derive_domoticz_target_id(request.action.capability.source),
+                request.action.capability.source,
+            )
+        ]
+
+    return responses
+
+
 def _configure_application(
     monkeypatch: pytest.MonkeyPatch,
     capabilities: list[Capability],
@@ -265,18 +397,19 @@ def _configure_application(
 
     monkeypatch.setattr(app_module, "HomeAssistantCatalogStorage", make_storage)
 
-    if binary_storage is not None:
+    if binary_storage is None:
+        binary_storage = _MemoryStorage()
 
-        def make_binary_storage(_hass, *, entry_id: str, destination_id: str):
-            assert entry_id == "entry-1"
-            assert destination_id == "destination-1"
-            return binary_storage
+    def make_binary_storage(_hass, *, entry_id: str, destination_id: str):
+        assert entry_id == "entry-1"
+        assert destination_id == "destination-1"
+        return binary_storage
 
-        monkeypatch.setattr(
-            app_module,
-            "HomeAssistantBinaryCatalogStorage",
-            make_binary_storage,
-        )
+    monkeypatch.setattr(
+        app_module,
+        "HomeAssistantBinaryCatalogStorage",
+        make_binary_storage,
+    )
 
 
 @pytest.mark.asyncio
@@ -364,6 +497,303 @@ async def test_application_reconciles_mixed_features_into_separate_catalogs(
         record.capability
         for record in catalog_from_document(binary_storage.document).records
     ] == [binary]
+
+
+@pytest.mark.asyncio
+async def test_inventory_is_complete_before_either_catalog_is_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One staged snapshot precedes both independently persisted catalogs."""
+    numeric = _capability("numeric-source")
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    numeric_storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    _configure_application(
+        monkeypatch,
+        [numeric, binary],
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.NUMERIC, CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    session = _Session(
+        _inventory_and_apply_responses(_INVENTORY_MIXED_SELECTION),
+        selection=_INVENTORY_MIXED_SELECTION,
+    )
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert [payload["type"] for payload in session.sent] == [
+        "inventory_request",
+        "apply",
+        "binary_apply",
+    ]
+    assert numeric_storage.load_calls == 1
+    assert binary_storage.load_calls == 1
+    assert len(numeric_storage.saved_documents) == 1
+    assert len(binary_storage.saved_documents) == 1
+
+
+@pytest.mark.asyncio
+async def test_inventory_accepts_interleaved_ping_before_terminal_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heartbeat traffic is answered while one overall inventory deadline runs."""
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [], storage)
+    ping_id = generate_nonce()
+
+    def responses(payload: dict[str, object]) -> list[dict[str, object]]:
+        request_id = parse_inventory_request(_INVENTORY_SELECTION, payload)
+        return [
+            {"id": ping_id, "type": "ping"},
+            _inventory_page(_INVENTORY_SELECTION, request_id),
+        ]
+
+    session = _Session(responses, selection=_INVENTORY_SELECTION)
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert [payload["type"] for payload in session.sent] == [
+        "inventory_request",
+        "pong",
+    ]
+    assert session.sent[1] == {"id": ping_id, "type": "pong"}
+    assert storage.load_calls == 1
+    assert storage.saved_documents == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("rejected", "request-mismatch", "page-gap", "duplicate", "malformed", "oversized"),
+)
+@pytest.mark.asyncio
+async def test_invalid_inventory_never_loads_or_mutates_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Every invalid complete snapshot fails before storage or target access."""
+    capability = _capability("sensor-a")
+    target = _inventory_target(capability)
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [capability], storage)
+
+    def responses(payload: dict[str, object]) -> list[dict[str, object]]:
+        request_id = parse_inventory_request(_INVENTORY_SELECTION, payload)
+        if failure == "rejected":
+            return [
+                _inventory_page(
+                    _INVENTORY_SELECTION,
+                    request_id,
+                    status=InventoryResultStatus.REJECTED,
+                )
+            ]
+        if failure == "request-mismatch":
+            return [_inventory_page(_INVENTORY_SELECTION, "different-request")]
+        if failure == "page-gap":
+            return [
+                _inventory_page(
+                    _INVENTORY_SELECTION,
+                    request_id,
+                    page=2,
+                    targets=(target,),
+                )
+            ]
+        if failure == "duplicate":
+            return [
+                _inventory_page(
+                    _INVENTORY_SELECTION,
+                    request_id,
+                    complete=False,
+                    targets=(target,),
+                ),
+                _inventory_page(
+                    _INVENTORY_SELECTION,
+                    request_id,
+                    page=2,
+                    targets=(target,),
+                ),
+            ]
+        valid = _inventory_page(_INVENTORY_SELECTION, request_id, targets=(target,))
+        if failure == "malformed":
+            valid["unexpected"] = True
+        else:
+            valid["targets"][0]["units"][0]["s_value"] = "x" * (61 * 1024)
+        return [valid]
+
+    session = _Session(responses, selection=_INVENTORY_SELECTION)
+
+    with pytest.raises(ProtocolError):
+        await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert storage.load_calls == 0
+    assert storage.saved_documents == []
+    assert [payload["type"] for payload in session.sent] == ["inventory_request"]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_inventory_times_out_before_catalog_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-terminal prefix is never mistaken for an authoritative snapshot."""
+    capability = _capability("sensor-a")
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [capability], storage)
+    monkeypatch.setattr(app_module, "INVENTORY_TIMEOUT", 0.01)
+
+    def responses(payload: dict[str, object]) -> list[dict[str, object]]:
+        request_id = parse_inventory_request(_INVENTORY_SELECTION, payload)
+        return [
+            _inventory_page(
+                _INVENTORY_SELECTION,
+                request_id,
+                complete=False,
+                targets=(_inventory_target(capability),),
+            )
+        ]
+
+    session = _Session(responses, selection=_INVENTORY_SELECTION)
+
+    with pytest.raises(TimeoutError):
+        await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert storage.load_calls == 0
+    assert storage.saved_documents == []
+    assert [payload["type"] for payload in session.sent] == ["inventory_request"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_deadline_includes_blocked_request_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backpressure cannot postpone preflight or allow catalog access."""
+
+    class _BlockedInventorySession(_Session):
+        async def async_send(self, payload: dict[str, object]) -> None:
+            self.sent.append(deepcopy(payload))
+            await self._never_respond.wait()
+
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [_capability("sensor-a")], storage)
+    monkeypatch.setattr(app_module, "INVENTORY_TIMEOUT", 0.01)
+    session = _BlockedInventorySession(selection=_INVENTORY_SELECTION)
+
+    with pytest.raises(TimeoutError):
+        await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert storage.load_calls == 0
+    assert storage.saved_documents == []
+    assert [payload["type"] for payload in session.sent] == ["inventory_request"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_forces_reassert_without_rewriting_unchanged_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real matching target is re-read remotely without storage churn."""
+    capability = _capability("sensor-a")
+    target = _inventory_target(capability)
+    storage = _MemoryStorage()
+    storage.document = catalog_to_document(
+        TargetCatalog([TargetRecord(target.target_id, capability)])
+    )
+    _configure_application(monkeypatch, [capability], storage)
+    session = _Session(
+        _inventory_and_apply_responses(_INVENTORY_SELECTION, (target,)),
+        selection=_INVENTORY_SELECTION,
+    )
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert [payload["type"] for payload in session.sent] == [
+        "inventory_request",
+        "apply",
+    ]
+    request = parse_apply(_INVENTORY_SELECTION, session.sent[1])
+    assert request.action.kind is ReconciliationActionKind.UPDATE
+    assert request.action.target_id == target.target_id
+    assert storage.load_calls == 1
+    assert storage.saved_documents == []
+
+
+@pytest.mark.asyncio
+async def test_inventory_preflights_cross_kind_catalog_bindings_before_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cross-catalog target collision aborts after loads but before writes."""
+    numeric = _capability("numeric-source")
+    binary = _capability("binary-source", kind=CapabilityKind.BINARY)
+    shared_target = derive_domoticz_target_id(numeric.source)
+    numeric_storage = _MemoryStorage()
+    numeric_storage.document = catalog_to_document(
+        TargetCatalog([TargetRecord(shared_target, numeric)])
+    )
+    binary_storage = _MemoryStorage()
+    binary_storage.document = catalog_to_document(
+        TargetCatalog([TargetRecord(shared_target, binary)])
+    )
+    _configure_application(
+        monkeypatch,
+        [numeric, binary],
+        numeric_storage,
+        included_kinds=frozenset({CapabilityKind.NUMERIC, CapabilityKind.BINARY}),
+        binary_storage=binary_storage,
+    )
+    session = _Session(
+        _inventory_and_apply_responses(_INVENTORY_MIXED_SELECTION),
+        selection=_INVENTORY_MIXED_SELECTION,
+    )
+
+    with pytest.raises(ProtocolError, match="export reconciliation is unavailable"):
+        await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert numeric_storage.load_calls == 1
+    assert binary_storage.load_calls == 1
+    assert numeric_storage.saved_documents == []
+    assert binary_storage.saved_documents == []
+    assert [payload["type"] for payload in session.sent] == ["inventory_request"]
+
+
+@pytest.mark.asyncio
+async def test_inventory_preflights_inactive_catalog_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inactive catalog still reserves remote-missing deterministic IDs."""
+    target_id = "HA00000000000000000000000"
+    current = _capability("current-source")
+    stale = replace(
+        _capability("stale-source", kind=CapabilityKind.BINARY),
+        value=None,
+        availability=Availability.UNAVAILABLE,
+    )
+    storage = _MemoryStorage()
+    binary_storage = _MemoryStorage()
+    binary_storage.document = catalog_to_document(
+        TargetCatalog([TargetRecord(target_id, stale, stale=True)])
+    )
+    _configure_application(
+        monkeypatch,
+        [current],
+        storage,
+        binary_storage=binary_storage,
+    )
+    monkeypatch.setattr(
+        reconciliation_module,
+        "derive_domoticz_target_id",
+        lambda _source: target_id,
+    )
+    session = _Session(
+        _inventory_and_apply_responses(_INVENTORY_SELECTION),
+        selection=_INVENTORY_SELECTION,
+    )
+
+    with pytest.raises(ProtocolError, match="export reconciliation is unavailable"):
+        await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    assert storage.load_calls == 1
+    assert binary_storage.load_calls == 1
+    assert storage.saved_documents == []
+    assert binary_storage.saved_documents == []
+    assert [payload["type"] for payload in session.sent] == ["inventory_request"]
 
 
 @pytest.mark.asyncio
