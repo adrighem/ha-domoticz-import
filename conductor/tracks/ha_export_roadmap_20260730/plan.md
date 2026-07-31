@@ -53,7 +53,14 @@
     troubleshooting, and verification guidance
   - [x] Explain mappings, fallbacks, limitations, and version compatibility in
     plain language
-- [ ] Task 2.5: Manually verify representative binary sensors
+- [x] Task 2.5: Manually verify representative binary sensors
+  - Live 2026-07-31: a directly labelled Z-Wave motion sensor exported as idx
+    `2311`, Type/SubType `244/73`, SwitchType `8`, Unit `1`, and state `Off`;
+    a directly labelled no-class Roomba binary sensor exported as idx `2312`,
+    Type/SubType `244/73`, fallback SwitchType `0`, Unit `1`, and state `Off`
+  - Two unchanged `domoticz.service` restarts under exact plugin and Home
+    Assistant `v0.5.0` negotiated binary and numeric v2 features; both targets
+    kept the same idx and DeviceID, and remained unique by name and DeviceID
 
 ## Phase 3: Protocol Compatibility Hardening
 
