@@ -53,7 +53,7 @@
     troubleshooting, and verification guidance
   - [x] Explain mappings, fallbacks, limitations, and version compatibility in
     plain language
-- [x] Task 2.5: Manually verify representative binary sensors
+- [x] Task 2.5: Manually verify representative binary sensors (`cbf30b0`)
   - Live 2026-07-31: a directly labelled Z-Wave motion sensor exported as idx
     `2311`, Type/SubType `244/73`, SwitchType `8`, Unit `1`, and state `Off`;
     a directly labelled no-class Roomba binary sensor exported as idx `2312`,
