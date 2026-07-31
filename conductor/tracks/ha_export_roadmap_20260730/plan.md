@@ -124,8 +124,9 @@
 ## Phase 6: Continuous Synchronization
 
 - [x] Task 6.1: Define catalog delta and reconnect semantics (`e09360e`)
-- [~] Task 6.2: Subscribe to selected Home Assistant state and metadata changes
-- [ ] Task 6.3: Coalesce updates and recover from disconnects
+- [x] Task 6.2: Subscribe to selected Home Assistant state and metadata changes
+  (`03b810a`)
+- [~] Task 6.3: Coalesce updates and recover from disconnects
 - [ ] Task 6.4: Test and manually verify live updates and relabeling
 
 ## Phase 7: Multi-capability Read-only Entities
