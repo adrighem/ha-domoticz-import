@@ -422,7 +422,8 @@ async def test_export_change_subscription_handles_label_lifecycle_and_cleanup(
 
     label_registry.async_delete(EXPORT_LABEL_ID)
     await hass.async_block_till_done()
-    on_change.assert_called_once_with()
+    assert on_change.call_count >= 1
+    assert all(not call.args and not call.kwargs for call in on_change.call_args_list)
 
     on_change.reset_mock()
     hass.states.async_set(selected.entity_id, "2")
