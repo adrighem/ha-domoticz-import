@@ -65,10 +65,10 @@
 - [x] Task 3.4: Test mixed installations, negotiation tampering, downgrade
   boundaries, and current and Python 3.9 compatibility
 - [x] Task 3.5: Document and manually verify both mixed-version rolling upgrade
-  orders and the matching-tag installation
+  orders and the matching-tag installation (`d5ab4d4`)
   - [x] Document both rolling-upgrade orders and matching-tag checks (`621bacc`)
   - [x] Preserve matching-version surfaces with regression coverage (`2698f1b`)
-  - [x] Manually verify the Home Assistant-first order
+  - [x] Manually verify the Home Assistant-first order (`d5ab4d4`)
     - Live 2026-07-31: exact plugin `v0.2.0` recreated the v1-only mixed
       checkpoint under HA `v0.3.1`; updating the plugin to `v0.3.1` negotiated
       numeric v2 with the same two persistent targets
@@ -76,7 +76,7 @@
     - Live 2026-07-31: HA `v0.2.0` negotiated heartbeat-only v1 with two
       persistent targets; restoring `v0.3.1` negotiated numeric v2 with the
       same two targets
-  - [x] Manually verify a matching-tag installation
+  - [x] Manually verify a matching-tag installation (`d5ab4d4`)
     - Live 2026-07-31: HACS and the remote plugin checkout both reported exact
       `v0.3.1`; an unchanged `domoticz.service` restart negotiated numeric v2
       and preserved both target identities without duplicates
