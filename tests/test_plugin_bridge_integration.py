@@ -2535,6 +2535,7 @@ async def test_real_bridge_continuous_export_recovers_without_duplicates(
         first_websocket,
         first_position,
     )
+    assert first_position == len(first_connection.sent)
     await bridge_view.async_wait_for_requests(1)
     first.onStop()
     assert await manager.async_active_session_count() == 0

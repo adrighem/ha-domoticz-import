@@ -589,14 +589,14 @@ async def test_application_and_heartbeat_sends_are_serialized(
     assert maximum_active_sends == 1
 
     release_first_send.set()
-    await application_send
+    await asyncio.gather(application_send)
     assert await connection.async_receive() == {
         "type": "application-send",
         "value": 1,
     }
     assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
     assert sent_sequences == [2, 3]
-    assert maximum_active_sends == 1
+    assert active_sends == 0
 
     await connection.websocket.close()
     async with asyncio.timeout(1):
@@ -652,7 +652,7 @@ async def test_heartbeat_response_deadline_starts_after_serialized_ping_send(
     await asyncio.sleep(0.15)
 
     release_application_send.set()
-    await application_send
+    await asyncio.gather(application_send)
     assert await connection.async_receive() == {"type": "application-send"}
     server_ping = await connection.async_receive()
     assert server_ping["type"] == "ping"
@@ -1272,7 +1272,7 @@ async def test_manager_stop_cancels_application_and_rejects_stale_sends(
     async with asyncio.timeout(1):
         await application.cancelled.wait()
     with pytest.raises(ProtocolError, match="no longer active"):
-        await blocked_receive
+        await asyncio.gather(blocked_receive)
 
     stale_send = asyncio.create_task(
         application.session.async_send({"type": "stale-application-send"})
@@ -1280,11 +1280,11 @@ async def test_manager_stop_cancels_application_and_rejects_stale_sends(
     await asyncio.sleep(0)
     assert stale_send.done()
     with pytest.raises(ProtocolError, match="no longer active"):
-        await stale_send
+        await asyncio.gather(stale_send)
     close_receive = asyncio.create_task(connection.websocket.receive())
     allow_close.set()
     close = await close_receive
-    await stop_task
+    await asyncio.gather(stop_task)
 
     assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
     assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
@@ -1355,7 +1355,7 @@ async def test_manager_detach_discards_queued_application_payload(
     close_receive = asyncio.create_task(connection.websocket.receive())
     allow_close.set()
     close = await close_receive
-    await stop_task
+    await asyncio.gather(stop_task)
     assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
     assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
     await connection.websocket.close()
@@ -1458,7 +1458,7 @@ async def test_detach_during_ready_send_cannot_reactivate_session(
 
     release_ready_send.set()
     await websocket.close()
-    await unregister_task
+    await asyncio.gather(unregister_task)
     for _ in range(10):
         await asyncio.sleep(0)
 

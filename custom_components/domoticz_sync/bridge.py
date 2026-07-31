@@ -345,7 +345,7 @@ class DomoticzBridgeManager:
             reservation_released = True
             try:
                 await self._async_run_session(session)
-            except BaseException as error:
+            except Exception as error:
                 self._raise_normalized_session_error(error)
         except _PeerClosed:
             await _async_close(
@@ -558,11 +558,11 @@ class DomoticzBridgeManager:
             if application_task in done:
                 try:
                     await application_task
-                except BaseException as error:
+                except (asyncio.CancelledError, Exception) as error:
                     if isinstance(error, asyncio.CancelledError) and not session.ready:
                         try:
                             await reader_task
-                        except BaseException as reader_error:
+                        except (asyncio.CancelledError, Exception) as reader_error:
                             primary_error = reader_error
                     else:
                         primary_error = error
@@ -570,14 +570,14 @@ class DomoticzBridgeManager:
                     application_session._deactivate()
                     try:
                         await reader_task
-                    except BaseException as error:
+                    except (asyncio.CancelledError, Exception) as error:
                         primary_error = error
             else:
                 try:
                     await reader_task
-                except BaseException as error:
+                except (asyncio.CancelledError, Exception) as error:
                     primary_error = error
-        except BaseException as error:
+        except (asyncio.CancelledError, Exception) as error:
             primary_error = error
         finally:
             application_session._deactivate()

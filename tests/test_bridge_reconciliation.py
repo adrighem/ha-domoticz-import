@@ -329,11 +329,11 @@ async def _async_wait_until(predicate, *, timeout_seconds: float = 1.0) -> None:
 async def _async_cancel_task(task: asyncio.Task[None]) -> None:
     """Cancel one long-lived application task without masking test failures."""
     if task.done():
-        await task
+        await asyncio.gather(task)
         return
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.gather(task)
 
 
 def _source(object_id: str) -> SourceIdentity:
@@ -1120,7 +1120,7 @@ async def test_different_destinations_reconcile_independently(
         assert second_binary_storage.load_calls == 1
     finally:
         first_storage.release_save.set()
-        await first_task
+        await asyncio.gather(first_task)
 
     assert len(first_storage.saved_documents) == 2
     assert first_binary_storage.load_calls == 1
@@ -1461,8 +1461,8 @@ async def test_continuous_uncataloged_source_reconnects_before_any_batch_write(
     capabilities[:] = [replace(owned, value=99.0), _capability("new-source")]
     subscription.fire()
 
-    with pytest.raises(ConnectionError):
-        await task
+    with pytest.raises(ConnectionError, match="fresh inventory is required"):
+        await asyncio.gather(task)
 
     assert session.sent == baseline_sent
     assert storage.document == baseline_document
@@ -1514,8 +1514,8 @@ async def test_continuous_baseline_collision_waits_for_leave_and_reentry(
 
     capabilities.append(blocked)
     subscription.fire()
-    with pytest.raises(ConnectionError):
-        await task
+    with pytest.raises(ConnectionError, match="fresh inventory is required"):
+        await asyncio.gather(task)
 
     assert [payload["type"] for payload in session.sent] == ["inventory_request"]
     assert storage.saved_documents == []
@@ -2385,8 +2385,8 @@ async def test_continuous_capacity_baseline_waits_for_leave_and_reentry(
 
         capabilities.append(blocked)
         subscription.fire()
-        with pytest.raises(ConnectionError):
-            await task
+        with pytest.raises(ConnectionError, match="fresh inventory is required"):
+            await asyncio.gather(task)
     finally:
         if not task.done():
             await _async_cancel_task(task)
@@ -2452,8 +2452,8 @@ async def test_continuous_blocked_owned_recovery_waits_for_reentry_inventory(
 
         capabilities.append(owned)
         subscription.fire()
-        with pytest.raises(ConnectionError):
-            await first_task
+        with pytest.raises(ConnectionError, match="fresh inventory is required"):
+            await asyncio.gather(first_task)
     finally:
         if not first_task.done():
             await _async_cancel_task(first_task)
@@ -2525,8 +2525,8 @@ async def test_continuous_blocked_dormant_recovery_requires_fresh_inventory(
     await _async_wait_until(lambda: storage.load_calls == 1)
     capabilities.append(owned)
     subscription.fire()
-    with pytest.raises(ConnectionError):
-        await first_task
+    with pytest.raises(ConnectionError, match="fresh inventory is required"):
+        await asyncio.gather(first_task)
 
     assert [payload["type"] for payload in first_session.sent] == ["inventory_request"]
     assert storage.saved_documents == []
