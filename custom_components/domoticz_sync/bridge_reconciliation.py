@@ -1,10 +1,11 @@
-"""Connect-time Home Assistant export reconciliation for the Domoticz bridge."""
+"""Home Assistant export reconciliation for the Domoticz bridge."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
@@ -15,7 +16,7 @@ from .catalog_storage import (
     HomeAssistantCatalogStorage,
 )
 from .const import CONF_EXPORT_LABEL_ID
-from .core.capabilities import Capability, CapabilityKind
+from .core.capabilities import Capability, CapabilityKind, SourceIdentity
 from .core.catalog import CatalogFormatError, TargetCatalog, catalog_from_document
 from .core.execution import (
     ApplyConfirmation,
@@ -26,10 +27,12 @@ from .core.execution import (
     ExecutionStatus,
     ReconciliationExecutor,
     TargetActionError,
+    async_execute_reconciliation,
 )
 from .core.protocol import (
     FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
+    FEATURE_HA_EXPORT_CONTINUOUS_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     INVENTORY_TIMEOUT_SECONDS,
     MAX_INVENTORY_PAGES,
@@ -57,11 +60,15 @@ from .core.reconciliation import (
     SourceScope,
     TargetBindingError,
     TargetObservation,
+    TargetRecord,
+    derive_domoticz_target_id,
+    plan_reconciliation,
     validate_deterministic_target_ownership,
 )
 from .home_assistant_source import (
     ExportExclusion,
     ExportLabelNotFoundError,
+    async_subscribe_export_changes,
     collect_export_selection,
 )
 
@@ -71,8 +78,39 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 APPLY_TIMEOUT = 10.0
+CONTINUOUS_COALESCE_SECONDS = 0.25
 INVENTORY_TIMEOUT = float(INVENTORY_TIMEOUT_SECONDS)
 _SOURCE_SYSTEM = "home_assistant"
+
+
+class _ContinuousDirtySignal:
+    """Track value-free changes without retaining event payload data."""
+
+    def __init__(self) -> None:
+        """Initialize one session-local dirty generation."""
+        self.event = asyncio.Event()
+        self.generation = 0
+        self._active = True
+
+    def mark_dirty(self) -> None:
+        """Record a change while the owning application session is active."""
+        if not self._active:
+            return
+        self.generation += 1
+        self.event.set()
+
+    def deactivate(self) -> None:
+        """Make already queued callbacks inert when the session ends."""
+        self._active = False
+
+
+@dataclass(frozen=True)
+class _InventoryAdmission:
+    """One capacity-safe baseline and its session-local blocked identities."""
+
+    capabilities: tuple[Capability, ...]
+    blocked_sources: frozenset[SourceIdentity]
+    blocked_durable_sources: frozenset[SourceIdentity]
 
 
 class _PreloadedCatalogStorage:
@@ -185,6 +223,12 @@ class HomeAssistantExportApplication:
         """Run one fail-closed reconciliation for each negotiated capability kind."""
         numeric_enabled = session.supports(FEATURE_HA_EXPORT_NUMERIC_V1)
         binary_enabled = session.supports(FEATURE_HA_EXPORT_BINARY_V1)
+        inventory_enabled = session.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+        continuous_enabled = session.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
+        if continuous_enabled and (
+            not inventory_enabled or not (numeric_enabled or binary_enabled)
+        ):
+            raise ProtocolError("continuous export is unavailable")
         if not numeric_enabled and not binary_enabled:
             return
 
@@ -198,6 +242,8 @@ class HomeAssistantExportApplication:
                 session,
                 numeric_enabled=numeric_enabled,
                 binary_enabled=binary_enabled,
+                inventory_enabled=inventory_enabled,
+                continuous_enabled=continuous_enabled,
             )
 
     async def _async_connected_locked(
@@ -206,6 +252,8 @@ class HomeAssistantExportApplication:
         *,
         numeric_enabled: bool,
         binary_enabled: bool,
+        inventory_enabled: bool,
+        continuous_enabled: bool,
     ) -> None:
         """Run one complete destination transaction under its application lock."""
 
@@ -217,6 +265,9 @@ class HomeAssistantExportApplication:
         if not isinstance(label_id, str) or not label_id:
             raise ProtocolError("export reconciliation is unavailable")
 
+        dirty_signal: _ContinuousDirtySignal | None = None
+        unsubscribe = None
+        rejected_desired_records: dict[SourceIdentity, TargetRecord] = {}
         try:
             instance_id = await async_get_instance_id(self._hass)
             included_kinds = set()
@@ -224,6 +275,13 @@ class HomeAssistantExportApplication:
                 included_kinds.add(CapabilityKind.NUMERIC)
             if binary_enabled:
                 included_kinds.add(CapabilityKind.BINARY)
+            if continuous_enabled:
+                dirty_signal = _ContinuousDirtySignal()
+                unsubscribe = async_subscribe_export_changes(
+                    self._hass,
+                    label_id=label_id,
+                    on_change=dirty_signal.mark_dirty,
+                )
             collection = collect_export_selection(
                 self._hass,
                 instance_id=instance_id,
@@ -232,7 +290,12 @@ class HomeAssistantExportApplication:
             )
             observations: tuple[TargetObservation, ...] | None = None
             staged_storages: dict[CapabilityKind, CatalogStorage] = {}
-            if session.supports(FEATURE_DOMOTICZ_INVENTORY_V1):
+            catalogs: dict[CapabilityKind, TargetCatalog] = {}
+            reconciliation_capabilities = collection.capabilities
+            capacity_blocked_sources: set[SourceIdentity] = set()
+            active_capacity_blocked_durable_sources: set[SourceIdentity] = set()
+            fresh_inventory_required_sources: set[SourceIdentity] = set()
+            if inventory_enabled:
                 inventory = await _async_fetch_inventory(session)
                 observations = tuple(
                     TargetObservation(
@@ -241,9 +304,27 @@ class HomeAssistantExportApplication:
                     )
                     for target in inventory
                 )
-                staged_storages = await self._async_preload_catalogs(
+                staged_storages, catalogs = await self._async_preload_catalogs(
                     session,
                     collection.capabilities,
+                )
+                admission = _admit_inventory_creates(
+                    SourceScope(_SOURCE_SYSTEM, instance_id),
+                    collection.capabilities,
+                    observations,
+                    catalogs,
+                    frozenset(included_kinds),
+                )
+                reconciliation_capabilities = admission.capabilities
+                capacity_blocked_sources = set(admission.blocked_sources)
+                current_sources = {
+                    capability.source for capability in collection.capabilities
+                }
+                active_capacity_blocked_durable_sources = (
+                    set(admission.blocked_durable_sources) & current_sources
+                )
+                fresh_inventory_required_sources = (
+                    set(admission.blocked_durable_sources) - current_sources
                 )
             self._report_exclusions(session, collection.exclusions)
 
@@ -252,24 +333,56 @@ class HomeAssistantExportApplication:
                 report = await self._async_reconcile_kind(
                     session,
                     instance_id,
-                    collection.capabilities,
+                    reconciliation_capabilities,
                     kind=CapabilityKind.NUMERIC,
                     observations=observations,
                     storage=staged_storages.get(CapabilityKind.NUMERIC),
                 )
                 self._ensure_persistence_confirmed(report)
                 reports.append(report)
+                catalogs[CapabilityKind.NUMERIC] = report.catalog
             if binary_enabled:
                 report = await self._async_reconcile_kind(
                     session,
                     instance_id,
-                    collection.capabilities,
+                    reconciliation_capabilities,
                     kind=CapabilityKind.BINARY,
                     observations=observations,
                     storage=staged_storages.get(CapabilityKind.BINARY),
                 )
                 self._ensure_persistence_confirmed(report)
                 reports.append(report)
+                catalogs[CapabilityKind.BINARY] = report.catalog
+
+            _update_rejected_desired_records(rejected_desired_records, reports)
+            self._log_reports(reports)
+
+            if dirty_signal is not None:
+                catalog_sources = {
+                    record.capability.source
+                    for catalog in catalogs.values()
+                    for record in catalog.records
+                }
+                blocked_sources = {
+                    capability.source for capability in collection.capabilities
+                } - catalog_sources
+                blocked_sources.update(capacity_blocked_sources)
+                await self._async_run_continuous(
+                    session,
+                    instance_id=instance_id,
+                    label_id=label_id,
+                    included_kinds=frozenset(included_kinds),
+                    numeric_enabled=numeric_enabled,
+                    binary_enabled=binary_enabled,
+                    dirty_signal=dirty_signal,
+                    blocked_sources=blocked_sources,
+                    capacity_blocked_sources=capacity_blocked_sources,
+                    active_capacity_blocked_durable_sources=(
+                        active_capacity_blocked_durable_sources
+                    ),
+                    fresh_inventory_required_sources=(fresh_inventory_required_sources),
+                    rejected_desired_records=rejected_desired_records,
+                )
         except (
             CatalogFormatError,
             CatalogStorageError,
@@ -278,7 +391,15 @@ class HomeAssistantExportApplication:
             TargetBindingError,
         ) as error:
             raise ProtocolError("export reconciliation is unavailable") from error
+        finally:
+            if dirty_signal is not None:
+                dirty_signal.deactivate()
+            if unsubscribe is not None:
+                unsubscribe()
 
+    @staticmethod
+    def _log_reports(reports: list[ExecutionReport]) -> None:
+        """Log aggregate outcomes without exposing source state or identity."""
         committed = sum(
             result.status is ExecutionStatus.COMMITTED
             for report in reports
@@ -296,6 +417,122 @@ class HomeAssistantExportApplication:
             committed,
             rejected,
         )
+
+    async def _async_run_continuous(
+        self,
+        session: BridgeApplicationSession,
+        *,
+        instance_id: str,
+        label_id: str,
+        included_kinds: frozenset[CapabilityKind],
+        numeric_enabled: bool,
+        binary_enabled: bool,
+        dirty_signal: _ContinuousDirtySignal,
+        blocked_sources: set[SourceIdentity],
+        capacity_blocked_sources: set[SourceIdentity],
+        active_capacity_blocked_durable_sources: set[SourceIdentity],
+        fresh_inventory_required_sources: set[SourceIdentity],
+        rejected_desired_records: dict[SourceIdentity, TargetRecord],
+    ) -> None:
+        """Run serialized catalog-owned deltas until this session ends."""
+        while True:
+            await dirty_signal.event.wait()
+            await asyncio.sleep(CONTINUOUS_COALESCE_SECONDS)
+            cycle_generation = dirty_signal.generation
+            dirty_signal.event.clear()
+
+            reports = await self._async_reconcile_live_snapshot(
+                session,
+                instance_id=instance_id,
+                label_id=label_id,
+                included_kinds=included_kinds,
+                numeric_enabled=numeric_enabled,
+                binary_enabled=binary_enabled,
+                blocked_sources=blocked_sources,
+                capacity_blocked_sources=capacity_blocked_sources,
+                active_capacity_blocked_durable_sources=(
+                    active_capacity_blocked_durable_sources
+                ),
+                fresh_inventory_required_sources=fresh_inventory_required_sources,
+                rejected_desired_records=rejected_desired_records,
+            )
+            self._log_reports(reports)
+
+            if dirty_signal.generation != cycle_generation:
+                dirty_signal.event.set()
+
+    async def _async_reconcile_live_snapshot(
+        self,
+        session: BridgeApplicationSession,
+        *,
+        instance_id: str,
+        label_id: str,
+        included_kinds: frozenset[CapabilityKind],
+        numeric_enabled: bool,
+        binary_enabled: bool,
+        blocked_sources: set[SourceIdentity],
+        capacity_blocked_sources: set[SourceIdentity],
+        active_capacity_blocked_durable_sources: set[SourceIdentity],
+        fresh_inventory_required_sources: set[SourceIdentity],
+        rejected_desired_records: dict[SourceIdentity, TargetRecord],
+    ) -> list[ExecutionReport]:
+        """Collect and apply one jointly preflighted catalog-owned live delta."""
+        collection = collect_export_selection(
+            self._hass,
+            instance_id=instance_id,
+            label_id=label_id,
+            included_kinds=included_kinds,
+        )
+        self._report_exclusions(session, collection.exclusions)
+        staged_storages, catalogs = await self._async_preload_catalogs(
+            session,
+            collection.capabilities,
+        )
+
+        current_sources = {capability.source for capability in collection.capabilities}
+        catalog_sources = {
+            record.capability.source
+            for catalog in catalogs.values()
+            for record in catalog.records
+        }
+        fresh_inventory_required_sources.update(
+            active_capacity_blocked_durable_sources - current_sources
+        )
+        active_capacity_blocked_durable_sources.intersection_update(current_sources)
+        if current_sources & fresh_inventory_required_sources:
+            raise ConnectionError("fresh inventory is required")
+        blocked_sources.intersection_update(current_sources)
+        if current_sources - catalog_sources - blocked_sources:
+            raise ConnectionError("fresh inventory is required")
+
+        reports: list[ExecutionReport] = []
+        if numeric_enabled:
+            report = await self._async_reconcile_live_kind(
+                session,
+                instance_id,
+                collection.capabilities,
+                kind=CapabilityKind.NUMERIC,
+                catalog=catalogs[CapabilityKind.NUMERIC],
+                storage=staged_storages[CapabilityKind.NUMERIC],
+                capacity_blocked_sources=capacity_blocked_sources,
+                rejected_desired_records=rejected_desired_records,
+            )
+            self._ensure_persistence_confirmed(report)
+            reports.append(report)
+        if binary_enabled:
+            report = await self._async_reconcile_live_kind(
+                session,
+                instance_id,
+                collection.capabilities,
+                kind=CapabilityKind.BINARY,
+                catalog=catalogs[CapabilityKind.BINARY],
+                storage=staged_storages[CapabilityKind.BINARY],
+                capacity_blocked_sources=capacity_blocked_sources,
+                rejected_desired_records=rejected_desired_records,
+            )
+            self._ensure_persistence_confirmed(report)
+            reports.append(report)
+        return reports
 
     @staticmethod
     def _ensure_persistence_confirmed(report: ExecutionReport) -> None:
@@ -335,11 +572,60 @@ class HomeAssistantExportApplication:
             return await executor.async_reconcile(scope, current)
         return await executor.async_reconcile(scope, current, observations)
 
+    async def _async_reconcile_live_kind(
+        self,
+        session: BridgeApplicationSession,
+        instance_id: str,
+        capabilities: tuple[Capability, ...],
+        *,
+        kind: CapabilityKind,
+        catalog: TargetCatalog,
+        storage: CatalogStorage,
+        capacity_blocked_sources: set[SourceIdentity],
+        rejected_desired_records: dict[SourceIdentity, TargetRecord],
+    ) -> ExecutionReport:
+        """Apply only changed records that this session's catalogs already own."""
+        if kind is CapabilityKind.NUMERIC:
+            adapter = DomoticzSessionTargetAdapter(session)
+        elif kind is CapabilityKind.BINARY:
+            adapter = DomoticzBinarySessionTargetAdapter(session)
+        else:
+            raise ValueError("unsupported export capability kind")
+
+        scope = SourceScope(_SOURCE_SYSTEM, instance_id)
+        current = tuple(
+            capability for capability in capabilities if capability.kind is kind
+        )
+        planned = plan_reconciliation(scope, current, catalog.records)
+        actions = tuple(
+            action
+            for action in planned
+            if action.kind is not ReconciliationActionKind.CREATE
+            and action.capability.source not in capacity_blocked_sources
+            and not _action_matches_catalog(action, catalog)
+        )
+        actions = _suppress_unchanged_rejections(
+            kind,
+            actions,
+            rejected_desired_records,
+        )
+        report = await async_execute_reconciliation(
+            catalog,
+            actions,
+            adapter,
+            storage,
+        )
+        _update_rejected_desired_records(rejected_desired_records, [report])
+        return report
+
     async def _async_preload_catalogs(
         self,
         session: BridgeApplicationSession,
         capabilities: tuple[Capability, ...],
-    ) -> dict[CapabilityKind, CatalogStorage]:
+    ) -> tuple[
+        dict[CapabilityKind, CatalogStorage],
+        dict[CapabilityKind, TargetCatalog],
+    ]:
         """Load and jointly validate all catalogs before the first target write."""
         ordered_kinds = (CapabilityKind.BINARY, CapabilityKind.NUMERIC)
         storages = tuple(
@@ -356,15 +642,18 @@ class HomeAssistantExportApplication:
             capabilities,
             (record for catalog in catalogs for record in catalog.records),
         )
-        return {
-            kind: _PreloadedCatalogStorage(storage, document)
-            for kind, storage, document in zip(
-                ordered_kinds,
-                storages,
-                documents,
-                strict=True,
-            )
-        }
+        return (
+            {
+                kind: _PreloadedCatalogStorage(storage, document)
+                for kind, storage, document in zip(
+                    ordered_kinds,
+                    storages,
+                    documents,
+                    strict=True,
+                )
+            },
+            dict(zip(ordered_kinds, catalogs, strict=True)),
+        )
 
     def _storage_for_kind(
         self,
@@ -403,6 +692,169 @@ class HomeAssistantExportApplication:
                 exclusion.reason.value,
             )
         self._reported_exclusions[key] = current
+
+
+def _admit_inventory_creates(
+    scope: SourceScope,
+    capabilities: tuple[Capability, ...],
+    observations: tuple[TargetObservation, ...],
+    catalogs: Mapping[CapabilityKind, TargetCatalog],
+    included_kinds: frozenset[CapabilityKind],
+) -> _InventoryAdmission:
+    """Reserve durable recovery first, then admit globally ordered new targets."""
+    observations_by_target_id: dict[str, TargetObservation] = {}
+    for observation in observations:
+        if observation.target_id in observations_by_target_id:
+            raise TargetBindingError("duplicate observed target identity")
+        observations_by_target_id[observation.target_id] = observation
+
+    reserved_target_ids = set(observations_by_target_id)
+    units_used = sum(
+        len(observation.units) for observation in observations_by_target_id.values()
+    )
+    if (
+        len(reserved_target_ids) > MAX_INVENTORY_TARGETS
+        or units_used > MAX_INVENTORY_UNITS
+    ):
+        raise TargetBindingError("target inventory capacity is unavailable")
+
+    current_sources = {capability.source for capability in capabilities}
+    durable_records = tuple(
+        record for catalog in catalogs.values() for record in catalog.records
+    )
+    recovery_reservations = tuple(
+        record
+        for record in durable_records
+        if (
+            observations_by_target_id.get(record.target_id) is None
+            or observations_by_target_id[record.target_id].units == ()
+        )
+    )
+    blocked_durable_sources: set[SourceIdentity] = set()
+    for record in sorted(
+        recovery_reservations,
+        key=lambda item: (
+            item.capability.source not in current_sources,
+            item.capability.source.key,
+        ),
+    ):
+        source = record.capability.source
+        target_cost = int(record.target_id not in reserved_target_ids)
+        if (
+            len(reserved_target_ids) + target_cost > MAX_INVENTORY_TARGETS
+            or units_used + 1 > MAX_INVENTORY_UNITS
+        ):
+            blocked_durable_sources.add(source)
+            continue
+        reserved_target_ids.add(record.target_id)
+        units_used += 1
+
+    create_actions = []
+    for kind in sorted(included_kinds, key=lambda item: item.value):
+        current = tuple(
+            capability for capability in capabilities if capability.kind is kind
+        )
+        create_actions.extend(
+            action
+            for action in plan_reconciliation(
+                scope,
+                current,
+                catalogs[kind].records,
+                observations,
+            )
+            if action.kind is ReconciliationActionKind.CREATE
+        )
+
+    blocked_create_sources: set[SourceIdentity] = set()
+    for action in sorted(
+        create_actions,
+        key=lambda item: item.capability.source.key,
+    ):
+        source = action.capability.source
+        target_id = derive_domoticz_target_id(source)
+        target_cost = int(target_id not in reserved_target_ids)
+        if (
+            len(reserved_target_ids) + target_cost > MAX_INVENTORY_TARGETS
+            or units_used + 1 > MAX_INVENTORY_UNITS
+        ):
+            blocked_create_sources.add(source)
+            continue
+        reserved_target_ids.add(target_id)
+        units_used += 1
+
+    blocked_sources = blocked_durable_sources | blocked_create_sources
+    admitted = tuple(
+        capability
+        for capability in capabilities
+        if capability.source not in blocked_sources
+    )
+    return _InventoryAdmission(
+        capabilities=admitted,
+        blocked_sources=frozenset(blocked_sources),
+        blocked_durable_sources=frozenset(blocked_durable_sources),
+    )
+
+
+def _desired_record(action: ReconciliationAction) -> TargetRecord:
+    """Normalize CREATE and existing-target actions to one desired target state."""
+    target_id = action.target_id
+    if target_id is None:
+        target_id = derive_domoticz_target_id(action.capability.source)
+    return TargetRecord(
+        target_id=target_id,
+        capability=action.capability,
+        stale=action.stale,
+    )
+
+
+def _suppress_unchanged_rejections(
+    kind: CapabilityKind,
+    actions: tuple[ReconciliationAction, ...],
+    rejected_desired_records: dict[SourceIdentity, TargetRecord],
+) -> tuple[ReconciliationAction, ...]:
+    """Skip only the same desired state rejected earlier in this session."""
+    desired_by_source = {
+        action.capability.source: _desired_record(action) for action in actions
+    }
+    for source, rejected in tuple(rejected_desired_records.items()):
+        if rejected.capability.kind is not kind:
+            continue
+        if desired_by_source.get(source) != rejected:
+            rejected_desired_records.pop(source)
+
+    return tuple(
+        action
+        for action in actions
+        if rejected_desired_records.get(action.capability.source)
+        != desired_by_source[action.capability.source]
+    )
+
+
+def _update_rejected_desired_records(
+    rejected_desired_records: dict[SourceIdentity, TargetRecord],
+    reports: list[ExecutionReport],
+) -> None:
+    """Remember expected rejections without leaking them across sessions."""
+    for report in reports:
+        for result in report.results:
+            source = result.action.capability.source
+            if result.status is ExecutionStatus.TARGET_NOT_CONFIRMED:
+                rejected_desired_records[source] = _desired_record(result.action)
+            elif result.status is ExecutionStatus.COMMITTED:
+                rejected_desired_records.pop(source, None)
+
+
+def _action_matches_catalog(
+    action: ReconciliationAction,
+    catalog: TargetCatalog,
+) -> bool:
+    """Return whether an existing record already represents one live action."""
+    if action.kind is ReconciliationActionKind.CREATE:
+        return False
+    existing = catalog.get(action.capability.source)
+    if existing is None:
+        return False
+    return existing == _desired_record(action)
 
 
 async def _async_fetch_inventory(

@@ -1456,30 +1456,33 @@ def test_inventory_feature_negotiates_independently_for_mixed_v2_peers() -> None
     ).selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
 
 
-def test_continuous_feature_is_explicit_and_safe_during_rolling_upgrades() -> None:
-    """Continuous behavior stays dormant until both peers advertise it."""
-    continuous_features = tuple(
-        sorted((*SUPPORTED_V2_FEATURES, FEATURE_HA_EXPORT_CONTINUOUS_V1))
+def test_continuous_feature_is_active_and_safe_during_rolling_upgrades() -> None:
+    """Continuous behavior is selected only when both peers advertise it."""
+    pre_continuous_features = tuple(
+        feature
+        for feature in SUPPORTED_V2_FEATURES
+        if feature != FEATURE_HA_EXPORT_CONTINUOUS_V1
     )
 
-    assert FEATURE_HA_EXPORT_CONTINUOUS_V1 not in SUPPORTED_V2_FEATURES
-    assert (
-        _fixed_v2_context(
-            client_features=continuous_features,
-            server_features=SUPPORTED_V2_FEATURES,
-        ).selection.features
-        == SUPPORTED_V2_FEATURES
-    )
+    assert FEATURE_HA_EXPORT_CONTINUOUS_V1 in SUPPORTED_V2_FEATURES
+    assert SUPPORTED_V2_FEATURES == tuple(sorted(SUPPORTED_V2_FEATURES))
     assert (
         _fixed_v2_context(
             client_features=SUPPORTED_V2_FEATURES,
-            server_features=continuous_features,
+            server_features=pre_continuous_features,
         ).selection.features
-        == SUPPORTED_V2_FEATURES
+        == pre_continuous_features
+    )
+    assert (
+        _fixed_v2_context(
+            client_features=pre_continuous_features,
+            server_features=SUPPORTED_V2_FEATURES,
+        ).selection.features
+        == pre_continuous_features
     )
     assert _fixed_v2_context(
-        client_features=continuous_features,
-        server_features=continuous_features,
+        client_features=SUPPORTED_V2_FEATURES,
+        server_features=SUPPORTED_V2_FEATURES,
     ).selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
 
 

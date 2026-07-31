@@ -1192,7 +1192,9 @@ class DomoticzSyncPlugin:
         request = wire_protocol.parse_apply(self._protocol_selection, payload)
 
         try:
-            self._require_inventory_write_gate()
+            self._require_inventory_write_gate(
+                wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1
+            )
             target_id = self._apply_action(request.action)
         except Exception:
             result = wire_protocol.build_apply_result(
@@ -1220,7 +1222,9 @@ class DomoticzSyncPlugin:
         )
 
         try:
-            self._require_inventory_write_gate()
+            self._require_inventory_write_gate(
+                wire_protocol.FEATURE_HA_EXPORT_BINARY_V1
+            )
             target_id = self._apply_binary_action(request.action)
         except Exception:
             result = wire_protocol.build_binary_apply_result(
@@ -1249,9 +1253,26 @@ class DomoticzSyncPlugin:
             )
         )
 
-    def _require_inventory_write_gate(self):
-        """Block inventory-aware writes until every confirmed page was sent."""
-        if self._inventory_is_selected() and not self._inventory_confirmed:
+    def _require_inventory_write_gate(self, required_feature=None):
+        """Require complete dependencies before an inventory-aware write."""
+        selection = self._protocol_selection
+        inventory_selected = self._inventory_is_selected()
+        if selection is not None and selection.supports(
+            wire_protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1
+        ):
+            kind_selected = selection.supports(
+                wire_protocol.FEATURE_HA_EXPORT_NUMERIC_V1
+            ) or selection.supports(wire_protocol.FEATURE_HA_EXPORT_BINARY_V1)
+            if (
+                not inventory_selected
+                or not kind_selected
+                or (
+                    required_feature is not None
+                    and not selection.supports(required_feature)
+                )
+            ):
+                raise DomoticzApplyError
+        if inventory_selected and not self._inventory_confirmed:
             raise DomoticzApplyError
 
     def _apply_action(self, action):
@@ -1444,7 +1465,7 @@ class DomoticzSyncPlugin:
         if profile.manages_options:
             create_arguments["Options"] = desired_options
         creator = Domoticz.Unit(**create_arguments)
-        self._require_inventory_creation_shape(device_id, require_absent)
+        self._require_inventory_creation_capacity(device_id, require_absent)
         creator.Create()
         self._require_inventory_target_unit(device_id, profile)
 
@@ -1456,6 +1477,55 @@ class DomoticzSyncPlugin:
                 raise DomoticzApplyError
             return
         if device is not None and unit_keys != ():
+            raise DomoticzApplyError
+
+    @staticmethod
+    def _require_inventory_creation_capacity(device_id, require_absent):
+        """Recheck the complete live shape and both caps immediately before Create."""
+        devices = globals().get("Devices")
+        if type(devices) is not dict:
+            raise DomoticzApplyError
+
+        device_items = tuple(devices.items())
+        total_units = 0
+        requested_device = None
+        requested_unit_keys = ()
+        for target_id, device in device_items:
+            if (
+                type(target_id) is not str
+                or getattr(device, "DeviceID", None) != target_id
+            ):
+                raise DomoticzApplyError
+            units = getattr(device, "Units", None)
+            if type(units) is not dict:
+                raise DomoticzApplyError
+            unit_items = tuple(units.items())
+            if any(
+                type(unit_number) is not int
+                or not 1 <= unit_number <= 255
+                or type(getattr(unit, "Unit", None)) is not int
+                or unit.Unit != unit_number
+                for unit_number, unit in unit_items
+            ):
+                raise DomoticzApplyError
+            total_units += len(unit_items)
+            if target_id == device_id:
+                requested_device = device
+                requested_unit_keys = tuple(
+                    sorted(unit_number for unit_number, _unit in unit_items)
+                )
+
+        if require_absent:
+            if requested_device is not None:
+                raise DomoticzApplyError
+        elif requested_device is not None and requested_unit_keys != ():
+            raise DomoticzApplyError
+
+        added_targets = 1 if requested_device is None else 0
+        if (
+            len(device_items) + added_targets > wire_protocol.MAX_INVENTORY_TARGETS
+            or total_units + 1 > wire_protocol.MAX_INVENTORY_UNITS
+        ):
             raise DomoticzApplyError
 
     @staticmethod

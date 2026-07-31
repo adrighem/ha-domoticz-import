@@ -678,18 +678,10 @@ def _inventory_features(_monkeypatch, protocol):
     return protocol.SUPPORTED_V2_FEATURES
 
 
-def _continuous_features(monkeypatch, protocol):
-    """Enable the not-yet-default continuous contract for focused tests."""
-    features = tuple(
-        sorted(
-            (
-                *protocol.SUPPORTED_V2_FEATURES,
-                protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1,
-            )
-        )
-    )
-    monkeypatch.setattr(protocol, "SUPPORTED_V2_FEATURES", features)
-    return features
+def _continuous_features(_monkeypatch, protocol):
+    """Return the active continuous contract for focused runtime tests."""
+    assert protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1 in (protocol.SUPPORTED_V2_FEATURES)
+    return protocol.SUPPORTED_V2_FEATURES
 
 
 def _send_inventory_request(
@@ -1230,7 +1222,11 @@ def test_second_inventory_request_in_one_session_is_a_protocol_violation(
     features = (
         _continuous_features(monkeypatch, protocol)
         if continuous
-        else _inventory_features(monkeypatch, protocol)
+        else tuple(
+            feature
+            for feature in _inventory_features(monkeypatch, protocol)
+            if feature != protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1
+        )
     )
     plugin, connection = _start_and_upgrade(module)
     session_key, session_id = _complete_handshake(
@@ -1268,11 +1264,11 @@ def test_second_inventory_request_in_one_session_is_a_protocol_violation(
     assert connection.sent[-1]["Operation"] == "Close"
 
 
-def test_continuous_session_accepts_sequential_catalog_delta_applies(
+def test_continuous_session_accepts_one_inventory_deltas_and_heartbeat(
     loaded_plugin,
     monkeypatch,
 ):
-    """One confirmed inventory can gate multiple ordered live deltas."""
+    """One inventory gates ordered numeric/binary deltas around a heartbeat."""
     module, domoticz = loaded_plugin
     protocol = module.wire_protocol
     features = _continuous_features(monkeypatch, protocol)
@@ -1282,6 +1278,19 @@ def test_continuous_session_accepts_sequential_catalog_delta_applies(
         plugin,
         connection,
         server_features=features,
+    )
+    inventory_request_count = 0
+    original_handle_inventory_request = plugin._handle_inventory_request
+
+    def count_inventory_request(payload):
+        nonlocal inventory_request_count
+        inventory_request_count += 1
+        original_handle_inventory_request(payload)
+
+    monkeypatch.setattr(
+        plugin,
+        "_handle_inventory_request",
+        count_inventory_request,
     )
     inventory = _send_inventory_request(
         module,
@@ -1314,13 +1323,68 @@ def test_continuous_session_accepts_sequential_catalog_delta_applies(
             name="Changed name",
         ),
     )
+    previous_out_sequence = plugin._out_sequence
+    ping_id = protocol.generate_nonce()
+    inbound_ping = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload={"type": "ping", "id": ping_id},
+    )
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(inbound_ping)},
+    )
+    outbound_pong = protocol.verify_envelope(
+        session_key,
+        protocol.canonical_json_loads(connection.sent[-1]["Payload"]),
+        protocol_version=plugin._protocol_version,
+        expected_direction=protocol.DIRECTION_DOMOTICZ_TO_HA,
+        expected_session_id=session_id,
+        last_sequence=previous_out_sequence,
+    )
+    binary_created = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-baseline-binary-target",
+        action=_binary_action(protocol, semantic="motion"),
+    )
+    binary_updated = _send_binary_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="update-live-binary-target",
+        action=_binary_action(
+            protocol,
+            kind="update",
+            target_id=binary_created.target_id,
+            value=False,
+            name="Hall motion",
+            semantic="motion",
+        ),
+    )
 
     assert inventory[0].targets == ()
+    assert inventory_request_count == 1
     assert baseline_created.status is protocol.ApplyResultStatus.CONFIRMED
     assert updated.status is protocol.ApplyResultStatus.CONFIRMED
-    unit = domoticz.devices[baseline_created.target_id].Units[1]
-    assert unit.Name == "Changed name"
-    assert unit.sValue == "2.0"
+    assert outbound_pong.payload == {"type": "pong", "id": ping_id}
+    assert binary_created.status is protocol.ApplyResultStatus.CONFIRMED
+    assert binary_updated.status is protocol.ApplyResultStatus.CONFIRMED
+    numeric_unit = domoticz.devices[baseline_created.target_id].Units[1]
+    assert numeric_unit.Name == "Changed name"
+    assert numeric_unit.sValue == "2.0"
+    binary_unit = domoticz.devices[binary_created.target_id].Units[1]
+    assert binary_unit.Name == "Hall motion"
+    assert binary_unit.nValue == 0
+    assert binary_unit.sValue == "Off"
     assert plugin.phase == module.PHASE_READY
     assert plugin._inventory_confirmed
 
@@ -1574,6 +1638,213 @@ def test_inventory_create_rechecks_parent_absence_after_unit_factory(
     assert domoticz.devices[target_id].Units[1] is collision
     assert collision.Name == "Unrelated target"
     assert collision.Options == {"Custom": "1;private"}
+
+
+def test_inventory_create_rejects_when_live_unit_capacity_fills_after_snapshot(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A stale session snapshot cannot overfill the live hardware unit cap."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_TARGETS", 3)
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_UNITS", 1)
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    occupied = FakeDevice(domoticz, "external-parent")
+    occupied_unit = FakeUnit(
+        domoticz,
+        DeviceID="external-parent",
+        Unit=1,
+        Name="External unit",
+    )
+    occupied.Units[1] = occupied_unit
+    domoticz.devices["external-parent"] = occupied
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-after-live-unit-cap-filled",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert target_id not in domoticz.devices
+    assert domoticz.devices == {"external-parent": occupied}
+    assert occupied.Units == {1: occupied_unit}
+
+
+def test_inventory_create_permits_the_exact_remaining_live_capacity(
+    loaded_plugin,
+    monkeypatch,
+):
+    """The last parent and unit slots remain usable without an off-by-one."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_TARGETS", 2)
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_UNITS", 2)
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    occupied = FakeDevice(domoticz, "external-parent")
+    occupied.Units[1] = FakeUnit(
+        domoticz,
+        DeviceID="external-parent",
+        Unit=1,
+        Name="External unit",
+    )
+    domoticz.devices["external-parent"] = occupied
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-in-final-live-slots",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert result.target_id == target_id
+    assert len(domoticz.devices) == protocol.MAX_INVENTORY_TARGETS
+    assert sum(len(device.Units) for device in domoticz.devices.values()) == (
+        protocol.MAX_INVENTORY_UNITS
+    )
+    assert len(domoticz.create_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("maximum_units", "expected_status", "expected_creates"),
+    [
+        (1, "rejected", 0),
+        (2, "confirmed", 1),
+    ],
+)
+def test_inventory_empty_parent_recovery_obeys_live_unit_capacity(
+    loaded_plugin,
+    monkeypatch,
+    maximum_units,
+    expected_status,
+    expected_creates,
+):
+    """Empty-parent repair costs one unit slot but no second parent slot."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_TARGETS", 2)
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_UNITS", maximum_units)
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+    empty_parent = FakeDevice(domoticz, target_id)
+    domoticz.devices[target_id] = empty_parent
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    occupied = FakeDevice(domoticz, "external-parent")
+    occupied_unit = FakeUnit(
+        domoticz,
+        DeviceID="external-parent",
+        Unit=1,
+        Name="External unit",
+    )
+    occupied.Units[1] = occupied_unit
+    domoticz.devices["external-parent"] = occupied
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id=f"recover-empty-parent-with-{maximum_units}-unit-cap",
+        action=_numeric_action(
+            protocol,
+            kind="update",
+            target_id=target_id,
+            value=19.25,
+        ),
+    )
+
+    assert result.status.value == expected_status
+    assert len(domoticz.create_calls) == expected_creates
+    assert domoticz.devices[target_id] is empty_parent
+    assert set(empty_parent.Units) == ({1} if expected_creates else set())
+    assert occupied.Units == {1: occupied_unit}
+
+
+def test_inventory_create_enforces_live_target_capacity_separately(
+    loaded_plugin,
+    monkeypatch,
+):
+    """A free unit slot cannot bypass an independently full parent cap."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_TARGETS", 1)
+    monkeypatch.setattr(protocol, "MAX_INVENTORY_UNITS", 2)
+    plugin, connection, session_key, session_id = _start_inventory_session(
+        module,
+        monkeypatch,
+    )
+    _send_inventory_request(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+    )
+    occupied = FakeDevice(domoticz, "external-empty-parent")
+    domoticz.devices["external-empty-parent"] = occupied
+    action = _numeric_action(protocol)
+    target_id = module._device_id_for_source(action.capability.source)
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="create-after-live-target-cap-filled",
+        action=action,
+    )
+
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert target_id not in domoticz.devices
+    assert domoticz.devices == {"external-empty-parent": occupied}
+    assert occupied.Units == {}
 
 
 def test_inventory_create_rejects_an_existing_empty_parent(
@@ -2344,7 +2615,7 @@ def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
         "Authenticated Home Assistant connection is ready; "
         "protocol=ha-domoticz-sync.v2; "
         "features=domoticz-inventory.v1,ha-export.binary.v1,"
-        "ha-export.numeric.v1."
+        "ha-export.continuous.v1,ha-export.numeric.v1."
     ]
 
     server_ping_id = protocol.generate_nonce()
@@ -2438,6 +2709,94 @@ def test_v2_pre_inventory_peer_keeps_catalog_only_apply_behavior(loaded_plugin):
 
     assert result.status is protocol.ApplyResultStatus.CONFIRMED
     assert len(domoticz.create_calls) == 1
+
+
+@pytest.mark.parametrize("capability_kind", ["numeric", "binary"])
+def test_continuous_application_action_requires_inventory_dependency(
+    loaded_plugin,
+    capability_kind,
+):
+    """Continuous mode never falls back to catalog-only application writes."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    if capability_kind == "numeric":
+        kind_feature = protocol.FEATURE_HA_EXPORT_NUMERIC_V1
+        action = _numeric_action(protocol)
+        send = _send_apply
+    else:
+        kind_feature = protocol.FEATURE_HA_EXPORT_BINARY_V1
+        action = _binary_action(protocol)
+        send = _send_binary_apply
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=tuple(
+            sorted(
+                (
+                    protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1,
+                    kind_feature,
+                )
+            )
+        ),
+    )
+
+    result = send(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id=f"continuous-{capability_kind}-without-inventory",
+        action=action,
+    )
+
+    assert plugin._protocol_selection.supports(protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1)
+    assert plugin._protocol_selection.supports(kind_feature)
+    assert not plugin._inventory_is_selected()
+    assert result.status is protocol.ApplyResultStatus.REJECTED
+    assert domoticz.create_calls == []
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_READY
+
+
+@pytest.mark.parametrize("message_type", ["apply", "binary_apply"])
+def test_continuous_only_peer_cannot_invoke_application_actions(
+    loaded_plugin,
+    message_type,
+):
+    """A malformed continuous-only selection has no application write path."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=(protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1,),
+    )
+    assert plugin._protocol_selection.features == (
+        protocol.FEATURE_HA_EXPORT_CONTINUOUS_V1,
+    )
+    payload = protocol.sign_envelope(
+        session_key,
+        protocol_version=plugin._protocol_version,
+        direction=protocol.DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=plugin._in_sequence + 1,
+        payload={"schema": 1, "type": message_type},
+    )
+
+    plugin.onMessage(
+        connection,
+        {"Payload": protocol.canonical_json_dumps(payload)},
+    )
+
+    assert domoticz.create_calls == []
+    assert domoticz.devices == {}
+    assert plugin.phase == module.PHASE_DISCONNECTED
+    assert connection.disconnected
 
 
 def test_v1_fallback_is_heartbeat_only_and_never_applies(loaded_plugin):

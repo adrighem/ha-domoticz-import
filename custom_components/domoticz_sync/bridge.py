@@ -15,7 +15,9 @@ from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
     FEATURE_HA_EXPORT_BINARY_V1,
+    FEATURE_HA_EXPORT_CONTINUOUS_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
+    MAX_INVENTORY_PAGES,
     PROTOCOL_VERSION,
     SUPPORTED_V2_FEATURES,
     SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
@@ -54,6 +56,7 @@ from .core.protocol import (
 BRIDGE_WEBSOCKET_PATH: Final = "/api/domoticz_sync/websocket"
 
 MAX_BRIDGE_MESSAGE_BYTES: Final = 64 * 1024
+MAX_APPLICATION_INBOX_MESSAGES: Final = MAX_INVENTORY_PAGES
 MAX_PENDING_HANDSHAKES: Final = 8
 PREPARE_TIMEOUT: Final = 5.0
 FIRST_MESSAGE_TIMEOUT: Final = 3.0
@@ -79,7 +82,7 @@ class BridgeApplication(Protocol):
     """Application invoked for one ready, authenticated bridge session."""
 
     async def async_connected(self, session: BridgeApplicationSession) -> None:
-        """Use the ready session before the bridge starts its heartbeat loop."""
+        """Use one ready application session until its transport ends."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +113,18 @@ class BridgeSession:
     client_sequence: int = 0
     server_sequence: int = 0
     ready: bool = False
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    application_session: BridgeApplicationSession | None = field(
+        default=None,
+        repr=False,
+    )
+    application_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 class BridgeApplicationSession:
     """Narrow signed-payload facade for a ready bridge session."""
 
-    __slots__ = ("_active", "_manager", "_session")
+    __slots__ = ("_active", "_deactivated", "_inbox", "_manager", "_session")
 
     def __init__(
         self,
@@ -126,6 +135,10 @@ class BridgeApplicationSession:
         self._manager = manager
         self._session = session
         self._active = True
+        self._deactivated = asyncio.Event()
+        self._inbox: asyncio.Queue[dict[str, object]] = asyncio.Queue(
+            maxsize=MAX_APPLICATION_INBOX_MESSAGES
+        )
 
     @property
     def entry_id(self) -> str:
@@ -157,14 +170,47 @@ class BridgeApplicationSession:
     async def async_receive(self) -> dict[str, object]:
         """Receive one signed, in-order application payload."""
         self._ensure_active()
-        return await self._manager._async_receive_payload(self._session)
+        payload_task = asyncio.create_task(self._inbox.get())
+        deactivation_task = asyncio.create_task(self._deactivated.wait())
+        try:
+            await asyncio.wait(
+                (payload_task, deactivation_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            self._ensure_active()
+            return payload_task.result()
+        finally:
+            for task in (payload_task, deactivation_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                payload_task,
+                deactivation_task,
+                return_exceptions=True,
+            )
+
+    def _deliver(self, payload: dict[str, object]) -> None:
+        """Route one manager-verified payload into the bounded application inbox."""
+        self._ensure_active()
+        try:
+            self._inbox.put_nowait(payload)
+        except asyncio.QueueFull:
+            raise ProtocolError("application session is unavailable") from None
 
     def _deactivate(self) -> None:
-        """Prevent application traffic after control returns to the bridge."""
+        """Prevent application traffic after the session detaches."""
+        if not self._active:
+            return
         self._active = False
+        self._deactivated.set()
+        while True:
+            try:
+                self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     def _ensure_active(self) -> None:
-        """Reject use once the heartbeat loop owns the session."""
+        """Reject use after the application session detaches."""
         if not self._active:
             raise ProtocolError("application session is no longer active")
 
@@ -201,6 +247,8 @@ class DomoticzBridgeManager:
             if previous_link_id is not None and previous_link_id != link_id:
                 self._links.pop(previous_link_id, None)
                 session_to_close = self._sessions.pop(previous_link_id, None)
+                if session_to_close is not None:
+                    self._deactivate_session(session_to_close)
 
             current_session = self._sessions.get(link_id)
             if (
@@ -209,13 +257,14 @@ class DomoticzBridgeManager:
                 and owner.pairing_key != pairing_key
             ):
                 session_to_close = self._sessions.pop(link_id)
+                self._deactivate_session(session_to_close)
 
             self._links[link_id] = replacement
             self._entry_links[entry_id] = link_id
 
         if session_to_close is not None:
-            await _async_close(
-                session_to_close.websocket,
+            await self._async_close_session(
+                session_to_close,
                 WSCloseCode.GOING_AWAY,
                 _SHUTDOWN_CLOSE_MESSAGE,
             )
@@ -228,10 +277,12 @@ class DomoticzBridgeManager:
                 return
             self._links.pop(link_id, None)
             session = self._sessions.pop(link_id, None)
+            if session is not None:
+                self._deactivate_session(session)
 
         if session is not None:
-            await _async_close(
-                session.websocket,
+            await self._async_close_session(
+                session,
                 WSCloseCode.GOING_AWAY,
                 _SHUTDOWN_CLOSE_MESSAGE,
             )
@@ -243,11 +294,13 @@ class DomoticzBridgeManager:
             self._sessions.clear()
             self._links.clear()
             self._entry_links.clear()
+            for session in sessions:
+                self._deactivate_session(session)
 
         await asyncio.gather(
             *(
-                _async_close(
-                    session.websocket,
+                self._async_close_session(
+                    session,
                     WSCloseCode.GOING_AWAY,
                     _SHUTDOWN_CLOSE_MESSAGE,
                 )
@@ -290,7 +343,10 @@ class DomoticzBridgeManager:
 
             await self.async_release_handshake()
             reservation_released = True
-            await self._async_run_session(session)
+            try:
+                await self._async_run_session(session)
+            except BaseException as error:
+                self._raise_normalized_session_error(error)
         except _PeerClosed:
             await _async_close(
                 websocket,
@@ -444,7 +500,7 @@ class DomoticzBridgeManager:
             raise ProtocolError("invalid protocol message")
 
         await self._async_send_payload(session, {"type": "ready"})
-        session.ready = True
+        await self._async_mark_ready(session)
 
         await self._async_run_heartbeat(session)
 
@@ -462,25 +518,99 @@ class DomoticzBridgeManager:
             session,
             build_application_ready(selection),
         )
-        session.ready = True
+        await self._async_mark_ready(session)
 
+        continuous_enabled = selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
+        if continuous_enabled and self._application is None:
+            raise ProtocolError("application session is unavailable")
         if self._application is not None and any(
             selection.supports(feature)
             for feature in (
                 FEATURE_HA_EXPORT_NUMERIC_V1,
                 FEATURE_HA_EXPORT_BINARY_V1,
+                FEATURE_HA_EXPORT_CONTINUOUS_V1,
             )
         ):
-            application_session = BridgeApplicationSession(self, session)
-            try:
-                await self._application.async_connected(application_session)
-            finally:
-                application_session._deactivate()
+            await self._async_run_application(session)
+            return
 
-        await self._async_run_heartbeat(session)
+        await self._async_run_heartbeat(session, None)
 
-    async def _async_run_heartbeat(self, session: BridgeSession) -> None:
-        """Keep one application-ready session alive with signed heartbeats."""
+    async def _async_run_application(self, session: BridgeSession) -> None:
+        """Run one application task beside the session's sole socket reader."""
+        application = self._application
+        assert application is not None
+        application_session = BridgeApplicationSession(self, session)
+        session.application_session = application_session
+        application_task = asyncio.create_task(
+            application.async_connected(application_session)
+        )
+        session.application_task = application_task
+        reader_task = asyncio.create_task(
+            self._async_run_heartbeat(session, application_session)
+        )
+        primary_error: BaseException | None = None
+        try:
+            done, _pending = await asyncio.wait(
+                (application_task, reader_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if application_task in done:
+                try:
+                    await application_task
+                except BaseException as error:
+                    if isinstance(error, asyncio.CancelledError) and not session.ready:
+                        try:
+                            await reader_task
+                        except BaseException as reader_error:
+                            primary_error = reader_error
+                    else:
+                        primary_error = error
+                else:
+                    application_session._deactivate()
+                    try:
+                        await reader_task
+                    except BaseException as error:
+                        primary_error = error
+            else:
+                try:
+                    await reader_task
+                except BaseException as error:
+                    primary_error = error
+        except BaseException as error:
+            primary_error = error
+        finally:
+            application_session._deactivate()
+            for task in (application_task, reader_task):
+                if not task.done():
+                    task.cancel()
+            application_result, reader_result = await asyncio.gather(
+                application_task,
+                reader_task,
+                return_exceptions=True,
+            )
+            if session.application_session is application_session:
+                session.application_session = None
+            if session.application_task is application_task:
+                session.application_task = None
+
+        for result in (application_result, reader_result):
+            if isinstance(result, BaseException) and not isinstance(
+                result,
+                asyncio.CancelledError,
+            ):
+                self._raise_normalized_session_error(result)
+        if primary_error is not None:
+            if isinstance(primary_error, asyncio.CancelledError) and not session.ready:
+                return
+            self._raise_normalized_session_error(primary_error)
+
+    async def _async_run_heartbeat(
+        self,
+        session: BridgeSession,
+        application_session: BridgeApplicationSession | None = None,
+    ) -> None:
+        """Own all session reads, heartbeats, and application dispatch."""
         pending_ping_id: str | None = None
         pending_ping_deadline: float | None = None
         loop = asyncio.get_running_loop()
@@ -496,14 +626,17 @@ class DomoticzBridgeManager:
             except TimeoutError:
                 if pending_ping_id is not None:
                     raise _PeerClosed from None
-                pending_ping_id = generate_nonce()
-                pending_ping_deadline = loop.time() + HEARTBEAT_RESPONSE_TIMEOUT
+                ping_id = generate_nonce()
                 await self._async_send_payload(
                     session,
-                    {"id": pending_ping_id, "type": "ping"},
+                    {"id": ping_id, "type": "ping"},
                 )
+                pending_ping_id = ping_id
+                pending_ping_deadline = loop.time() + HEARTBEAT_RESPONSE_TIMEOUT
                 continue
 
+            if not isinstance(payload, dict):
+                raise ProtocolError("invalid protocol message")
             message_type = payload.get("type")
             if message_type == "ping":
                 ping_id = _validate_heartbeat_payload(payload)
@@ -521,7 +654,9 @@ class DomoticzBridgeManager:
                 pending_ping_deadline = None
                 continue
 
-            raise ProtocolError("invalid protocol message")
+            if application_session is None:
+                raise ProtocolError("invalid protocol message")
+            application_session._deliver(payload)
 
     async def _async_receive_payload(
         self,
@@ -549,27 +684,76 @@ class DomoticzBridgeManager:
         payload: dict[str, object],
     ) -> None:
         """Send one authenticated, in-order server envelope."""
-        sequence = session.server_sequence + 1
-        document = sign_envelope(
-            session.session_key,
-            protocol_version=(
-                session.selection.version
-                if session.selection is not None
-                else PROTOCOL_VERSION
-            ),
-            direction=DIRECTION_HA_TO_DOMOTICZ,
-            session_id=session.session_id,
-            sequence=sequence,
-            payload=payload,
-        )
-        await _async_send_document(session.websocket, document)
-        session.server_sequence = sequence
+        async with session.send_lock:
+            async with self._lock:
+                if self._sessions.get(session.link_id) is not session:
+                    raise ProtocolError("application session is no longer active")
+            sequence = session.server_sequence + 1
+            document = sign_envelope(
+                session.session_key,
+                protocol_version=(
+                    session.selection.version
+                    if session.selection is not None
+                    else PROTOCOL_VERSION
+                ),
+                direction=DIRECTION_HA_TO_DOMOTICZ,
+                session_id=session.session_id,
+                sequence=sequence,
+                payload=payload,
+            )
+            await _async_send_document(session.websocket, document)
+            session.server_sequence = sequence
+
+    @staticmethod
+    async def _async_close_session(
+        session: BridgeSession,
+        code: WSCloseCode,
+        message: bytes,
+    ) -> None:
+        """Close a detached session after stopping its application work."""
+        await _async_close(session.websocket, code, message)
 
     async def _async_release_session(self, session: BridgeSession) -> None:
         """Release a session only if it is still the active instance."""
         async with self._lock:
+            self._deactivate_session(session)
             if self._sessions.get(session.link_id) is session:
                 self._sessions.pop(session.link_id)
+
+    async def _async_mark_ready(self, session: BridgeSession) -> None:
+        """Atomically mark only the exact still-active session ready."""
+        async with self._lock:
+            if self._sessions.get(session.link_id) is not session:
+                raise _PeerClosed
+            session.ready = True
+
+    @staticmethod
+    def _deactivate_session(session: BridgeSession) -> None:
+        """Synchronously stop application work for one detached session."""
+        session.ready = False
+        application_session = session.application_session
+        if application_session is not None:
+            application_session._deactivate()
+        application_task = session.application_task
+        if application_task is not None and not application_task.done():
+            application_task.cancel()
+
+    @staticmethod
+    def _raise_normalized_session_error(error: BaseException) -> None:
+        """Raise expected transport failures or one fixed fail-closed error."""
+        if not isinstance(error, Exception):
+            raise error
+        if isinstance(
+            error,
+            (
+                _PeerClosed,
+                ProtocolError,
+                TimeoutError,
+                ConnectionError,
+            ),
+        ):
+            raise error
+        raise ProtocolError("application session is unavailable") from None
 
 
 class DomoticzBridgeView(HomeAssistantView):

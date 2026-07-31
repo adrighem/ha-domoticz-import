@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 
@@ -32,6 +33,7 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
     FEATURE_HA_EXPORT_BINARY_V1,
+    FEATURE_HA_EXPORT_CONTINUOUS_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     PROTOCOL_VERSION,
     PROTOCOL_VERSION_V2,
@@ -143,6 +145,60 @@ class FailingApplication:
         """Raise the configured application failure."""
         self.called.set()
         raise self.error
+
+
+class PersistentApplication:
+    """Application test double that owns its session until it is cancelled."""
+
+    def __init__(self, *, receive: bool = True) -> None:
+        """Initialize lifecycle and received-payload observations."""
+        self._receive = receive
+        self._never_complete = asyncio.Event()
+        self.called = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.session: BridgeApplicationSession | None = None
+        self.received: list[dict[str, object]] = []
+
+    async def async_connected(self, session: BridgeApplicationSession) -> None:
+        """Keep using one application session until its transport ends."""
+        self.session = session
+        self.called.set()
+        try:
+            if not self._receive:
+                await self._never_complete.wait()
+                raise AssertionError("unreachable")
+            while True:
+                payload = await session.async_receive()
+                self.received.append(payload)
+                await session.async_send(
+                    {
+                        "type": "application-response",
+                        "value": payload.get("value"),
+                    }
+                )
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class FailingCancellationApplication:
+    """Application test double that turns transport cancellation into a failure."""
+
+    def __init__(self, error: Exception) -> None:
+        """Store the deterministic failure raised during cancellation."""
+        self._error = error
+        self._never_complete = asyncio.Event()
+        self.called = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def async_connected(self, session: BridgeApplicationSession) -> None:
+        """Wait for reader failure, then expose an application cleanup failure."""
+        self.called.set()
+        try:
+            await self._never_complete.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise self._error from None
 
 
 async def _async_create_endpoint(
@@ -370,6 +426,252 @@ async def test_application_runs_after_ready_and_exchanges_signed_payloads(
 
 
 @pytest.mark.asyncio
+async def test_persistent_application_and_heartbeat_share_one_reader(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Application payloads stay routed while the manager handles heartbeats."""
+    application = PersistentApplication()
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-persistent",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+
+    await connection.async_send({"type": "application-request", "value": 1})
+    assert await connection.async_receive() == {
+        "type": "application-response",
+        "value": 1,
+    }
+    ping_id = generate_nonce()
+    await connection.async_send({"id": ping_id, "type": "ping"})
+    assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    await connection.async_send({"type": "application-request", "value": 2})
+    assert await connection.async_receive() == {
+        "type": "application-response",
+        "value": 2,
+    }
+    assert application.received == [
+        {"type": "application-request", "value": 1},
+        {"type": "application-request", "value": 2},
+    ]
+
+    await connection.websocket.close()
+    async with asyncio.timeout(1):
+        await application.cancelled.wait()
+        for _ in range(10):
+            if not await manager.async_is_ready(link_id):
+                break
+            await asyncio.sleep(0)
+    assert not await manager.async_is_ready(link_id)
+
+
+@pytest.mark.asyncio
+async def test_application_inbox_is_bounded(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An application that stops consuming cannot grow an unbounded inbox."""
+    monkeypatch.setattr(
+        bridge_module,
+        "MAX_APPLICATION_INBOX_MESSAGES",
+        1,
+        raising=False,
+    )
+    application = PersistentApplication(receive=False)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-bounded-inbox",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+
+    await connection.async_send({"type": "application-result", "value": 1})
+    await connection.async_send({"type": "application-result", "value": 2})
+    async with asyncio.timeout(1):
+        close = await connection.websocket.receive()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.POLICY_VIOLATION
+    async with asyncio.timeout(1):
+        await application.cancelled.wait()
+        for _ in range(10):
+            if not await manager.async_is_ready(link_id):
+                break
+            await asyncio.sleep(0)
+    assert not await manager.async_is_ready(link_id)
+    await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_application_and_heartbeat_sends_are_serialized(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent application and pong writes receive unique ordered sequences."""
+    application = PersistentApplication(receive=False)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-serialized-send",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+    assert application.session is not None
+
+    original_send = bridge_module._async_send_document
+    first_send_entered = asyncio.Event()
+    release_first_send = asyncio.Event()
+    active_sends = 0
+    maximum_active_sends = 0
+    sent_sequences: list[int] = []
+
+    async def _async_gated_send(websocket, document):
+        nonlocal active_sends, maximum_active_sends
+        payload = document.get("payload") if isinstance(document, dict) else None
+        if isinstance(payload, dict) and payload.get("type") in {
+            "application-send",
+            "pong",
+        }:
+            active_sends += 1
+            maximum_active_sends = max(maximum_active_sends, active_sends)
+            sent_sequences.append(document["sequence"])
+            if not first_send_entered.is_set():
+                first_send_entered.set()
+                await release_first_send.wait()
+            active_sends -= 1
+        await original_send(websocket, document)
+
+    monkeypatch.setattr(bridge_module, "_async_send_document", _async_gated_send)
+    application_send = asyncio.create_task(
+        application.session.async_send({"type": "application-send", "value": 1})
+    )
+    async with asyncio.timeout(1):
+        await first_send_entered.wait()
+    ping_id = generate_nonce()
+    await connection.async_send({"id": ping_id, "type": "ping"})
+    await asyncio.sleep(0)
+    assert maximum_active_sends == 1
+
+    release_first_send.set()
+    await application_send
+    assert await connection.async_receive() == {
+        "type": "application-send",
+        "value": 1,
+    }
+    assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    assert sent_sequences == [2, 3]
+    assert maximum_active_sends == 1
+
+    await connection.websocket.close()
+    async with asyncio.timeout(1):
+        await application.cancelled.wait()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_response_deadline_starts_after_serialized_ping_send(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send-lock contention cannot consume the peer's pong response window."""
+    monkeypatch.setattr(bridge_module, "HEARTBEAT_INTERVAL", 0.01)
+    monkeypatch.setattr(bridge_module, "HEARTBEAT_RESPONSE_TIMEOUT", 0.1)
+    application = PersistentApplication(receive=False)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-heartbeat-send-contention",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+    assert application.session is not None
+
+    original_send = bridge_module._async_send_document
+    application_send_entered = asyncio.Event()
+    release_application_send = asyncio.Event()
+
+    async def _async_gated_send(websocket, document):
+        payload = document.get("payload") if isinstance(document, dict) else None
+        if isinstance(payload, dict) and payload.get("type") == "application-send":
+            application_send_entered.set()
+            await release_application_send.wait()
+        await original_send(websocket, document)
+
+    monkeypatch.setattr(bridge_module, "_async_send_document", _async_gated_send)
+    application_send = asyncio.create_task(
+        application.session.async_send({"type": "application-send"})
+    )
+    async with asyncio.timeout(1):
+        await application_send_entered.wait()
+    await asyncio.sleep(0.15)
+
+    release_application_send.set()
+    await application_send
+    assert await connection.async_receive() == {"type": "application-send"}
+    server_ping = await connection.async_receive()
+    assert server_ping["type"] == "ping"
+    await connection.async_send({"id": server_ping["id"], "type": "pong"})
+
+    client_ping_id = generate_nonce()
+    await connection.async_send({"id": client_ping_id, "type": "ping"})
+    assert await connection.async_receive() == {
+        "id": client_ping_id,
+        "type": "pong",
+    }
+    assert await manager.async_is_ready(link_id)
+
+    await connection.websocket.close()
+    async with asyncio.timeout(1):
+        await application.cancelled.wait()
+
+
+@pytest.mark.asyncio
 async def test_legacy_v1_remains_heartbeat_only_without_application_side_effects(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,
@@ -432,6 +734,50 @@ async def test_v2_without_export_features_remains_heartbeat_only(
     ping_id = generate_nonce()
     await connection.async_send({"id": ping_id, "type": "ping"})
     assert await connection.async_receive() == {"id": ping_id, "type": "pong"}
+    await connection.websocket.close()
+
+
+@pytest.mark.parametrize("application_enabled", (True, False))
+@pytest.mark.asyncio
+async def test_continuous_only_selection_fails_closed(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    application_enabled: bool,
+) -> None:
+    """Continuous export cannot bypass its application dependency checks."""
+    application = (
+        FailingApplication(ProtocolError("continuous export is unavailable"))
+        if application_enabled
+        else None
+    )
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-continuous-only",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_CONTINUOUS_V1,),
+    )
+    async with asyncio.timeout(1):
+        close = await connection.websocket.receive()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.POLICY_VIOLATION
+    if application is not None:
+        assert application.called.is_set()
+    for _ in range(10):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
     await connection.websocket.close()
 
 
@@ -551,6 +897,100 @@ async def test_application_failure_closes_and_releases_session(
         await asyncio.sleep(0)
     assert await manager.async_active_session_count() == 0
     await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_application_failure_wins_simultaneous_reader_failure(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A sibling failure cannot be discarded while both tasks are unwinding."""
+    application = FailingCancellationApplication(ConnectionError())
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-simultaneous-failure",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+
+    await connection.async_send({"id": generate_nonce(), "type": "pong"})
+    async with asyncio.timeout(1):
+        close = await connection.websocket.receive()
+        await application.cancelled.wait()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
+    for _ in range(10):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
+    await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_application_failure_is_normalized_without_raw_log_text(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unexpected application details cannot escape through the HTTP handler."""
+    private_marker = "private-application-failure-marker"
+    application = FailingApplication(RuntimeError(private_marker))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-normalized-failure",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    with caplog.at_level(logging.ERROR, logger="aiohttp.server"):
+        connection = await _async_connect_v2(
+            client,
+            link_id=link_id,
+            pairing_key=pairing_key,
+            client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+        )
+        async with asyncio.timeout(1):
+            await application.called.wait()
+            close = await connection.websocket.receive()
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.POLICY_VIOLATION
+    assert private_marker not in caplog.text
+    for _ in range(10):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
+    await connection.websocket.close()
+
+
+@pytest.mark.parametrize("error_type", (SystemExit, KeyboardInterrupt, GeneratorExit))
+def test_non_exception_base_failures_are_not_normalized(
+    error_type: type[BaseException],
+) -> None:
+    """Process-control BaseExceptions retain their original identity."""
+    error = error_type()
+
+    with pytest.raises(error_type) as raised:
+        DomoticzBridgeManager._raise_normalized_session_error(error)
+
+    assert raised.value is error
 
 
 @pytest.mark.asyncio
@@ -778,6 +1218,253 @@ async def test_unregister_closes_session_and_disables_link(
     assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
     assert not await manager.async_is_ready(link_id)
     await connection.websocket.close()
+
+
+@pytest.mark.parametrize("stop_method", ("unregister", "shutdown"))
+@pytest.mark.asyncio
+async def test_manager_stop_cancels_application_and_rejects_stale_sends(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_method: str,
+) -> None:
+    """A detached exact session cannot allocate another outbound sequence."""
+    application = PersistentApplication(receive=False)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-stop",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+    assert application.session is not None
+    blocked_receive = asyncio.create_task(application.session.async_receive())
+    await asyncio.sleep(0)
+    assert not blocked_receive.done()
+
+    original_close = bridge_module._async_close
+    close_entered = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    async def _async_gated_close(websocket, code, message):
+        close_entered.set()
+        await allow_close.wait()
+        await original_close(websocket, code, message)
+
+    monkeypatch.setattr(bridge_module, "_async_close", _async_gated_close)
+    if stop_method == "unregister":
+        stop_task = asyncio.create_task(manager.async_unregister_entry("entry-stop"))
+    else:
+        stop_task = asyncio.create_task(manager.async_shutdown())
+    async with asyncio.timeout(1):
+        await close_entered.wait()
+    assert not await manager.async_is_ready(link_id)
+    async with asyncio.timeout(1):
+        await application.cancelled.wait()
+    with pytest.raises(ProtocolError, match="no longer active"):
+        await blocked_receive
+
+    stale_send = asyncio.create_task(
+        application.session.async_send({"type": "stale-application-send"})
+    )
+    await asyncio.sleep(0)
+    assert stale_send.done()
+    with pytest.raises(ProtocolError, match="no longer active"):
+        await stale_send
+    close_receive = asyncio.create_task(connection.websocket.receive())
+    allow_close.set()
+    close = await close_receive
+    await stop_task
+
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
+    with pytest.raises(ProtocolError, match="no longer active"):
+        await application.session.async_send({"type": "later-stale-send"})
+    await connection.websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_detach_discards_queued_application_payload(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified payload queued before detach cannot escape after detach."""
+    application = PersistentApplication(receive=False)
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-queued-detach",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+    connection = await _async_connect_v2(
+        client,
+        link_id=link_id,
+        pairing_key=pairing_key,
+        client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+    )
+    async with asyncio.timeout(1):
+        await application.called.wait()
+    assert application.session is not None
+
+    original_deliver = BridgeApplicationSession._deliver
+    payload_queued = asyncio.Event()
+
+    def _deliver(session, payload):
+        original_deliver(session, payload)
+        payload_queued.set()
+
+    monkeypatch.setattr(BridgeApplicationSession, "_deliver", _deliver)
+    await connection.async_send({"type": "queued-before-detach"})
+    async with asyncio.timeout(1):
+        await payload_queued.wait()
+
+    original_close = bridge_module._async_close
+    close_entered = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    async def _async_gated_close(websocket, code, message):
+        close_entered.set()
+        await allow_close.wait()
+        await original_close(websocket, code, message)
+
+    monkeypatch.setattr(bridge_module, "_async_close", _async_gated_close)
+    stop_task = asyncio.create_task(
+        manager.async_unregister_entry("entry-queued-detach")
+    )
+    async with asyncio.timeout(1):
+        await close_entered.wait()
+        await application.cancelled.wait()
+
+    with pytest.raises(ProtocolError, match="no longer active"):
+        await application.session.async_receive()
+
+    close_receive = asyncio.create_task(connection.websocket.receive())
+    allow_close.set()
+    close = await close_receive
+    await stop_task
+    assert close.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+    assert connection.websocket.close_code == WSCloseCode.GOING_AWAY
+    await connection.websocket.close()
+
+
+@pytest.mark.parametrize("protocol", ("v1", "v2"))
+@pytest.mark.asyncio
+async def test_detach_during_ready_send_cannot_reactivate_session(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """A completed ready write cannot launch work after exact-session detach."""
+    application = FailingApplication(AssertionError("application must not start"))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id="entry-ready-detach",
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    client = await _async_create_endpoint(hass, hass_client_no_auth, manager)
+
+    if protocol == "v1":
+        websocket, context, session_key = await _async_start_handshake(
+            client,
+            link_id=link_id,
+            pairing_key=pairing_key,
+        )
+        handshake_ready = canonical_json_loads(await websocket.receive_str())
+        session_id = verify_ready(session_key, context, handshake_ready)
+        protocol_version = PROTOCOL_VERSION
+        client_payload = {"targets": [], "type": "inventory"}
+        ready_type = "ready"
+    else:
+        websocket, context, session_key = await _async_start_v2_handshake(
+            client,
+            link_id=link_id,
+            pairing_key=pairing_key,
+            client_features=(FEATURE_HA_EXPORT_NUMERIC_V1,),
+        )
+        handshake_ready = canonical_json_loads(await websocket.receive_str())
+        session_id = verify_v2_ready(session_key, context, handshake_ready)
+        protocol_version = PROTOCOL_VERSION_V2
+        client_payload = build_application_ready(context.selection)
+        ready_type = "application_ready"
+
+    session = manager._sessions[link_id]
+    original_send = bridge_module._async_send_document
+    ready_sent = asyncio.Event()
+    release_ready_send = asyncio.Event()
+    heartbeat_started = asyncio.Event()
+
+    async def _async_gate_after_ready_send(websocket, document):
+        await original_send(websocket, document)
+        payload = document.get("payload") if isinstance(document, dict) else None
+        if isinstance(payload, dict) and payload.get("type") == ready_type:
+            ready_sent.set()
+            await release_ready_send.wait()
+
+    async def _async_observe_heartbeat(
+        observed_session,
+        application_session=None,
+    ) -> None:
+        assert observed_session is session
+        heartbeat_started.set()
+        raise bridge_module._PeerClosed
+
+    monkeypatch.setattr(
+        bridge_module,
+        "_async_send_document",
+        _async_gate_after_ready_send,
+    )
+    monkeypatch.setattr(manager, "_async_run_heartbeat", _async_observe_heartbeat)
+    await websocket.send_str(
+        canonical_json_dumps(
+            sign_envelope(
+                session_key,
+                protocol_version=protocol_version,
+                direction=DIRECTION_DOMOTICZ_TO_HA,
+                session_id=session_id,
+                sequence=1,
+                payload=client_payload,
+            )
+        )
+    )
+    async with asyncio.timeout(1):
+        await ready_sent.wait()
+
+    unregister_task = asyncio.create_task(
+        manager.async_unregister_entry("entry-ready-detach")
+    )
+    for _ in range(10):
+        if await manager.async_active_session_count() == 0:
+            break
+        await asyncio.sleep(0)
+    assert await manager.async_active_session_count() == 0
+
+    release_ready_send.set()
+    await websocket.close()
+    await unregister_task
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert not heartbeat_started.is_set()
+    assert not application.called.is_set()
+    assert not session.ready
 
 
 @pytest.mark.asyncio
