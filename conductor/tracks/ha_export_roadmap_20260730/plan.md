@@ -14,9 +14,10 @@
   - [x] Test deterministic creation, adoption, update, and unavailable state
   - [x] Update user and architecture documentation
   - [x] Run current Python, Python 3.9, integration, and Ruff validation
-- [~] Task 1.4: Manual verification
+- [x] Task 1.4: Manual verification
   - [x] Install the released version on the test Domoticz instance
-  - [ ] Confirm representative native devices
+  - [x] Confirm a native Temperature target keeps its identity across reconnects
+    (live 2026-07-31)
   - [x] Confirm the live fallback uses the expected Custom Sensor profile
   - [x] Confirm a fallback sensor reconnects without duplicates
   - [x] Cover native and fallback reconnects end to end (`2698f1b`)
@@ -68,8 +69,15 @@
   - [x] Document both rolling-upgrade orders and matching-tag checks (`621bacc`)
   - [x] Preserve matching-version surfaces with regression coverage (`2698f1b`)
   - [ ] Manually verify the Home Assistant-first order
-  - [ ] Manually verify the Domoticz plugin-first order
+    - Blocked until the installed Domoticz plugin checkout can be inspected and
+      switched to an exact tag without deleting the installation
+  - [x] Manually verify the Domoticz plugin-first order
+    - Live 2026-07-31: HA `v0.2.0` negotiated heartbeat-only v1 with two
+      persistent targets; restoring `v0.3.1` negotiated numeric v2 with the
+      same two targets
   - [ ] Manually verify a matching-tag installation
+    - Blocked because the Domoticz API exposes neither the installed plugin tag
+      nor a non-destructive exact-tag switch
 
 ## Phase 4: First Export Release
 
