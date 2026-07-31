@@ -126,8 +126,12 @@
 - [x] Task 6.1: Define catalog delta and reconnect semantics (`e09360e`)
 - [x] Task 6.2: Subscribe to selected Home Assistant state and metadata changes
   (`03b810a`)
-- [~] Task 6.3: Coalesce updates and recover from disconnects
-- [ ] Task 6.4: Test and manually verify live updates and relabeling
+- [x] Task 6.3: Coalesce updates and recover from disconnects (`99dae55`)
+- [~] Task 6.4: Test and manually verify live updates and relabeling
+  (`2b12e76`)
+  - [x] Automated continuous, reconnect, relabel, unavailable, metadata,
+    capacity, rejection, and mixed-version verification
+  - [ ] Live verification on the installed Home Assistant and Domoticz peers
 
 ## Phase 7: Multi-capability Read-only Entities
 
