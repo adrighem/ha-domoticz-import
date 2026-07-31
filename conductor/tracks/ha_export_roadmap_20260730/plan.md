@@ -64,20 +64,22 @@
   schema-versioned application messages and catalog schema v2
 - [x] Task 3.4: Test mixed installations, negotiation tampering, downgrade
   boundaries, and current and Python 3.9 compatibility
-- [~] Task 3.5: Document and manually verify both mixed-version rolling upgrade
+- [x] Task 3.5: Document and manually verify both mixed-version rolling upgrade
   orders and the matching-tag installation
   - [x] Document both rolling-upgrade orders and matching-tag checks (`621bacc`)
   - [x] Preserve matching-version surfaces with regression coverage (`2698f1b`)
-  - [ ] Manually verify the Home Assistant-first order
-    - Blocked until the installed Domoticz plugin checkout can be inspected and
-      switched to an exact tag without deleting the installation
+  - [x] Manually verify the Home Assistant-first order
+    - Live 2026-07-31: exact plugin `v0.2.0` recreated the v1-only mixed
+      checkpoint under HA `v0.3.1`; updating the plugin to `v0.3.1` negotiated
+      numeric v2 with the same two persistent targets
   - [x] Manually verify the Domoticz plugin-first order (`7347ca3`)
     - Live 2026-07-31: HA `v0.2.0` negotiated heartbeat-only v1 with two
       persistent targets; restoring `v0.3.1` negotiated numeric v2 with the
       same two targets
-  - [ ] Manually verify a matching-tag installation
-    - Blocked because the Domoticz API exposes neither the installed plugin tag
-      nor a non-destructive exact-tag switch
+  - [x] Manually verify a matching-tag installation
+    - Live 2026-07-31: HACS and the remote plugin checkout both reported exact
+      `v0.3.1`; an unchanged `domoticz.service` restart negotiated numeric v2
+      and preserved both target identities without duplicates
 
 ## Phase 4: First Export Release
 
