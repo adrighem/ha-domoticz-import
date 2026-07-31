@@ -39,6 +39,9 @@ from homeassistant.const import (  # noqa: E402
 from homeassistant.core import HomeAssistant  # noqa: E402
 from homeassistant.helpers import entity_registry as er  # noqa: E402
 from homeassistant.helpers import label_registry as lr  # noqa: E402
+from homeassistant.helpers.instance_id import (  # noqa: E402
+    async_get as async_get_instance_id,
+)
 from homeassistant.setup import async_setup_component  # noqa: E402
 from pytest_homeassistant_custom_component.common import (  # noqa: E402
     MockConfigEntry,
@@ -65,6 +68,9 @@ from custom_components.domoticz_sync.const import (  # noqa: E402
     DOMAIN,
     EXPORT_LABEL_NAME,
 )
+from custom_components.domoticz_sync.core.capabilities import (  # noqa: E402
+    CapabilityKind,
+)
 from custom_components.domoticz_sync.core.catalog import (  # noqa: E402
     catalog_from_document,
 )
@@ -72,6 +78,7 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
     FEATURE_DOMOTICZ_INVENTORY_V1,
+    ApplyResultStatus,
     InventoryResult,
     InventoryTarget,
     ProtocolSelection,
@@ -79,9 +86,17 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     canonical_json_loads,
     generate_link_id,
     generate_pairing_key,
+    parse_apply,
+    parse_apply_result,
     parse_inventory_request,
     parse_inventory_result,
     verify_envelope,
+)
+from custom_components.domoticz_sync.core.reconciliation import (  # noqa: E402
+    derive_domoticz_target_id,
+)
+from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E402
+    collect_export_selection,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -555,6 +570,45 @@ async def _exchange_one_apply(
     return send_position
 
 
+async def _exchange_observed_numeric_apply(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+) -> tuple[int, object, object]:
+    """Exchange and independently parse one signed numeric apply and result."""
+    selection = _selected_protocol(plugin)
+    request_text = await _receive_text(websocket)
+    request = parse_apply(
+        selection,
+        verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(request_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+            expected_session_id=plugin._session_id,
+            last_sequence=plugin._in_sequence,
+        ).payload,
+    )
+    response_sequence = plugin._out_sequence
+    plugin.onMessage(connection, {"Payload": request_text})
+
+    result_text, send_position = _next_text_payload(connection, send_position)
+    result = parse_apply_result(
+        selection,
+        verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(result_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=plugin._session_id,
+            last_sequence=response_sequence,
+        ).payload,
+    )
+    await websocket.send_str(result_text)
+    return send_position, request, result
+
+
 async def _close_plugin_connection(
     plugin: object,
     websocket: object,
@@ -824,6 +878,7 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
     for index in range(65):
         target_id = f"FOREIGN{index:018d}"
         fake_domoticz.devices[target_id] = _FakeDevice(target_id)
+    foreign_devices = dict(fake_domoticz.devices)
 
     (
         first,
@@ -999,6 +1054,122 @@ async def test_real_bridge_reconciles_numeric_sensor_across_reconnects(
             manager,
             bridge_view,
             3,
+        )
+
+    target_count = len(fake_domoticz.devices)
+    removed_device = fake_domoticz.devices.pop(target_id)
+    assert removed_device.Units[1] is unit
+    (
+        fourth,
+        fourth_connection,
+        fourth_websocket,
+        fourth_position,
+        fourth_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        assert fourth_inventory is not None
+        assert len(fourth_inventory.targets) == target_count - 1
+        assert all(target.target_id != target_id for target in fourth_inventory.targets)
+        (
+            fourth_position,
+            recreate_request,
+            recreate_result,
+        ) = await _exchange_observed_numeric_apply(
+            fourth,
+            fourth_connection,
+            fourth_websocket,
+            fourth_position,
+        )
+        assert recreate_request.action.kind.value == "update"
+        assert recreate_request.action.target_id == target_id
+        assert recreate_result.status is ApplyResultStatus.CONFIRMED
+        assert recreate_result.target_id == target_id
+        assert recreate_result.source == recreate_request.action.capability.source
+        await application.async_wait_for_calls(4)
+
+        recreated_catalog = catalog_from_document(await storage.async_load())
+        assert len(recreated_catalog.records) == 1
+        assert recreated_catalog.records[0].target_id == target_id
+        assert not recreated_catalog.records[0].pending
+        assert len(fake_domoticz.devices) == target_count
+        assert len(fake_domoticz.create_calls) == 2
+        replacement_device = fake_domoticz.devices[target_id]
+        replacement_unit = replacement_device.Units[1]
+        assert replacement_device is not removed_device
+        assert replacement_unit is not unit
+        assert replacement_unit.Name == source_name
+        assert replacement_unit.Type == expected_type
+        assert replacement_unit.SubType == expected_subtype
+        assert replacement_unit.SwitchType == 0
+        assert replacement_unit.Options == expected_options
+        assert replacement_unit.Used == 1
+        assert (replacement_unit.nValue, replacement_unit.sValue) == (0, "18.75")
+        assert replacement_device.TimedOut == 0
+        assert fourth_position == len(fourth_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            fourth,
+            fourth_websocket,
+            manager,
+            bridge_view,
+            4,
+        )
+
+    (
+        fifth,
+        fifth_connection,
+        fifth_websocket,
+        fifth_position,
+        fifth_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        assert fifth_inventory is not None
+        assert len(fifth_inventory.targets) == target_count
+        (
+            fifth_position,
+            reassert_request,
+            reassert_result,
+        ) = await _exchange_observed_numeric_apply(
+            fifth,
+            fifth_connection,
+            fifth_websocket,
+            fifth_position,
+        )
+        assert reassert_request.action.kind.value == "update"
+        assert reassert_request.action.target_id == target_id
+        assert reassert_result.status is ApplyResultStatus.CONFIRMED
+        assert reassert_result.target_id == target_id
+        assert reassert_result.source == reassert_request.action.capability.source
+        await application.async_wait_for_calls(5)
+        assert len(fake_domoticz.devices) == target_count
+        assert len(fake_domoticz.create_calls) == 2
+        assert fake_domoticz.devices[target_id] is replacement_device
+        assert replacement_device.Units[1] is replacement_unit
+        assert replacement_unit.sValue == "18.75"
+        assert all(
+            fake_domoticz.devices[foreign_id] is foreign_device
+            and foreign_device.Units == {}
+            for foreign_id, foreign_device in foreign_devices.items()
+        )
+        assert fifth_position == len(fifth_connection.sent)
+        assert fake_domoticz.errors == []
+    finally:
+        await _close_plugin_connection(
+            fifth,
+            fifth_websocket,
+            manager,
+            bridge_view,
+            5,
         )
 
 
@@ -1281,3 +1452,560 @@ async def test_real_bridge_reconciles_binary_sensor_across_reconnects(
         )
 
     assert fake_domoticz.errors == []
+
+
+@pytest.mark.asyncio
+async def test_real_bridge_repairs_safe_target_after_rejecting_unsafe_targets(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unsafe binding cannot block repair or expose neighboring targets."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    state_attributes = {
+        ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+        ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+    }
+    source_entries = []
+    for index in range(3):
+        source_name = f"Safety source {index}"
+        source_entry = registry.async_get_or_create(
+            "sensor",
+            "integration_test",
+            f"safety_source_{index}",
+            suggested_object_id=f"safety_source_{index}",
+            capabilities={ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING},
+            original_device_class=SensorDeviceClass.ENERGY,
+            original_name=source_name,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
+        registry.async_update_entity(
+            source_entry.entity_id,
+            labels={export_label.label_id},
+        )
+        hass.states.async_set(
+            source_entry.entity_id,
+            str(10 + index),
+            {**state_attributes, ATTR_FRIENDLY_NAME: source_name},
+        )
+        source_entries.append(source_entry)
+
+    application = _ObservedApplication(HomeAssistantExportApplication(hass))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+    assert endpoint.port is not None
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    _assert_inventory_negotiation_enabled(plugin_module)
+
+    (
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+        first_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    destination_id = first._destination_id
+    assert isinstance(destination_id, str)
+    storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    try:
+        assert first_inventory is not None
+        assert first_inventory.targets == ()
+        for _ in source_entries:
+            first_position = await _exchange_one_apply(
+                first,
+                first_connection,
+                first_websocket,
+                first_position,
+                application,
+                1,
+            )
+        await application.async_wait_for_calls(1)
+        assert first_position == len(first_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            first,
+            first_websocket,
+            manager,
+            bridge_view,
+            1,
+        )
+
+    baseline_document = await storage.async_load()
+    assert baseline_document is not None
+    baseline_catalog = catalog_from_document(baseline_document)
+    assert len(baseline_catalog.records) == 3
+    incompatible_record, safe_record, sibling_record = baseline_catalog.records
+    incompatible_id = incompatible_record.target_id
+    safe_id = safe_record.target_id
+    sibling_id = sibling_record.target_id
+    assert len(fake_domoticz.create_calls) == 3
+
+    def target_snapshot(device: _FakeDevice, unit: _FakeUnit) -> tuple[object, ...]:
+        return (
+            device.DeviceID,
+            device.TimedOut,
+            tuple(device.Units),
+            unit.Unit,
+            unit.Name,
+            unit.Type,
+            unit.SubType,
+            unit.SwitchType,
+            tuple(sorted(unit.Options.items())),
+            unit.Used,
+            unit.nValue,
+            unit.sValue,
+            tuple(tuple(sorted(update.items())) for update in unit.updates),
+            unit.refreshes,
+        )
+
+    incompatible_device = fake_domoticz.devices[incompatible_id]
+    incompatible_unit = incompatible_device.Units[1]
+    incompatible_device.TimedOut = 1
+    incompatible_unit.Name = "Manual incompatible name"
+    incompatible_unit.Type = 244
+    incompatible_unit.SubType = 73
+    incompatible_unit.SwitchType = 8
+    incompatible_unit.Options = {"Private": "incompatible"}
+    incompatible_unit.Used = 0
+    incompatible_unit.nValue = 9
+    incompatible_unit.sValue = "manual-incompatible"
+    incompatible_snapshot = target_snapshot(
+        incompatible_device,
+        incompatible_unit,
+    )
+
+    safe_device = fake_domoticz.devices[safe_id]
+    safe_unit = safe_device.Units[1]
+    safe_expected_name = safe_unit.Name
+    safe_expected_values = (safe_unit.nValue, safe_unit.sValue)
+    safe_expected_custom = safe_unit.Options["Custom"]
+    safe_updates_before = len(safe_unit.updates)
+    safe_refreshes_before = safe_unit.refreshes
+    safe_device.TimedOut = 1
+    safe_unit.Name = "Manual safe drift"
+    safe_unit.Options = {"Custom": "1;wrong", "Private": "safe"}
+    safe_unit.Used = 0
+    safe_unit.nValue = 7
+    safe_unit.sValue = "manual-safe"
+
+    sibling_device = fake_domoticz.devices[sibling_id]
+    sibling_unit = sibling_device.Units[1]
+    sibling_device.TimedOut = 1
+    sibling_unit.Name = "Manual sibling parent"
+    sibling_unit.Options = {"Custom": "1;sibling", "Private": "unit-1"}
+    sibling_unit.Used = 0
+    sibling_unit.nValue = 8
+    sibling_unit.sValue = "manual-sibling"
+    sibling_unit_2 = _FakeUnit(
+        fake_domoticz,
+        Unit=2,
+        Name="Manual sibling Unit 2",
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;private", "Private": "unit-2"},
+        Used=0,
+        nValue=6,
+        sValue="manual-unit-2",
+    )
+    sibling_device.Units[2] = sibling_unit_2
+    sibling_snapshot = target_snapshot(sibling_device, sibling_unit)
+    sibling_2_snapshot = target_snapshot(sibling_device, sibling_unit_2)
+
+    collision_name = "Manual collision source"
+    collision_entry = registry.async_get_or_create(
+        "sensor",
+        "integration_test",
+        "manual_collision_source",
+        suggested_object_id="manual_collision_source",
+        capabilities={ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING},
+        original_device_class=SensorDeviceClass.ENERGY,
+        original_name=collision_name,
+        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    )
+    registry.async_update_entity(
+        collision_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    hass.states.async_set(
+        collision_entry.entity_id,
+        "42",
+        {**state_attributes, ATTR_FRIENDLY_NAME: collision_name},
+    )
+    collection = collect_export_selection(
+        hass,
+        instance_id=await async_get_instance_id(hass),
+        label_id=export_label.label_id,
+        included_kinds=frozenset({CapabilityKind.NUMERIC}),
+    )
+    collision_capability = next(
+        capability
+        for capability in collection.capabilities
+        if capability.source.object_id == collision_entry.id
+    )
+    collision_id = derive_domoticz_target_id(collision_capability.source)
+    assert collision_id not in fake_domoticz.devices
+    collision_device = _FakeDevice(collision_id)
+    collision_device.TimedOut = 1
+    collision_unit = _FakeUnit(
+        fake_domoticz,
+        Unit=1,
+        Name="Unrelated manual target",
+        Type=243,
+        Subtype=31,
+        Switchtype=0,
+        Options={"Custom": "1;manual", "Private": "collision"},
+        Used=0,
+        nValue=5,
+        sValue="manual-collision",
+    )
+    collision_device.Units[1] = collision_unit
+    fake_domoticz.devices[collision_id] = collision_device
+    collision_snapshot = target_snapshot(collision_device, collision_unit)
+
+    create_count = len(fake_domoticz.create_calls)
+    target_ids = frozenset(fake_domoticz.devices)
+    (
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+        second_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        assert second_inventory is not None
+        inventory_by_id = {
+            target.target_id: target for target in second_inventory.targets
+        }
+        assert frozenset(inventory_by_id) == target_ids
+        assert tuple(unit.unit for unit in inventory_by_id[sibling_id].units) == (1, 2)
+
+        (
+            second_position,
+            rejected_request,
+            rejected_result,
+        ) = await _exchange_observed_numeric_apply(
+            second,
+            second_connection,
+            second_websocket,
+            second_position,
+        )
+        assert rejected_request.action.target_id == incompatible_id
+        assert rejected_result.status is ApplyResultStatus.REJECTED
+        assert rejected_result.target_id is None
+        assert rejected_result.source is None
+
+        (
+            second_position,
+            repaired_request,
+            repaired_result,
+        ) = await _exchange_observed_numeric_apply(
+            second,
+            second_connection,
+            second_websocket,
+            second_position,
+        )
+        assert repaired_request.action.target_id == safe_id
+        assert repaired_result.status is ApplyResultStatus.CONFIRMED
+        assert repaired_result.target_id == safe_id
+        assert repaired_result.source == safe_record.capability.source
+        await application.async_wait_for_calls(2)
+        assert second_position == len(second_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            second,
+            second_websocket,
+            manager,
+            bridge_view,
+            2,
+        )
+
+    assert fake_domoticz.devices[safe_id] is safe_device
+    assert safe_device.Units[1] is safe_unit
+    assert safe_unit.Name == safe_expected_name
+    assert (safe_unit.Type, safe_unit.SubType, safe_unit.SwitchType) == (243, 31, 0)
+    assert safe_unit.Options == {
+        "Custom": safe_expected_custom,
+        "Private": "safe",
+    }
+    assert safe_unit.Used == 1
+    assert (safe_unit.nValue, safe_unit.sValue) == safe_expected_values
+    assert safe_device.TimedOut == 0
+    assert len(safe_unit.updates) == safe_updates_before + 1
+    assert safe_unit.updates[-1] == {
+        "Log": False,
+        "UpdateProperties": True,
+        "UpdateOptions": True,
+    }
+    assert safe_unit.refreshes == safe_refreshes_before + 1
+
+    assert fake_domoticz.devices[incompatible_id] is incompatible_device
+    assert incompatible_device.Units[1] is incompatible_unit
+    assert target_snapshot(incompatible_device, incompatible_unit) == (
+        incompatible_snapshot
+    )
+    assert fake_domoticz.devices[sibling_id] is sibling_device
+    assert sibling_device.Units[1] is sibling_unit
+    assert sibling_device.Units[2] is sibling_unit_2
+    assert target_snapshot(sibling_device, sibling_unit) == sibling_snapshot
+    assert target_snapshot(sibling_device, sibling_unit_2) == sibling_2_snapshot
+    assert fake_domoticz.devices[collision_id] is collision_device
+    assert collision_device.Units[1] is collision_unit
+    assert target_snapshot(collision_device, collision_unit) == collision_snapshot
+
+    assert len(fake_domoticz.create_calls) == create_count
+    assert frozenset(fake_domoticz.devices) == target_ids
+    assert await storage.async_load() == baseline_document
+    final_catalog = catalog_from_document(await storage.async_load())
+    assert tuple(record.target_id for record in final_catalog.records) == (
+        incompatible_id,
+        safe_id,
+        sibling_id,
+    )
+    assert all(not record.pending for record in final_catalog.records)
+    assert final_catalog.get(collision_capability.source) is None
+    assert application.completed_calls == 2
+    assert fake_domoticz.errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_side", ("home_assistant", "plugin"))
+async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_side: str,
+) -> None:
+    """Either pre-inventory peer keeps common export safe and catalog-only."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="mixed-v2-integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    source_name = "Mixed-version energy"
+    source_entry = registry.async_get_or_create(
+        "sensor",
+        "integration_test",
+        "mixed_version_energy",
+        suggested_object_id="mixed_version_energy",
+        capabilities={ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING},
+        original_device_class=SensorDeviceClass.ENERGY,
+        original_name=source_name,
+        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    )
+    registry.async_update_entity(
+        source_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    hass.states.async_set(
+        source_entry.entity_id,
+        "12.5",
+        {
+            ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+            ATTR_FRIENDLY_NAME: source_name,
+            ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+        },
+    )
+
+    application = _ObservedApplication(HomeAssistantExportApplication(hass))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+    assert endpoint.port is not None
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert FEATURE_DOMOTICZ_INVENTORY_V1 in bridge_module.SUPPORTED_V2_FEATURES
+    assert (
+        FEATURE_DOMOTICZ_INVENTORY_V1
+        in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
+    )
+    if legacy_side == "home_assistant":
+        monkeypatch.setattr(
+            bridge_module,
+            "SUPPORTED_V2_FEATURES",
+            tuple(
+                feature
+                for feature in bridge_module.SUPPORTED_V2_FEATURES
+                if feature != FEATURE_DOMOTICZ_INVENTORY_V1
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            plugin_module.wire_protocol,
+            "SUPPORTED_V2_FEATURES",
+            tuple(
+                feature
+                for feature in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
+                if feature != FEATURE_DOMOTICZ_INVENTORY_V1
+            ),
+        )
+
+    assert (FEATURE_DOMOTICZ_INVENTORY_V1 in bridge_module.SUPPORTED_V2_FEATURES) is (
+        legacy_side == "plugin"
+    )
+    assert (
+        FEATURE_DOMOTICZ_INVENTORY_V1
+        in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
+    ) is (legacy_side == "home_assistant")
+
+    (
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+        first_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    destination_id = first._destination_id
+    assert isinstance(destination_id, str)
+    storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    try:
+        selection = _selected_protocol(first)
+        assert not selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+        assert first_inventory is None
+        first_position, request, result = await _exchange_observed_numeric_apply(
+            first,
+            first_connection,
+            first_websocket,
+            first_position,
+        )
+        await application.async_wait_for_calls(1)
+
+        assert request.action.kind.value == "create"
+        assert result.status is ApplyResultStatus.CONFIRMED
+        assert result.target_id is not None
+        assert result.source == request.action.capability.source
+        assert first_position == len(first_connection.sent)
+    finally:
+        await _close_plugin_connection(
+            first,
+            first_websocket,
+            manager,
+            bridge_view,
+            1,
+        )
+
+    baseline_document = await storage.async_load()
+    assert baseline_document is not None
+    baseline_catalog = catalog_from_document(baseline_document)
+    assert len(baseline_catalog.records) == 1
+    record = baseline_catalog.records[0]
+    target_id = record.target_id
+    assert target_id == result.target_id
+    assert not record.pending
+    assert len(fake_domoticz.devices) == 1
+    assert len(fake_domoticz.create_calls) == 1
+    device = fake_domoticz.devices[target_id]
+    unit = device.Units[1]
+
+    drifted_name = "Manual mixed-version drift"
+    unit.Name = drifted_name
+    (
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+        second_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    try:
+        assert second_inventory is None
+        assert not _selected_protocol(second).supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+        await application.async_wait_for_calls(2)
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await second_websocket.receive()
+
+        assert second_position == len(second_connection.sent)
+        assert len(fake_domoticz.devices) == 1
+        assert len(fake_domoticz.create_calls) == 1
+        assert fake_domoticz.devices[target_id] is device
+        assert device.Units[1] is unit
+        assert unit.Name == drifted_name
+        assert await storage.async_load() == baseline_document
+        assert fake_domoticz.errors == []
+    finally:
+        await _close_plugin_connection(
+            second,
+            second_websocket,
+            manager,
+            bridge_view,
+            2,
+        )

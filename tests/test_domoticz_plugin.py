@@ -232,10 +232,9 @@ def _start_and_upgrade(module, *, subprotocol=MISSING):
 
 def _legacy_v2_features(protocol):
     """Return the feature set advertised by a pre-inventory v2 peer."""
-    return tuple(
-        feature
-        for feature in protocol.SUPPORTED_V2_FEATURES
-        if feature != protocol.FEATURE_DOMOTICZ_INVENTORY_V1
+    return (
+        protocol.FEATURE_HA_EXPORT_BINARY_V1,
+        protocol.FEATURE_HA_EXPORT_NUMERIC_V1,
     )
 
 
@@ -2329,6 +2328,39 @@ def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
         {"Payload": protocol.canonical_json_dumps(inbound_pong)},
     )
     assert plugin._pending_ping_id is None
+
+
+def test_v2_pre_inventory_peer_keeps_catalog_only_apply_behavior(loaded_plugin):
+    """A rolling upgrade keeps common exports live without an inventory gate."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+    plugin, connection = _start_and_upgrade(module)
+    session_key, session_id = _complete_handshake(
+        module,
+        plugin,
+        connection,
+        server_features=_legacy_v2_features(protocol),
+    )
+
+    assert domoticz.statuses == [
+        "Authenticated Home Assistant connection is ready; "
+        "protocol=ha-domoticz-sync.v2; "
+        "features=ha-export.binary.v1,ha-export.numeric.v1."
+    ]
+    assert not plugin._inventory_is_selected()
+
+    result = _send_apply(
+        module,
+        plugin,
+        connection,
+        session_key,
+        session_id,
+        request_id="legacy-peer-create-1",
+        action=_numeric_action(protocol),
+    )
+
+    assert result.status is protocol.ApplyResultStatus.CONFIRMED
+    assert len(domoticz.create_calls) == 1
 
 
 def test_v1_fallback_is_heartbeat_only_and_never_applies(loaded_plugin):

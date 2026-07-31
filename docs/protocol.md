@@ -326,7 +326,7 @@ intermediate states are safe:
 | --- | --- | --- |
 | New, v1 and v2 aware | Old, v1 only | Authenticated v1 heartbeat session; export is disabled |
 | Old, v1 only | New, v1 and v2 aware | Authenticated v1 heartbeat session; export is disabled |
-| Current, inventory-aware peer | Current, inventory-aware peer | Authenticated v2 session; inventory is confirmed before numeric and binary export, then enables safe drift repair when all three features are selected |
+| Current, inventory-aware peer | Current, inventory-aware peer | Authenticated v2 session; inventory is confirmed before export and enables safe drift repair for each selected export kind |
 | Current binary-aware peer | Earlier numeric-only v2 peer | Authenticated v2 session; numeric export continues and binary export stays disabled |
 | Inventory-aware peer | Earlier v2 peer without inventory | Authenticated v2 session; common export features continue and remote inventory and drift repair stay disabled |
 | Both support v2 but not the same optional feature | Mixed feature support | The v2 session may run its common baseline, but the unsupported feature is not used |
