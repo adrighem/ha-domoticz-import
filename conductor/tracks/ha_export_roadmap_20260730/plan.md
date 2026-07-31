@@ -111,7 +111,15 @@
 - [x] Task 5.2: Reconcile owned devices against real Domoticz state (`c3ac10e`)
 - [x] Task 5.3: Repair safe drift without deleting or claiming unrelated devices
   (`ff075cc`)
-- [~] Task 5.4: Test and manually verify restart and manual-change scenarios
+- [x] Task 5.4: Test and manually verify restart and manual-change scenarios
+  (`3efd868`)
+  - Live 2026-07-31: the exact `3efd868` Home Assistant and Domoticz build
+    negotiated inventory, binary, and numeric v2 features
+  - Three `domoticz.service`-only restarts kept four unique Unit 1 targets at
+    `4|4|0`; manual name and value drift on idx `2313` was repaired in place
+    with the same deterministic identity and no duplicate
+  - A manually removed target was recreated exactly once, subsequent restarts
+    stayed stable, and unrelated sentinel idx `16` remained unchanged
 
 ## Phase 6: Continuous Synchronization
 
