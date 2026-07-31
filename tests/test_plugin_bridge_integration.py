@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("homeassistant")
 pytest.importorskip("pytest_homeassistant_custom_component")
 
-from aiohttp import WSMsgType  # noqa: E402
+from aiohttp import WSCloseCode, WSMsgType  # noqa: E402
 from aiohttp import client as aiohttp_client  # noqa: E402
 from homeassistant.components.binary_sensor import (  # noqa: E402
     BinarySensorDeviceClass,
@@ -51,6 +51,9 @@ from pytest_homeassistant_custom_component.typing import (  # noqa: E402
 )
 
 from custom_components.domoticz_sync import bridge as bridge_module  # noqa: E402
+from custom_components.domoticz_sync import (  # noqa: E402
+    bridge_reconciliation as bridge_reconciliation_module,
+)
 from custom_components.domoticz_sync.bridge import (  # noqa: E402
     BridgeApplicationSession,
     DomoticzBridgeManager,
@@ -78,6 +81,7 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
     FEATURE_DOMOTICZ_INVENTORY_V1,
+    FEATURE_HA_EXPORT_CONTINUOUS_V1,
     ApplyResultStatus,
     InventoryResult,
     InventoryTarget,
@@ -88,6 +92,8 @@ from custom_components.domoticz_sync.core.protocol import (  # noqa: E402
     generate_pairing_key,
     parse_apply,
     parse_apply_result,
+    parse_binary_apply,
+    parse_binary_apply_result,
     parse_inventory_request,
     parse_inventory_result,
     verify_envelope,
@@ -316,6 +322,135 @@ def _selected_protocol(plugin: object) -> ProtocolSelection:
     )
 
 
+def _assert_continuous_negotiation_enabled(
+    plugin_module: ModuleType,
+) -> None:
+    """Require both runtime peers to advertise active continuous export."""
+    assert FEATURE_HA_EXPORT_CONTINUOUS_V1 in bridge_module.SUPPORTED_V2_FEATURES
+    assert (
+        FEATURE_HA_EXPORT_CONTINUOUS_V1
+        in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
+    )
+
+
+async def _receive_application_text(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+) -> tuple[str, int]:
+    """Receive application traffic while transparently servicing heartbeats."""
+    while True:
+        payload_text = await _receive_text(websocket)
+        selection = _selected_protocol(plugin)
+        verified = verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(payload_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+            expected_session_id=plugin._session_id,
+            last_sequence=plugin._in_sequence,
+        )
+        payload = verified.payload
+        if not isinstance(payload, dict) or payload.get("type") not in {
+            "ping",
+            "pong",
+        }:
+            return payload_text, send_position
+
+        sends_before = len(connection.sent)
+        plugin.onMessage(connection, {"Payload": payload_text})
+        if len(connection.sent) > sends_before:
+            heartbeat_reply, send_position = _next_text_payload(
+                connection,
+                send_position,
+            )
+            await websocket.send_str(heartbeat_reply)
+
+
+async def _assert_no_application_payload(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+    *,
+    duration: float = 0.1,
+) -> int:
+    """Service heartbeats while proving no application request is emitted."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + duration
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return send_position
+        try:
+            async with asyncio.timeout(remaining):
+                payload_text = await websocket.receive_str()
+        except TimeoutError:
+            return send_position
+
+        selection = _selected_protocol(plugin)
+        verified = verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(payload_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+            expected_session_id=plugin._session_id,
+            last_sequence=plugin._in_sequence,
+        )
+        payload = verified.payload
+        assert isinstance(payload, dict)
+        assert payload.get("type") in {"ping", "pong"}, "unexpected application request"
+        sends_before = len(connection.sent)
+        plugin.onMessage(connection, {"Payload": payload_text})
+        if len(connection.sent) > sends_before:
+            heartbeat_reply, send_position = _next_text_payload(
+                connection,
+                send_position,
+            )
+            await websocket.send_str(heartbeat_reply)
+
+
+async def _wait_for_controlled_close(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+) -> int:
+    """Service only heartbeats until the bridge requests a clean reconnect."""
+    async with asyncio.timeout(2):
+        while True:
+            message = await websocket.receive()
+            if message.type is WSMsgType.CLOSE:
+                assert message.data == WSCloseCode.GOING_AWAY
+                return send_position
+            assert message.type is WSMsgType.TEXT
+            assert isinstance(message.data, str)
+
+            selection = _selected_protocol(plugin)
+            verified = verify_envelope(
+                plugin._session_key,
+                canonical_json_loads(message.data),
+                protocol_version=selection.version,
+                expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+                expected_session_id=plugin._session_id,
+                last_sequence=plugin._in_sequence,
+            )
+            payload = verified.payload
+            assert isinstance(payload, dict)
+            assert payload.get("type") in {"ping", "pong"}, (
+                "application write preceded controlled reconnect"
+            )
+            sends_before = len(connection.sent)
+            plugin.onMessage(connection, {"Payload": message.data})
+            if len(connection.sent) > sends_before:
+                heartbeat_reply, send_position = _next_text_payload(
+                    connection,
+                    send_position,
+                )
+                await websocket.send_str(heartbeat_reply)
+
+
 async def _exchange_complete_inventory(
     plugin: object,
     connection: _FakeConnection,
@@ -326,7 +461,12 @@ async def _exchange_complete_inventory(
     selection = _selected_protocol(plugin)
     assert selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
 
-    request_text = await _receive_text(websocket)
+    request_text, send_position = await _receive_application_text(
+        plugin,
+        connection,
+        websocket,
+        send_position,
+    )
     request_document = canonical_json_loads(request_text)
     request = verify_envelope(
         plugin._session_key,
@@ -388,17 +528,50 @@ class _ObservedApplication:
     def __init__(self, application: HomeAssistantExportApplication) -> None:
         self._application = application
         self._condition = asyncio.Condition()
+        self._next_call_id = 0
+        self._session_call_ids: dict[int, int] = {}
+        self._settled_call_ids: set[int] = set()
         self.attempted_calls = 0
         self.completed_calls = 0
         self.failure_type_chains: list[tuple[str, ...]] = []
         self.failure_frames: list[tuple[tuple[str, str, int], ...]] = []
+        continuous_runner = application._async_run_continuous
+
+        async def observed_continuous_runner(
+            session: BridgeApplicationSession,
+            **kwargs: object,
+        ) -> None:
+            await self._async_record_completion(session)
+            await continuous_runner(session, **kwargs)
+
+        application._async_run_continuous = observed_continuous_runner
+
+    async def _async_record_completion(
+        self,
+        session: BridgeApplicationSession,
+    ) -> None:
+        """Record completion of connect-time work before a persistent loop."""
+        call_id = self._session_call_ids[id(session)]
+        async with self._condition:
+            if call_id in self._settled_call_ids:
+                return
+            self._settled_call_ids.add(call_id)
+            self.attempted_calls += 1
+            self.completed_calls += 1
+            self._condition.notify_all()
 
     async def async_connected(
         self,
         session: BridgeApplicationSession,
     ) -> None:
+        self._next_call_id += 1
+        call_id = self._next_call_id
+        session_key = id(session)
+        self._session_call_ids[session_key] = call_id
         try:
             await self._application.async_connected(session)
+        except asyncio.CancelledError:
+            raise
         except BaseException as error:
             type_chain = []
             current: BaseException | None = error
@@ -410,15 +583,18 @@ class _ObservedApplication:
                 for frame in traceback.extract_tb(error.__traceback__)
             )
             async with self._condition:
-                self.attempted_calls += 1
+                if call_id not in self._settled_call_ids:
+                    self._settled_call_ids.add(call_id)
+                    self.attempted_calls += 1
                 self.failure_type_chains.append(tuple(type_chain))
                 self.failure_frames.append(frames)
                 self._condition.notify_all()
             raise
-        async with self._condition:
-            self.attempted_calls += 1
-            self.completed_calls += 1
-            self._condition.notify_all()
+        else:
+            await self._async_record_completion(session)
+        finally:
+            if self._session_call_ids.get(session_key) == call_id:
+                self._session_call_ids.pop(session_key)
 
     async def async_wait_for_calls(self, expected: int) -> None:
         """Wait until the real application has completed enough sessions."""
@@ -429,6 +605,13 @@ class _ObservedApplication:
             "bridge application failed with exception types "
             f"{self.failure_type_chains[-1]} at {self.failure_frames[-1]}"
         )
+
+
+class _NoopApplication:
+    """Keep the authenticated transport alive without application traffic."""
+
+    async def async_connected(self, _session: BridgeApplicationSession) -> None:
+        """Return after accepting the negotiated application session."""
 
 
 class _ObservedBridgeView(DomoticzBridgeView):
@@ -560,7 +743,12 @@ async def _exchange_one_apply(
 ) -> int:
     """Pass one signed apply and its signed result across the real socket."""
     try:
-        payload = await _receive_text(websocket)
+        payload, send_position = await _receive_application_text(
+            plugin,
+            connection,
+            websocket,
+            send_position,
+        )
     except AssertionError:
         await application.async_wait_for_calls(expected_application_call)
         raise
@@ -578,7 +766,12 @@ async def _exchange_observed_numeric_apply(
 ) -> tuple[int, object, object]:
     """Exchange and independently parse one signed numeric apply and result."""
     selection = _selected_protocol(plugin)
-    request_text = await _receive_text(websocket)
+    request_text, send_position = await _receive_application_text(
+        plugin,
+        connection,
+        websocket,
+        send_position,
+    )
     request = parse_apply(
         selection,
         verify_envelope(
@@ -595,6 +788,50 @@ async def _exchange_observed_numeric_apply(
 
     result_text, send_position = _next_text_payload(connection, send_position)
     result = parse_apply_result(
+        selection,
+        verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(result_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+            expected_session_id=plugin._session_id,
+            last_sequence=response_sequence,
+        ).payload,
+    )
+    await websocket.send_str(result_text)
+    return send_position, request, result
+
+
+async def _exchange_observed_binary_apply(
+    plugin: object,
+    connection: _FakeConnection,
+    websocket: object,
+    send_position: int,
+) -> tuple[int, object, object]:
+    """Exchange and independently parse one signed binary apply and result."""
+    selection = _selected_protocol(plugin)
+    request_text, send_position = await _receive_application_text(
+        plugin,
+        connection,
+        websocket,
+        send_position,
+    )
+    request = parse_binary_apply(
+        selection,
+        verify_envelope(
+            plugin._session_key,
+            canonical_json_loads(request_text),
+            protocol_version=selection.version,
+            expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+            expected_session_id=plugin._session_id,
+            last_sequence=plugin._in_sequence,
+        ).payload,
+    )
+    response_sequence = plugin._out_sequence
+    plugin.onMessage(connection, {"Payload": request_text})
+
+    result_text, send_position = _next_text_payload(connection, send_position)
+    result = parse_binary_apply_result(
         selection,
         verify_envelope(
             plugin._session_key,
@@ -634,7 +871,7 @@ async def test_root_plugin_and_real_bridge_reach_ready_and_exchange_ping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The shipped plugin interoperates with the registered HA endpoint."""
-    manager = DomoticzBridgeManager()
+    manager = DomoticzBridgeManager(_NoopApplication())
     link_id = generate_link_id()
     pairing_key = generate_pairing_key()
     await manager.async_register_link(
@@ -1811,14 +2048,646 @@ async def test_real_bridge_repairs_safe_target_after_rejecting_unsafe_targets(
 
 
 @pytest.mark.asyncio
+async def test_real_bridge_continuous_export_recovers_without_duplicates(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Apply live deltas, reconnect for discovery, and recover the latest state."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="continuous-integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    numeric_entry = registry.async_get_or_create(
+        "sensor",
+        "integration_test",
+        "continuous_temperature",
+        suggested_object_id="continuous_temperature",
+        capabilities={ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT},
+        original_device_class=SensorDeviceClass.TEMPERATURE,
+        original_name="Continuous temperature",
+        unit_of_measurement=UnitOfTemperature.CELSIUS,
+    )
+    binary_entry = registry.async_get_or_create(
+        "binary_sensor",
+        "integration_test",
+        "continuous_motion",
+        suggested_object_id="continuous_motion",
+        original_device_class=BinarySensorDeviceClass.MOTION,
+        original_name="Continuous motion",
+    )
+    registry.async_update_entity(
+        numeric_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    registry.async_update_entity(
+        binary_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    numeric_attributes = {
+        ATTR_DEVICE_CLASS: SensorDeviceClass.TEMPERATURE,
+        ATTR_FRIENDLY_NAME: "Continuous temperature",
+        ATTR_STATE_CLASS: SensorStateClass.MEASUREMENT,
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfTemperature.CELSIUS,
+    }
+    binary_attributes = {
+        ATTR_DEVICE_CLASS: BinarySensorDeviceClass.MOTION,
+        ATTR_FRIENDLY_NAME: "Continuous motion",
+    }
+    hass.states.async_set(numeric_entry.entity_id, "18.5", numeric_attributes)
+    hass.states.async_set(binary_entry.entity_id, STATE_ON, binary_attributes)
+
+    application = _ObservedApplication(HomeAssistantExportApplication(hass))
+    manager = DomoticzBridgeManager(application)
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+    assert endpoint.port is not None
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+    _assert_continuous_negotiation_enabled(plugin_module)
+    monkeypatch.setattr(
+        bridge_reconciliation_module,
+        "CONTINUOUS_COALESCE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(bridge_module, "HEARTBEAT_INTERVAL", 0.01)
+    monkeypatch.setattr(bridge_module, "HEARTBEAT_RESPONSE_TIMEOUT", 0.5)
+
+    (
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+        first_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    assert first_inventory is not None
+    assert first_inventory.targets == ()
+    first_selection = _selected_protocol(first)
+    assert first_selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+    assert first_selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
+
+    (
+        first_position,
+        numeric_create,
+        numeric_create_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    (
+        first_position,
+        binary_create,
+        binary_create_result,
+    ) = await _exchange_observed_binary_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    await application.async_wait_for_calls(1)
+    assert numeric_create.action.kind.value == "create"
+    assert binary_create.action.kind.value == "create"
+    assert numeric_create_result.status is ApplyResultStatus.CONFIRMED
+    assert binary_create_result.status is ApplyResultStatus.CONFIRMED
+
+    destination_id = first._destination_id
+    assert isinstance(destination_id, str)
+    numeric_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    binary_storage = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    numeric_catalog = catalog_from_document(await numeric_storage.async_load())
+    binary_catalog = catalog_from_document(await binary_storage.async_load())
+    assert len(numeric_catalog.records) == 1
+    assert len(binary_catalog.records) == 1
+    numeric_target_id = numeric_catalog.records[0].target_id
+    binary_target_id = binary_catalog.records[0].target_id
+    numeric_device = fake_domoticz.devices[numeric_target_id]
+    binary_device = fake_domoticz.devices[binary_target_id]
+    numeric_unit = numeric_device.Units[1]
+    binary_unit = binary_device.Units[1]
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+
+    numeric_updates_before = len(numeric_unit.updates)
+    binary_updates_before = len(binary_unit.updates)
+    await asyncio.sleep(0.03)
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "19.0",
+        numeric_attributes | {ATTR_FRIENDLY_NAME: "Discarded temperature"},
+    )
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "20.0",
+        numeric_attributes | {ATTR_FRIENDLY_NAME: "Intermediate temperature"},
+    )
+    final_numeric_attributes = numeric_attributes | {
+        ATTR_FRIENDLY_NAME: "Latest temperature"
+    }
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "22.75",
+        final_numeric_attributes,
+    )
+    hass.states.async_set(binary_entry.entity_id, STATE_OFF, binary_attributes)
+    hass.states.async_set(binary_entry.entity_id, STATE_ON, binary_attributes)
+    final_binary_attributes = binary_attributes | {ATTR_FRIENDLY_NAME: "Latest motion"}
+    hass.states.async_set(
+        binary_entry.entity_id,
+        STATE_OFF,
+        final_binary_attributes,
+    )
+    await hass.async_block_till_done()
+
+    burst_position = first_position
+    (
+        first_position,
+        numeric_update,
+        numeric_update_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    (
+        first_position,
+        binary_update,
+        binary_update_result,
+    ) = await _exchange_observed_binary_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert first_position >= burst_position + 3
+    assert numeric_update.action.kind.value == "update"
+    assert numeric_update.action.target_id == numeric_target_id
+    assert numeric_update.action.capability.value == 22.75
+    assert numeric_update.action.capability.name == "Latest temperature"
+    assert binary_update.action.kind.value == "update"
+    assert binary_update.action.target_id == binary_target_id
+    assert binary_update.action.capability.value is False
+    assert binary_update.action.capability.name == "Latest motion"
+    assert numeric_update_result.status is ApplyResultStatus.CONFIRMED
+    assert binary_update_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_unit.Name == "Latest temperature"
+    assert numeric_unit.sValue == "22.75"
+    assert binary_unit.Name == "Latest motion"
+    assert (binary_unit.nValue, binary_unit.sValue) == (0, "Off")
+    assert len(numeric_unit.updates) == numeric_updates_before + 1
+    assert len(binary_unit.updates) == binary_updates_before + 1
+    first_position = await _assert_no_application_payload(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+
+    preserved_numeric_values = (numeric_unit.nValue, numeric_unit.sValue)
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        STATE_UNAVAILABLE,
+        final_numeric_attributes,
+    )
+    await hass.async_block_till_done()
+    (
+        first_position,
+        source_unavailable,
+        source_unavailable_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert source_unavailable.action.kind.value == "mark_unavailable"
+    assert source_unavailable.action.target_id == numeric_target_id
+    assert source_unavailable.action.capability.availability.value == "unavailable"
+    assert source_unavailable.action.stale is False
+    assert source_unavailable_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_device.TimedOut == 1
+    assert (numeric_unit.nValue, numeric_unit.sValue) == preserved_numeric_values
+    assert fake_domoticz.devices[numeric_target_id] is numeric_device
+    assert numeric_device.Units[1] is numeric_unit
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "22.75",
+        final_numeric_attributes,
+    )
+    await hass.async_block_till_done()
+    (
+        first_position,
+        source_restored,
+        source_restored_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert source_restored.action.kind.value == "update"
+    assert source_restored.action.target_id == numeric_target_id
+    assert source_restored.action.capability.value == 22.75
+    assert source_restored_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_device.TimedOut == 0
+    assert fake_domoticz.devices[numeric_target_id] is numeric_device
+    assert numeric_device.Units[1] is numeric_unit
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+
+    hass.states.async_remove(numeric_entry.entity_id)
+    await hass.async_block_till_done()
+    (
+        first_position,
+        missing_state,
+        missing_state_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert missing_state.action.kind.value == "mark_unavailable"
+    assert missing_state.action.target_id == numeric_target_id
+    assert missing_state.action.stale is False
+    assert missing_state_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_device.TimedOut == 1
+
+    registry_only_name = "Registry-only temperature"
+    assert hass.states.get(numeric_entry.entity_id) is None
+    registry.async_update_entity(
+        numeric_entry.entity_id,
+        name=registry_only_name,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(numeric_entry.entity_id) is None
+    (
+        first_position,
+        metadata_update,
+        metadata_update_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert metadata_update.action.kind.value == "mark_unavailable"
+    assert metadata_update.action.target_id == numeric_target_id
+    assert metadata_update.action.capability.name == registry_only_name
+    assert metadata_update.action.stale is False
+    assert metadata_update_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_unit.Name == registry_only_name
+    assert numeric_device.TimedOut == 1
+    assert fake_domoticz.devices[numeric_target_id] is numeric_device
+    assert numeric_device.Units[1] is numeric_unit
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+
+    renamed_numeric_attributes = numeric_attributes | {
+        ATTR_FRIENDLY_NAME: registry_only_name
+    }
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "22.75",
+        renamed_numeric_attributes,
+    )
+    await hass.async_block_till_done()
+    (
+        first_position,
+        metadata_source_restored,
+        metadata_source_restored_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert metadata_source_restored.action.kind.value == "update"
+    assert metadata_source_restored.action.target_id == numeric_target_id
+    assert metadata_source_restored.action.capability.name == registry_only_name
+    assert metadata_source_restored.action.capability.value == 22.75
+    assert metadata_source_restored_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_unit.Name == registry_only_name
+    assert numeric_device.TimedOut == 0
+    assert fake_domoticz.devices[numeric_target_id] is numeric_device
+    assert numeric_device.Units[1] is numeric_unit
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+    first_position = await _assert_no_application_payload(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+
+    registry.async_update_entity(numeric_entry.entity_id, labels=set())
+    await hass.async_block_till_done()
+    (
+        first_position,
+        unavailable,
+        unavailable_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert unavailable.action.kind.value == "mark_unavailable"
+    assert unavailable.action.target_id == numeric_target_id
+    assert unavailable.action.stale is True
+    assert unavailable_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_device.TimedOut == 1
+    assert len(fake_domoticz.create_calls) == 2
+    first_position = await _assert_no_application_payload(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+
+    registry.async_update_entity(
+        numeric_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    await hass.async_block_till_done()
+    (
+        first_position,
+        relabelled,
+        relabelled_result,
+    ) = await _exchange_observed_numeric_apply(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    assert relabelled.action.kind.value == "update"
+    assert relabelled.action.target_id == numeric_target_id
+    assert relabelled.action.capability.value == 22.75
+    assert relabelled_result.status is ApplyResultStatus.CONFIRMED
+    assert numeric_device.TimedOut == 0
+    assert fake_domoticz.devices[numeric_target_id] is numeric_device
+    assert numeric_device.Units[1] is numeric_unit
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+    first_position = await _assert_no_application_payload(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    relabelled_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    relabelled_catalog = catalog_from_document(await relabelled_storage.async_load())
+    assert relabelled_catalog.records[0].target_id == numeric_target_id
+    assert relabelled_catalog.records[0].stale is False
+
+    discovered_entry = registry.async_get_or_create(
+        "sensor",
+        "integration_test",
+        "continuous_discovered_energy",
+        suggested_object_id="continuous_discovered_energy",
+        capabilities={ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING},
+        original_device_class=SensorDeviceClass.ENERGY,
+        original_name="Discovered energy",
+        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    )
+    discovered_attributes = {
+        ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+        ATTR_FRIENDLY_NAME: "Discovered energy",
+        ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+        ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+    }
+    hass.states.async_set(discovered_entry.entity_id, "7.5", discovered_attributes)
+    await hass.async_block_till_done()
+    current_numeric_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    current_binary_storage = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    catalogs_before_discovery = (
+        await current_numeric_storage.async_load(),
+        await current_binary_storage.async_load(),
+    )
+    update_counts_before_discovery = {
+        target_id: len(device.Units[1].updates)
+        for target_id, device in fake_domoticz.devices.items()
+    }
+    availability_before_discovery = {
+        target_id: device.TimedOut
+        for target_id, device in fake_domoticz.devices.items()
+    }
+    registry.async_update_entity(
+        discovered_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    await hass.async_block_till_done()
+    first_position = await _wait_for_controlled_close(
+        first,
+        first_connection,
+        first_websocket,
+        first_position,
+    )
+    await bridge_view.async_wait_for_requests(1)
+    first.onStop()
+    assert await manager.async_active_session_count() == 0
+    assert len(fake_domoticz.devices) == 2
+    assert len(fake_domoticz.create_calls) == 2
+    post_close_numeric_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    post_close_binary_storage = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    assert (
+        await post_close_numeric_storage.async_load(),
+        await post_close_binary_storage.async_load(),
+    ) == catalogs_before_discovery
+    assert {
+        target_id: len(device.Units[1].updates)
+        for target_id, device in fake_domoticz.devices.items()
+    } == update_counts_before_discovery
+    assert {
+        target_id: device.TimedOut
+        for target_id, device in fake_domoticz.devices.items()
+    } == availability_before_discovery
+
+    recovered_attributes = numeric_attributes | {
+        ATTR_FRIENDLY_NAME: "Recovered latest temperature"
+    }
+    hass.states.async_set(
+        numeric_entry.entity_id,
+        "41.5",
+        recovered_attributes,
+    )
+    await hass.async_block_till_done()
+
+    (
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+        second_inventory,
+    ) = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+    assert second_inventory is not None
+    assert len(second_inventory.targets) == 2
+    reconnect_numeric_requests = []
+    reconnect_numeric_results = []
+    for _index in range(2):
+        (
+            second_position,
+            reconnect_request,
+            reconnect_result,
+        ) = await _exchange_observed_numeric_apply(
+            second,
+            second_connection,
+            second_websocket,
+            second_position,
+        )
+        reconnect_numeric_requests.append(reconnect_request)
+        reconnect_numeric_results.append(reconnect_result)
+    (
+        second_position,
+        reconnect_binary,
+        reconnect_binary_result,
+    ) = await _exchange_observed_binary_apply(
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+    )
+    await application.async_wait_for_calls(2)
+
+    create_request = next(
+        request
+        for request in reconnect_numeric_requests
+        if request.action.kind.value == "create"
+    )
+    recovered_request = next(
+        request
+        for request in reconnect_numeric_requests
+        if request.action.target_id == numeric_target_id
+    )
+    assert recovered_request.action.kind.value == "update"
+    assert recovered_request.action.capability.value == 41.5
+    assert recovered_request.action.capability.name == "Recovered latest temperature"
+    assert reconnect_binary.action.kind.value == "update"
+    assert reconnect_binary.action.target_id == binary_target_id
+    assert all(
+        result.status is ApplyResultStatus.CONFIRMED
+        for result in reconnect_numeric_results
+    )
+    assert reconnect_binary_result.status is ApplyResultStatus.CONFIRMED
+    assert len(fake_domoticz.devices) == 3
+    assert len(fake_domoticz.create_calls) == 3
+    assert numeric_unit.sValue == "41.5"
+    assert numeric_unit.Name == "Recovered latest temperature"
+
+    recovered_numeric_storage = HomeAssistantCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id=destination_id,
+    )
+    recovered_numeric_catalog = catalog_from_document(
+        await recovered_numeric_storage.async_load()
+    )
+    assert len(recovered_numeric_catalog.records) == 2
+    discovered_record = recovered_numeric_catalog.get(
+        create_request.action.capability.source
+    )
+    assert discovered_record is not None
+    assert (
+        discovered_record.target_id
+        == reconnect_numeric_results[
+            reconnect_numeric_requests.index(create_request)
+        ].target_id
+    )
+    assert discovered_record.pending is False
+    second_position = await _assert_no_application_payload(
+        second,
+        second_connection,
+        second_websocket,
+        second_position,
+    )
+    assert second_position == len(second_connection.sent)
+    assert fake_domoticz.errors == []
+
+    await _close_plugin_connection(
+        second,
+        second_websocket,
+        manager,
+        bridge_view,
+        2,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_side", ("home_assistant", "plugin"))
-async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
+@pytest.mark.parametrize("legacy_generation", ("pre_inventory", "pre_continuous"))
+async def test_real_bridge_preserves_mixed_v2_fallback(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
     legacy_side: str,
+    legacy_generation: str,
 ) -> None:
-    """Either pre-inventory peer keeps common export safe and catalog-only."""
+    """Either older peer keeps its mutually supported connect-time behavior."""
     export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -1884,6 +2753,9 @@ async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
         FEATURE_DOMOTICZ_INVENTORY_V1
         in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
     )
+    removed_features = {FEATURE_HA_EXPORT_CONTINUOUS_V1}
+    if legacy_generation == "pre_inventory":
+        removed_features.add(FEATURE_DOMOTICZ_INVENTORY_V1)
     if legacy_side == "home_assistant":
         monkeypatch.setattr(
             bridge_module,
@@ -1891,7 +2763,7 @@ async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
             tuple(
                 feature
                 for feature in bridge_module.SUPPORTED_V2_FEATURES
-                if feature != FEATURE_DOMOTICZ_INVENTORY_V1
+                if feature not in removed_features
             ),
         )
     else:
@@ -1901,15 +2773,23 @@ async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
             tuple(
                 feature
                 for feature in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
-                if feature != FEATURE_DOMOTICZ_INVENTORY_V1
+                if feature not in removed_features
             ),
         )
 
+    inventory_expected = legacy_generation == "pre_continuous"
     assert (FEATURE_DOMOTICZ_INVENTORY_V1 in bridge_module.SUPPORTED_V2_FEATURES) is (
-        legacy_side == "plugin"
+        legacy_side == "plugin" or inventory_expected
     )
     assert (
         FEATURE_DOMOTICZ_INVENTORY_V1
+        in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
+    ) is (legacy_side == "home_assistant" or inventory_expected)
+    assert (FEATURE_HA_EXPORT_CONTINUOUS_V1 in bridge_module.SUPPORTED_V2_FEATURES) is (
+        legacy_side == "plugin"
+    )
+    assert (
+        FEATURE_HA_EXPORT_CONTINUOUS_V1
         in plugin_module.wire_protocol.SUPPORTED_V2_FEATURES
     ) is (legacy_side == "home_assistant")
 
@@ -1934,8 +2814,13 @@ async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
     )
     try:
         selection = _selected_protocol(first)
-        assert not selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
-        assert first_inventory is None
+        assert selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1) is inventory_expected
+        assert not selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
+        if inventory_expected:
+            assert first_inventory is not None
+            assert first_inventory.targets == ()
+        else:
+            assert first_inventory is None
         first_position, request, result = await _exchange_observed_numeric_apply(
             first,
             first_connection,
@@ -1986,19 +2871,58 @@ async def test_real_bridge_preserves_catalog_only_mixed_v2_fallback(
         monkeypatch,
     )
     try:
-        assert second_inventory is None
-        assert not _selected_protocol(second).supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+        second_selection = _selected_protocol(second)
+        assert (
+            second_selection.supports(FEATURE_DOMOTICZ_INVENTORY_V1)
+            is inventory_expected
+        )
+        assert not second_selection.supports(FEATURE_HA_EXPORT_CONTINUOUS_V1)
+        if inventory_expected:
+            assert second_inventory is not None
+            assert tuple(target.target_id for target in second_inventory.targets) == (
+                target_id,
+            )
+            (
+                second_position,
+                reconnect_request,
+                reconnect_result,
+            ) = await _exchange_observed_numeric_apply(
+                second,
+                second_connection,
+                second_websocket,
+                second_position,
+            )
+            assert reconnect_request.action.kind.value == "update"
+            assert reconnect_request.action.target_id == target_id
+            assert reconnect_result.status is ApplyResultStatus.CONFIRMED
+        else:
+            assert second_inventory is None
         await application.async_wait_for_calls(2)
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.05):
-                await second_websocket.receive()
+        hass.states.async_set(
+            source_entry.entity_id,
+            "13.75",
+            {
+                ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+                ATTR_FRIENDLY_NAME: "Ignored same-session update",
+                ATTR_STATE_CLASS: SensorStateClass.TOTAL_INCREASING,
+                ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+            },
+        )
+        await hass.async_block_till_done()
+        second_position = await _assert_no_application_payload(
+            second,
+            second_connection,
+            second_websocket,
+            second_position,
+        )
 
         assert second_position == len(second_connection.sent)
         assert len(fake_domoticz.devices) == 1
         assert len(fake_domoticz.create_calls) == 1
         assert fake_domoticz.devices[target_id] is device
         assert device.Units[1] is unit
-        assert unit.Name == drifted_name
+        assert unit.Name == (source_name if inventory_expected else drifted_name)
+        assert unit.sValue == "12.5"
         assert await storage.async_load() == baseline_document
         assert fake_domoticz.errors == []
     finally:

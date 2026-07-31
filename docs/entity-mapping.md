@@ -73,9 +73,10 @@ monoxide to Smoke Detector or occupancy to Motion Sensor.
 
 Available `on` and `off` states become `On` and `Off`. An unavailable source
 keeps its last Domoticz value and is marked timed out. That timeout is runtime
-state and is reapplied when the plugin reconnects after a Domoticz restart.
-Export currently runs when the plugin connects, so later state or label changes
-also require a reconnect.
+state and is reapplied when the plugin reconnects after a Domoticz service
+restart. When `ha-export.continuous.v1` is selected, later state, availability,
+metadata, and direct label changes are reconciled while the connection remains
+open.
 
 Deterministic identity makes reconnects adopt the same device. A later device
 class change that selects a different SwitchType is rejected rather than
@@ -93,15 +94,16 @@ DeviceID. Before mutation, the corresponding remote container must be absent,
 empty, or contain exactly Unit 1 with no siblings. A matching DeviceID, name,
 idx, or profile by itself is never enough to claim a remote-only device.
 
-For a catalog-owned target with the expected Type, SubType, and SwitchType, a
-reconnect restores the source name, enables its `Used` flag, restores its
-current encoded value, timeout state, and the managed `Custom` option used by
-Custom Sensors. Other native and calibration options are preserved. If the
-whole catalog-owned
-target is missing and its source is still selected, the bridge recreates its
-deterministic DeviceID; Domoticz may assign a different idx. A deleted,
-selected, unavailable target is recreated timed out with a neutral value
-because its previous Domoticz value no longer exists.
+For a catalog-owned target with the expected Type, SubType, and SwitchType, the
+initial pass and each reconnect restore the source name, enable its `Used` flag,
+restore its current encoded value and timeout state, and restore the managed
+`Custom` option used by Custom Sensors. Continuous export keeps those mutable
+source-derived fields current between reconnects. Other native and calibration
+options are preserved. If the whole catalog-owned target is missing and its
+source is still selected, the bridge recreates its deterministic DeviceID;
+Domoticz may assign a different idx. A deleted, selected, unavailable target is
+recreated timed out with a neutral value because its previous Domoticz value no
+longer exists.
 
 The bridge refuses and leaves untouched an unexpected Type, SubType,
 SwitchType, Unit number, or container with sibling units. It also leaves all
@@ -109,6 +111,33 @@ remote-only targets untouched. It never deletes or retypes a Domoticz device,
 and removing a Home Assistant export label does not delete the existing target.
 If the inventory is incomplete, rejected, malformed, or ambiguous, no
 inventory-aware repair or catalog change is performed.
+
+## Continuous Synchronization
+
+Continuous synchronization is enabled only when the authenticated session
+selects `ha-export.continuous.v1`, `domoticz-inventory.v1`, and the matching
+numeric or binary export feature. State and relevant attributes, availability,
+the effective entity name, mapping metadata, and direct export-label membership
+can then update an existing catalog-owned target without a manual reconnect.
+
+Several quick Home Assistant events are coalesced. The bridge reads the latest
+complete source snapshot after the short window instead of replaying event
+values, so an intermediate value may be skipped but the final state is applied.
+Disconnecting drops these value-free dirty hints; the next session starts from
+a fresh source snapshot and Domoticz inventory.
+
+Removing the direct export label marks the catalog-owned target unavailable and
+stale instead of deleting it. This protects Domoticz history and local user
+configuration. Adding the label again reuses the same deterministic DeviceID.
+If an entity becomes newly exportable without an existing catalog binding, the
+bridge performs one controlled reconnect so creation is checked against fresh
+inventory and proceeds only when every safety check passes. The joint preflight
+enforces at most 512 targets and 1,024 total units, reserving recovery capacity
+for durable sync-owned records before admitting new sources. The plugin recounts
+the live shape immediately before creation. Capacity, collision,
+immutable-profile, and ambiguous-layout checks remain fail closed. An unchanged
+blocked or rejected source is not repeatedly retried for unrelated Home
+Assistant events.
 
 ## Selection Diagnostics
 

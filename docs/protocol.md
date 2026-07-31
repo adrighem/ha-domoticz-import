@@ -344,6 +344,12 @@ snapshot, jointly validates both durable target catalogs, and derives the
 smallest catalog-owned action delta. Signed envelope sequences order all
 application traffic; independent request IDs correlate each apply result.
 
+The subscription covers state and attribute changes for directly labelled
+sources, including availability, plus selection and registry metadata that can
+change the effective name or exported profile. The callback carries no source
+value or event payload. A profile change that would require a different
+Domoticz Type, SubType, or SwitchType remains an immutable-layout refusal.
+
 The source snapshot, catalogs, and writes for one destination are serialized as
 one cycle, while each confirmed action retains its existing atomic catalog
 persistence boundary. Only one apply is in flight across both export kinds;
@@ -375,6 +381,24 @@ source remains uncataloged and becomes the new session's unbound desired
 baseline. It does not trigger another reconnect until it leaves the selection
 and later re-enters, preventing an incompatible target from causing a reconnect
 loop.
+
+The fresh-session create preflight also enforces both complete-inventory limits
+across the remote inventory and both durable catalogs: at most 512 targets and
+1,024 total units. Existing catalog-owned records reserve the missing target and
+Unit 1 capacity required for recovery, even when their export kind is not
+selected for that session, before new sources are admitted in stable source
+order. The exact limits are allowed; any action that would exceed either budget
+is blocked before its apply or catalog save. The plugin independently recounts
+the complete live target and unit shape immediately before each create. Other
+owned updates remain eligible. A capacity-blocked source follows the same
+unbound-baseline rule, so it cannot cause a reconnect loop until it leaves and
+later re-enters the selection.
+
+A target-side rejection does not change the catalog. During the same session,
+an identical desired action is suppressed on unrelated dirty cycles. A change
+to that source's desired capability makes it eligible again, and a new session
+may retry it after fresh inventory. This prevents an incompatible target from
+being hammered while preserving recovery from transient rejection.
 
 Disconnecting abandons the session-local dirty generation and every unconfirmed
 cycle result. An apply timeout, correlation failure, or uncertain catalog
@@ -426,15 +450,16 @@ credentials.
 2. After Home Assistant restarts, confirm that the existing plugin reconnects.
 3. Verify that a v1-only overlap remains heartbeat-only, or that a v2 overlap
    advertises and uses only the feature intersection.
-4. Update the plugin to the target release, restart Domoticz, and confirm that
-   protocol v2 selects the expected features.
+4. Update the plugin to the target release, restart the Domoticz service only,
+   and confirm that protocol v2 selects the expected features.
 5. Reconnect again and verify that existing source identities were reused
    without duplicate targets.
 
 ### Domoticz plugin first
 
 1. Keep Home Assistant on the starting release and update the Domoticz plugin.
-2. After Domoticz restarts, confirm the same safe intermediate behavior:
+2. After the Domoticz service restarts, confirm the same safe intermediate
+   behavior:
    heartbeat-only v1 or only mutually selected v2 features.
 3. Update Home Assistant to the target release and restart Home Assistant.
 4. Confirm protocol v2 and the expected feature set.
@@ -445,10 +470,11 @@ credentials.
 
 Finish both sequences on the same matching release tag. Confirm the installed
 tag in HACS and PyPluginStore, or in both manual installations. The ready status
-must report protocol v2 and the expected inventory, numeric, and binary
-features. Verify a representative native numeric device, Custom Sensor
-fallback, and passive binary device, then reconnect once more and confirm that
-the target count is unchanged.
+must report protocol v2 and the expected inventory, continuous, numeric, and
+binary features, including `domoticz-inventory.v1` and
+`ha-export.continuous.v1`. Verify a representative native numeric device,
+Custom Sensor fallback, and passive binary device, then reconnect once more and
+confirm that the target count is unchanged.
 
 ## Future Compatibility Rules
 

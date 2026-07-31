@@ -164,8 +164,9 @@ Install Domoticz Sync from the store:
 1. Open **Custom** -> **pypluginstore**.
 2. Search for `ha-domoticz-sync`.
 3. Select **Install**.
-4. Select **Restart Domoticz**, or restart the Domoticz service manually if
-   the store does not have permission to restart it.
+4. Select **Restart Domoticz**, or restart `domoticz.service` manually if the
+   store does not have permission to restart it. This restarts
+   the service only; the host does not need to be rebooted.
 5. Go to **Setup** -> **Hardware** and confirm that
    **Home Assistant Domoticz Sync** is available.
 
@@ -199,7 +200,8 @@ You can also extract the complete matching release archive into a single
 directory such as
 `/path/to/domoticz/plugins/ha-domoticz-sync`.
 
-Restart Domoticz after installing the plugin.
+Restart the Domoticz service after installing the plugin. The whole system does
+not need to be restarted.
 
 ### Select Home Assistant entities
 
@@ -287,12 +289,13 @@ units, fallbacks, and deliberate exclusions.
 
 ### Export behavior
 
-Export and drift repair run when the Domoticz plugin connects. When both peers
-negotiate `domoticz-inventory.v1`, Home Assistant first requests a complete,
-authenticated snapshot of the devices visible to that plugin hardware. It
-validates every page before comparing the current labelled entities, its local
-ownership records, and the real Domoticz state. An incomplete, rejected, or
-invalid inventory causes no export writes or local catalog changes.
+A complete export and drift-repair pass runs when the Domoticz plugin connects.
+When both peers negotiate `domoticz-inventory.v1`, Home Assistant first requests
+a complete, authenticated snapshot of the devices visible to that plugin
+hardware. It validates every page before comparing the current labelled
+entities, its local ownership records, and the real Domoticz state. An
+incomplete, rejected, or invalid inventory causes no export writes or local
+catalog changes.
 
 - Stable IDs let a reconnect reuse a matching Domoticz device instead of
   creating a duplicate.
@@ -321,37 +324,81 @@ invalid inventory causes no export writes or local catalog changes.
   in the Home Assistant log. Successfully exported Custom Sensors do not
   produce warning-level logs.
 
-During a rolling update, peers without the inventory feature keep the earlier
-catalog-only export behavior for their common numeric and binary features.
-Remote drift detection and repair stay disabled until both sides negotiate
-`domoticz-inventory.v1`.
+When both peers also negotiate `ha-export.continuous.v1`, existing sync-owned
+targets stay current while the authenticated connection remains open:
 
-There are no live updates yet. Reconnect the plugin, or restart Domoticz, after
-changing a selected state, name, label, unit, or device class.
+- State and availability changes are exported. An unavailable source keeps its
+  last value and its Domoticz device is marked timed out.
+- Relevant state attributes and entity metadata are watched, including the
+  effective name, unit, device class, and state class. Mutable fields update in
+  place. A change that would require a different Domoticz Type, SubType, or
+  SwitchType is still refused rather than silently retyping the target.
+- Removing the direct **Domoticz Export** label marks the existing target
+  unavailable and stale. It is not deleted, because deletion could discard
+  Domoticz history or user configuration. Adding the label back reuses the same
+  deterministic DeviceID and updates that target in place.
+- Bursts of related events are coalesced into one pass. Home Assistant reads the
+  latest complete source state after the short coalescing window, so temporary
+  intermediate values may be skipped but the final state is not lost.
+- If a newly labelled or newly exportable source has no catalog binding, Home
+  Assistant ends the session before writing. The plugin reconnects, obtains a
+  fresh inventory, checks capacity and identity collisions, and creates the
+  target only when all safety checks pass. The DeviceID remains deterministic
+  across the reconnect.
+- A disconnect discards queued dirty hints. The next authenticated session uses
+  a fresh Home Assistant snapshot and Domoticz inventory, which recovers the
+  latest state without replaying old event data.
+
+Creation is also bounded safely. The bridge considers the remote inventory and
+both local catalogs before admitting work against the protocol limits of 512
+targets and 1,024 total units. It reserves the target and Unit 1 capacity needed
+to recover durable sync-owned records before admitting new sources. The plugin
+then recounts the complete live Domoticz shape immediately before each create.
+If either budget is full, affected sources remain unchanged or unbound without a
+partial apply, while unrelated safe updates can continue. A source blocked by
+capacity or an unrelated DeviceID collision does not cause a reconnect loop
+while it remains selected. Likewise, an unchanged target action rejected by
+Domoticz is not retried for every unrelated Home Assistant event; it is eligible
+again when its desired state changes or a new session starts.
+
+Continuous export requires `ha-export.continuous.v1`,
+`domoticz-inventory.v1`, and at least one matching numeric or binary export
+feature in the authenticated feature intersection. During a rolling update,
+peers without continuous export keep the safe connect-time behavior for their
+common features. Remote inventory repair also stays disabled until both sides
+negotiate `domoticz-inventory.v1`.
 
 ### Verify the export
 
 1. Label one representative numeric sensor and one binary sensor.
-2. Start or restart the Domoticz plugin.
+2. Start or restart the Domoticz service. Restart only the service, not the
+   whole host.
 3. In the Domoticz log, look for
    `Authenticated Home Assistant connection is ready`.
-4. Confirm that the ready status includes `domoticz-inventory.v1` and the
-   expected numeric and binary features.
+4. Confirm that the ready status includes `domoticz-inventory.v1`,
+   `ha-export.continuous.v1`, and the expected `ha-export.numeric.v1` and
+   `ha-export.binary.v1` features.
 5. Confirm that both devices appear with the expected names, types, and states.
    Record each DeviceID and idx, the sync-owned device count, and one unrelated
    device as a safety sentinel. Do not record credentials.
-6. Reconnect without changing anything. Confirm the same identities and count,
-   with no duplicate.
-7. On a test installation, rename one catalog-owned target, change its value,
-   and clear its `Used` flag. Reconnect and confirm those mutable fields are
-   repaired in place with the same DeviceID and idx.
-8. Delete another catalog-owned target and reconnect. Confirm exactly one
-   replacement with the same DeviceID. Its idx may be new.
-9. On a test installation, change an owned target's type or add a sibling unit.
-   Reconnect and confirm the target is refused and left untouched, with no
-   replacement or duplicate. Restore it manually afterward.
-10. Confirm the unrelated sentinel was never changed or claimed, then reconnect
-    once more and verify stable identities and counts.
+6. Change the numeric state and trigger the binary sensor. Confirm that Domoticz
+   shows the latest values without another ready message or reconnect, and that
+   the DeviceIDs and idx values stay unchanged.
+7. Make several quick state or safe name changes. After the coalescing window,
+   confirm that Domoticz shows the final state and name without duplicate
+   targets.
+8. Remove the direct export label from one source. Confirm that its existing
+   target remains present but becomes unavailable or timed out. Add the label
+   back and confirm the same DeviceID and idx become current again.
+9. Restart the Domoticz service during or after another source change. Confirm
+   that the plugin reconnects, reports the same feature set, and converges to
+   the latest state without a duplicate.
+10. On a test installation, change an owned target's type or add a sibling unit.
+    Trigger a source change and confirm that the target is refused and left
+    untouched, with no replacement or duplicate. Restore it manually afterward.
+11. Confirm that the unrelated sentinel was never changed or claimed, then
+    reconnect once more and verify stable identities and counts. Keep pairing
+    details, private state values, and private URLs out of verification notes.
 
 The ready status also reports the selected protocol and feature names. If it
 reports v1 compatibility mode or no export features, update both installations
@@ -376,33 +423,36 @@ Updating one does not update the other.
 2. Search for `ha-domoticz-sync`, or filter the list to installed plugins.
 3. Select **Refresh status** if needed, then select **Update** when an update
    is offered.
-4. Select **Restart Domoticz**, or restart the service manually.
+4. Select **Restart Domoticz**, or restart `domoticz.service` manually. Only the
+   service needs restarting; do not reboot the host.
 5. Reopen PyPluginStore and confirm that the plugin no longer reports a
    pending update or restart.
 
 #### Update a manual installation
 
-For a Git checkout, select the matching tag and restart Domoticz:
+For a Git checkout, select the matching tag and restart the Domoticz service:
 
 <!-- x-release-please-start-version -->
 ```bash
 cd /path/to/domoticz/plugins/ha-domoticz-sync
 git fetch --tags
 git checkout v0.5.0
-# Restart Domoticz after the update.
+# Restart domoticz.service after the update; do not reboot the host.
 ```
 <!-- x-release-please-end -->
 
 For an archive installation, replace the complete plugin directory with the
-same tagged release and restart Domoticz.
+same tagged release and restart the Domoticz service.
 
 The halves can be updated in either order. They use only features supported by
 both sides during the rolling update. Legacy protocol v1 is limited to
 authentication and heartbeats, so export remains off if v1 is the only shared
 protocol. During a mixed v2 update, common numeric and binary export features
 continue, but remote inventory and drift repair stay off until both peers
-advertise `domoticz-inventory.v1`. The normal Domoticz -> Home Assistant JSON
-API import is independent of this plugin negotiation.
+advertise `domoticz-inventory.v1`. Live updates start only when both peers also
+advertise `ha-export.continuous.v1`; otherwise their common export features run
+at connect time. The normal Domoticz -> Home Assistant JSON API import is
+independent of this plugin negotiation.
 
 Pairing details normally survive an update. Removing and adding the Home
 Assistant integration creates new pairing details, which must then be copied
@@ -422,14 +472,16 @@ logs.
 3. Confirm that the plugin reconnects safely. A v1-only overlap must remain
    heartbeat-only. A v2 overlap may use only the features reported by both
    peers; catalog-only export may continue without inventory repair.
-4. Update the Domoticz plugin to the target release and restart Domoticz.
+4. Update the Domoticz plugin to the target release and restart the Domoticz
+   service only.
 5. Confirm that the ready status reports protocol v2 and the expected export
    features, then check that reconnecting did not create duplicate devices.
 
 #### Domoticz plugin first
 
 1. Leave Home Assistant on the starting version.
-2. Update the Domoticz plugin to the target release and restart Domoticz.
+2. Update the Domoticz plugin to the target release and restart the Domoticz
+   service only.
 3. Confirm the same safe intermediate behavior: heartbeat-only for v1, or only
    the common negotiated v2 features. Inventory repair must remain off when
    `domoticz-inventory.v1` is not selected.
@@ -443,7 +495,7 @@ logs.
    manual installations use the same Git tag or release archive.
 2. Confirm that the Domoticz log reports
    `Authenticated Home Assistant connection is ready` with protocol v2 and the
-   expected inventory, numeric, and binary feature names.
+   expected inventory, continuous, numeric, and binary feature names.
 3. Verify one native numeric target, one Custom Sensor fallback, and one passive
    binary target when those representative entities are labelled.
 4. Reconnect once more and confirm that each source still has exactly one
@@ -459,14 +511,14 @@ mixed-version and feature-negotiation rules.
 | Domoticz -> Home Assistant | The integration cannot be added | Confirm that Home Assistant can reach the Domoticz URL, the credentials are correct, the URL uses HTTP or HTTPS, and the import SSL setting matches the certificate. Do not put credentials in the URL. |
 | Domoticz -> Home Assistant | Expected entities are missing | Check that the Domoticz devices are active and used, visible to the configured user, and allowed by the hidden and favorite options. |
 | Domoticz -> Home Assistant | A newly created Domoticz device is missing | Reload the integration so Home Assistant can create entities for the new device or metric. |
-| Home Assistant -> Domoticz | PyPluginStore is missing from the Custom menu | Confirm that PyPluginStore was added under Hardware, the current user has the Custom menu enabled, its web folders are writable, and Domoticz was restarted. Then hard-refresh the browser. |
-| Home Assistant -> Domoticz | The plugin is not listed under Hardware | For PyPluginStore, confirm that `ha-domoticz-sync` is installed, then restart Domoticz. For a manual installation, confirm that the complete repository is one direct child of the plugins directory and that its root `plugin.py` is executable. In both cases, confirm Python plugin support under Setup -> About. |
+| Home Assistant -> Domoticz | PyPluginStore is missing from the Custom menu | Confirm that PyPluginStore was added under Hardware, the current user has the Custom menu enabled, its web folders are writable, and the Domoticz service was restarted. Then hard-refresh the browser. |
+| Home Assistant -> Domoticz | The plugin is not listed under Hardware | For PyPluginStore, confirm that `ha-domoticz-sync` is installed, then restart the Domoticz service. For a manual installation, confirm that the complete repository is one direct child of the plugins directory and that its root `plugin.py` is executable. In both cases, confirm Python plugin support under Setup -> About. |
 | Home Assistant -> Domoticz | The plugin reports invalid configuration | Enter a host without a scheme or path, a numeric port from 1 to 65535, WS or WSS, and the exact Link ID and Pairing key shown in Home Assistant. |
 | Home Assistant -> Domoticz | The plugin cannot connect | Confirm Domoticz can resolve and reach the Home Assistant host and port, the Home Assistant integration entry is loaded, and WS/WSS matches the endpoint. A reverse proxy must forward WebSocket traffic and the `Sec-WebSocket-Protocol` header. |
 | Home Assistant -> Domoticz | The connection is ready but export is disabled | Check the reported protocol and features. Install the same release tag on both systems. A v1 compatibility connection is intentionally heartbeat-only. |
-| Home Assistant -> Domoticz | A labelled entity is not exported | Put the label directly on a `sensor` or `binary_sensor`, reconnect the plugin, and check the Home Assistant log for a fixed exclusion reason. Domoticz-origin mirrors are intentionally skipped. |
+| Home Assistant -> Domoticz | A labelled entity is not exported | Put the label directly on a `sensor` or `binary_sensor` and check the Home Assistant log for a fixed exclusion reason. With continuous export, a newly eligible uncataloged source causes one controlled reconnect for fresh inventory. Without `ha-export.continuous.v1`, reconnect the plugin manually. Domoticz-origin mirrors are intentionally skipped. |
 | Home Assistant -> Domoticz | A numeric sensor becomes a Custom Sensor | This is the safe fallback when meaning, unit, or state class does not exactly match a native Domoticz type. Check the mapping reference. |
-| Home Assistant -> Domoticz | A state, label, or name change is not visible | Export is connect-time only. Restart or reconnect the plugin. |
+| Home Assistant -> Domoticz | A state, label, or name change is not visible | Confirm that the ready status includes `ha-export.continuous.v1`, `domoticz-inventory.v1`, and the matching numeric or binary feature. Wait for the short coalescing window. If continuous export is not selected, restart or reconnect the plugin to run the connect-time pass. |
 | Home Assistant -> Domoticz | A manually deleted target is not recreated | Confirm that the source is still selected, both peers report `domoticz-inventory.v1`, and the target was already recorded as sync-owned. A remote-only DeviceID is deliberately not claimed. Do not edit Home Assistant `.storage` files. |
 | Home Assistant -> Domoticz | A retyped target or unexpected unit layout is not repaired | This is deliberate. The bridge never retypes a device or chooses between sibling units. Restore the original profile or remove the conflicting target manually, then reconnect. |
 | Home Assistant -> Domoticz | Inventory reconciliation is rejected | Install matching tags and reconnect once. A partial, malformed, oversized, or ambiguous inventory is discarded before any write. Check the sanitized Home Assistant and Domoticz logs without sharing credentials or private state. |
@@ -478,8 +530,9 @@ Domoticz password, tokens, cookies, or other credentials in an issue.
 
 - Domoticz -> Home Assistant uses polling. New Domoticz devices or metrics may
   need an integration reload before Home Assistant creates their entities.
-- Home Assistant -> Domoticz runs only when the plugin connects. It does not
-  subscribe to live Home Assistant state, metadata, or label changes.
+- Home Assistant -> Domoticz live updates require the continuous, inventory,
+  and matching export-kind features to be selected. Older or mixed versions
+  without that intersection retain connect-time-only export.
 - The plugin never automatically deletes or retypes Domoticz targets.
 - Inventory-aware repair is limited to locally cataloged targets with their
   deterministic DeviceID and exactly Unit 1. Remote-only devices, immutable
@@ -515,6 +568,12 @@ device metadata:
 Keep the bridge on a trusted network or VPN and do not expose it directly to
 the public internet. Keep pairing keys private and never put them in URLs,
 logs, diagnostics, or issue reports.
+
+Continuous change notifications retain only a session-local dirty marker. The
+bridge reads current state after coalescing and does not retain event payloads
+for replay. Logs report fixed diagnostics and aggregate outcomes; verification
+notes and shared logs must still exclude credentials, private URLs, and private
+state values.
 
 Please report suspected vulnerabilities privately through GitHub Security
 Advisories. See [SECURITY.md](SECURITY.md).
