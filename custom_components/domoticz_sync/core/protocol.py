@@ -15,7 +15,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
 from .reconciliation import ReconciliationAction, ReconciliationActionKind
@@ -27,6 +27,7 @@ PROTOCOL_VERSION = PROTOCOL_VERSION_V1
 PROTOCOL_VERSION_V2 = 2
 
 WEBSOCKET_SUBPROTOCOL_V2 = "ha-domoticz-sync.v2"
+FEATURE_DOMOTICZ_INVENTORY_V1 = "domoticz-inventory.v1"
 FEATURE_HA_EXPORT_BINARY_V1 = "ha-export.binary.v1"
 FEATURE_HA_EXPORT_NUMERIC_V1 = "ha-export.numeric.v1"
 SUPPORTED_WEBSOCKET_SUBPROTOCOLS = (WEBSOCKET_SUBPROTOCOL_V2,)
@@ -46,6 +47,16 @@ MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEQUENCE = MAX_SAFE_INTEGER
 MAX_PROTOCOL_TOKENS = 16
 MAX_FEATURE_IDS = 64
+MAX_INVENTORY_TARGETS = 512
+MAX_INVENTORY_UNITS = 1024
+MAX_INVENTORY_PAGES = 512
+MAX_INVENTORY_TARGETS_PER_PAGE = 64
+MAX_INVENTORY_PAYLOAD_BYTES = 60 * 1024
+INVENTORY_TIMEOUT_SECONDS = 10
+MAX_INVENTORY_TARGET_ID_BYTES = 128
+MAX_INVENTORY_NAME_BYTES = 512
+MAX_INVENTORY_S_VALUE_BYTES = 4096
+MAX_INVENTORY_OPTION_BYTES = 1024
 
 _SECRET_BYTES = PAIRING_KEY_BITS // 8
 _NONCE_BYTES = NONCE_BITS // 8
@@ -92,6 +103,29 @@ _APPLY_RESULT_KEYS = {
     "status",
     "target_id",
     "source",
+}
+_INVENTORY_REQUEST_KEYS = {"schema", "type", "request_id"}
+_INVENTORY_RESULT_KEYS = {
+    "schema",
+    "type",
+    "request_id",
+    "status",
+    "page",
+    "complete",
+    "targets",
+}
+_INVENTORY_TARGET_KEYS = {"target_id", "timed_out", "units"}
+_INVENTORY_UNIT_KEYS = {
+    "unit",
+    "name",
+    "type",
+    "subtype",
+    "switch_type",
+    "used",
+    "n_value",
+    "s_value",
+    "custom_option",
+    "has_other_options",
 }
 _ACTION_KEYS = {"kind", "capability", "target_id", "stale"}
 _CAPABILITY_KEYS = {
@@ -154,6 +188,13 @@ class ProtocolCompatibilityError(ProtocolError):
 
 class ApplyResultStatus(str, Enum):
     """The only safe outcomes returned for one remote action."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
+class InventoryResultStatus(str, Enum):
+    """The only safe outcomes for one authenticated inventory request."""
 
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
@@ -346,6 +387,110 @@ class ApplyResult:
             if not isinstance(self.source, SourceIdentity):
                 raise ProtocolFormatError("invalid protocol message")
         elif self.target_id is not None or self.source is not None:
+            raise ProtocolFormatError("invalid protocol message")
+
+
+@dataclass(frozen=True)
+class InventoryUnit:
+    """One bounded Domoticz unit observation inside an inventory snapshot."""
+
+    unit: int
+    name: str
+    type: int
+    subtype: int
+    switch_type: int
+    used: bool
+    n_value: int
+    s_value: str
+    custom_option: Optional[str]
+    has_other_options: bool
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as strictly as parsed input."""
+        _validate_bounded_integer(self.unit, 1, 255)
+        _validate_inventory_string(self.name, MAX_INVENTORY_NAME_BYTES)
+        _validate_bounded_integer(self.type, 0, MAX_SAFE_INTEGER)
+        _validate_bounded_integer(self.subtype, 0, MAX_SAFE_INTEGER)
+        _validate_bounded_integer(self.switch_type, 0, MAX_SAFE_INTEGER)
+        _validate_strict_bool(self.used)
+        _validate_bounded_integer(
+            self.n_value,
+            -MAX_SAFE_INTEGER,
+            MAX_SAFE_INTEGER,
+        )
+        _validate_inventory_string(self.s_value, MAX_INVENTORY_S_VALUE_BYTES)
+        if self.custom_option is not None:
+            _validate_inventory_string(
+                self.custom_option,
+                MAX_INVENTORY_OPTION_BYTES,
+            )
+        _validate_strict_bool(self.has_other_options)
+
+
+@dataclass(frozen=True)
+class InventoryTarget:
+    """One hardware-scoped Domoticz parent and its ordered units."""
+
+    target_id: str
+    timed_out: bool
+    units: Tuple[InventoryUnit, ...]
+
+    def __post_init__(self) -> None:
+        """Require a deterministic, duplicate-free unit ordering."""
+        _validate_inventory_target_id(self.target_id)
+        _validate_strict_bool(self.timed_out)
+        if type(self.units) is not tuple or len(self.units) > MAX_INVENTORY_UNITS:
+            raise ProtocolFormatError("invalid protocol message")
+        unit_numbers: List[int] = []
+        for unit in self.units:
+            if not isinstance(unit, InventoryUnit):
+                raise ProtocolFormatError("invalid protocol message")
+            unit_numbers.append(unit.unit)
+        if unit_numbers != sorted(unit_numbers) or len(unit_numbers) != len(
+            set(unit_numbers)
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+
+
+@dataclass(frozen=True)
+class InventoryResult:
+    """One page of an authenticated, bounded Domoticz inventory snapshot."""
+
+    request_id: str
+    status: InventoryResultStatus
+    page: int
+    complete: bool
+    targets: Tuple[InventoryTarget, ...]
+
+    def __post_init__(self) -> None:
+        """Require one exact confirmed page or sanitized rejection."""
+        _validate_request_id(self.request_id)
+        if not isinstance(self.status, InventoryResultStatus):
+            raise ProtocolFormatError("invalid protocol message")
+        _validate_bounded_integer(self.page, 1, MAX_INVENTORY_PAGES)
+        _validate_strict_bool(self.complete)
+        if (
+            type(self.targets) is not tuple
+            or len(self.targets) > MAX_INVENTORY_TARGETS_PER_PAGE
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+
+        target_ids: List[str] = []
+        for target in self.targets:
+            if not isinstance(target, InventoryTarget):
+                raise ProtocolFormatError("invalid protocol message")
+            target_ids.append(target.target_id)
+        if target_ids != sorted(target_ids) or len(target_ids) != len(
+            set(target_ids)
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+
+        if self.status is InventoryResultStatus.REJECTED:
+            if self.page != 1 or not self.complete or self.targets:
+                raise ProtocolFormatError("invalid protocol message")
+        elif not self.targets and (self.page != 1 or not self.complete):
+            raise ProtocolFormatError("invalid protocol message")
+        elif self.page == MAX_INVENTORY_PAGES and not self.complete:
             raise ProtocolFormatError("invalid protocol message")
 
 
@@ -1072,6 +1217,139 @@ def parse_application_ready(
     )
 
 
+def build_inventory_request(
+    selection: ProtocolSelection,
+    request_id: str,
+) -> Dict[str, object]:
+    """Build one feature-gated request for a complete Domoticz inventory."""
+    _require_inventory_selection(selection)
+    _validate_request_id(request_id)
+    return _normalize_inventory_payload(
+        {
+            "schema": 1,
+            "type": "inventory_request",
+            "request_id": request_id,
+        }
+    )
+
+
+def parse_inventory_request(
+    selection: ProtocolSelection,
+    document: object,
+) -> str:
+    """Parse one exact inventory request and return its correlation ID."""
+    _require_inventory_selection(selection)
+    try:
+        data = _require_application_message(
+            _normalize_inventory_payload(document),
+            _INVENTORY_REQUEST_KEYS,
+            "inventory_request",
+        )
+        request_id = _require_string(data["request_id"])
+        _validate_request_id(request_id)
+        return request_id
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def build_inventory_result(
+    selection: ProtocolSelection,
+    result: InventoryResult,
+) -> Dict[str, object]:
+    """Build one strict, bounded page of a Domoticz inventory result."""
+    _require_inventory_selection(selection)
+    if not isinstance(result, InventoryResult):
+        raise ProtocolFormatError("invalid protocol message")
+    return _normalize_inventory_payload(_inventory_result_to_dict(result))
+
+
+def parse_inventory_result(
+    selection: ProtocolSelection,
+    document: object,
+) -> InventoryResult:
+    """Parse one exact, bounded Domoticz inventory result page."""
+    _require_inventory_selection(selection)
+    try:
+        data = _require_application_message(
+            _normalize_inventory_payload(document),
+            _INVENTORY_RESULT_KEYS,
+            "inventory_result",
+        )
+        targets = data["targets"]
+        if type(targets) is not list:
+            raise ProtocolFormatError("invalid protocol message")
+        return InventoryResult(
+            request_id=_require_string(data["request_id"]),
+            status=InventoryResultStatus(data["status"]),
+            page=data["page"],
+            complete=data["complete"],
+            targets=tuple(_inventory_target_from_dict(target) for target in targets),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def assemble_inventory_results(
+    selection: ProtocolSelection,
+    request_id: str,
+    pages: Iterable[InventoryResult],
+) -> Tuple[InventoryTarget, ...]:
+    """Validate and assemble one complete inventory without side effects."""
+    validated_selection = _require_inventory_selection(selection)
+    _validate_request_id(request_id)
+    try:
+        iterator = iter(pages)
+    except TypeError:
+        raise ProtocolFormatError("invalid protocol message") from None
+
+    assembled: List[InventoryTarget] = []
+    page_count = 0
+    unit_count = 0
+    terminal_seen = False
+    previous_target_id: Optional[str] = None
+
+    for result in iterator:
+        page_count += 1
+        if page_count > MAX_INVENTORY_PAGES:
+            raise ProtocolFormatError("invalid protocol message")
+        if not isinstance(result, InventoryResult):
+            raise ProtocolFormatError("invalid protocol message")
+        if (
+            terminal_seen
+            or result.request_id != request_id
+            or result.page != page_count
+        ):
+            raise ProtocolFormatError("invalid protocol message")
+
+        # Directly constructed pages receive the same canonical byte validation
+        # as pages that crossed the wire.
+        build_inventory_result(validated_selection, result)
+
+        if result.status is InventoryResultStatus.REJECTED:
+            raise ProtocolCompatibilityError("inventory rejected")
+
+        for target in result.targets:
+            if (
+                previous_target_id is not None
+                and target.target_id <= previous_target_id
+            ):
+                raise ProtocolFormatError("invalid protocol message")
+            previous_target_id = target.target_id
+            assembled.append(target)
+            unit_count += len(target.units)
+            if (
+                len(assembled) > MAX_INVENTORY_TARGETS
+                or unit_count > MAX_INVENTORY_UNITS
+            ):
+                raise ProtocolFormatError("invalid protocol message")
+
+        terminal_seen = result.complete
+
+    if page_count == 0 or not terminal_seen:
+        raise ProtocolFormatError("invalid protocol message")
+    return tuple(assembled)
+
+
 def build_apply(
     selection: ProtocolSelection,
     request_id: str,
@@ -1335,6 +1613,35 @@ def _validate_request_id(value: object) -> None:
     _validate_identifier(value)
 
 
+def _validate_bounded_integer(value: object, minimum: int, maximum: int) -> None:
+    """Require one exact integer inside an inclusive wire-safe range."""
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ProtocolFormatError("invalid protocol message")
+
+
+def _validate_strict_bool(value: object) -> None:
+    """Require a JSON boolean without accepting integer zero or one."""
+    if type(value) is not bool:
+        raise ProtocolFormatError("invalid protocol message")
+
+
+def _validate_inventory_string(value: object, maximum_bytes: int) -> None:
+    """Require one valid Unicode string inside its UTF-8 byte bound."""
+    try:
+        if type(value) is not str or len(value.encode("utf-8")) > maximum_bytes:
+            raise ValueError
+        _validate_json_value(value)
+    except (UnicodeError, TypeError, ValueError, OverflowError, RecursionError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def _validate_inventory_target_id(value: object) -> None:
+    """Require one bounded, nonempty, whitespace-stable target identity."""
+    _validate_inventory_string(value, MAX_INVENTORY_TARGET_ID_BYTES)
+    if not value or value != value.strip():
+        raise ProtocolFormatError("invalid protocol message")
+
+
 def _validate_target_id(value: object) -> None:
     """Apply the target-neutral opaque identifier rules."""
     if not isinstance(value, str) or not value.strip() or value != value.strip():
@@ -1472,6 +1779,16 @@ def _require_binary_export_selection(
     """Require the negotiated Home Assistant binary export behavior."""
     validated = _require_v2_selection(selection)
     if not validated.supports(FEATURE_HA_EXPORT_BINARY_V1):
+        raise ProtocolCompatibilityError("incompatible protocol")
+    return validated
+
+
+def _require_inventory_selection(
+    selection: object,
+) -> ProtocolSelection:
+    """Require the negotiated authenticated Domoticz inventory behavior."""
+    validated = _require_v2_selection(selection)
+    if not validated.supports(FEATURE_DOMOTICZ_INVENTORY_V1):
         raise ProtocolCompatibilityError("incompatible protocol")
     return validated
 
@@ -1631,6 +1948,84 @@ def _normalize_payload(payload: object) -> Dict[str, object]:
     return normalized
 
 
+def _normalize_inventory_payload(payload: object) -> Dict[str, object]:
+    """Normalize one inventory payload inside its reserved envelope budget."""
+    normalized = _normalize_payload(payload)
+    if len(canonical_json_bytes(normalized)) > MAX_INVENTORY_PAYLOAD_BYTES:
+        raise ProtocolFormatError("invalid protocol message")
+    return normalized
+
+
+def _inventory_unit_to_dict(unit: InventoryUnit) -> Dict[str, object]:
+    """Serialize one complete, bounded inventory unit."""
+    return {
+        "unit": unit.unit,
+        "name": unit.name,
+        "type": unit.type,
+        "subtype": unit.subtype,
+        "switch_type": unit.switch_type,
+        "used": unit.used,
+        "n_value": unit.n_value,
+        "s_value": unit.s_value,
+        "custom_option": unit.custom_option,
+        "has_other_options": unit.has_other_options,
+    }
+
+
+def _inventory_unit_from_dict(document: object) -> InventoryUnit:
+    """Parse one exact inventory unit using strict scalar types."""
+    _require_exact_object(document, _INVENTORY_UNIT_KEYS)
+    return InventoryUnit(
+        unit=document["unit"],
+        name=document["name"],
+        type=document["type"],
+        subtype=document["subtype"],
+        switch_type=document["switch_type"],
+        used=document["used"],
+        n_value=document["n_value"],
+        s_value=document["s_value"],
+        custom_option=document["custom_option"],
+        has_other_options=document["has_other_options"],
+    )
+
+
+def _inventory_target_to_dict(target: InventoryTarget) -> Dict[str, object]:
+    """Serialize one parent target and all of its ordered units."""
+    return {
+        "target_id": target.target_id,
+        "timed_out": target.timed_out,
+        "units": [_inventory_unit_to_dict(unit) for unit in target.units],
+    }
+
+
+def _inventory_target_from_dict(document: object) -> InventoryTarget:
+    """Parse one exact parent target without dropping empty containers."""
+    _require_exact_object(document, _INVENTORY_TARGET_KEYS)
+    units = document["units"]
+    if type(units) is not list:
+        raise ProtocolFormatError("invalid protocol message")
+    return InventoryTarget(
+        target_id=document["target_id"],
+        timed_out=document["timed_out"],
+        units=tuple(_inventory_unit_from_dict(unit) for unit in units),
+    )
+
+
+def _inventory_result_to_dict(result: InventoryResult) -> Dict[str, object]:
+    """Serialize one exact inventory result page."""
+    return {
+        "schema": 1,
+        "type": "inventory_result",
+        "request_id": result.request_id,
+        "status": result.status.value,
+        "page": result.page,
+        "complete": result.complete,
+        "targets": [
+            _inventory_target_to_dict(target) for target in result.targets
+        ],
+    }
+
+
 def _source_to_dict(source: SourceIdentity) -> Dict[str, object]:
     """Serialize one complete source identity."""
     return {
@@ -1729,9 +2124,20 @@ def _unsigned_envelope(
 __all__ = [
     "DIRECTION_DOMOTICZ_TO_HA",
     "DIRECTION_HA_TO_DOMOTICZ",
+    "FEATURE_DOMOTICZ_INVENTORY_V1",
     "FEATURE_HA_EXPORT_BINARY_V1",
     "FEATURE_HA_EXPORT_NUMERIC_V1",
+    "INVENTORY_TIMEOUT_SECONDS",
     "MAX_FEATURE_IDS",
+    "MAX_INVENTORY_NAME_BYTES",
+    "MAX_INVENTORY_OPTION_BYTES",
+    "MAX_INVENTORY_PAGES",
+    "MAX_INVENTORY_PAYLOAD_BYTES",
+    "MAX_INVENTORY_S_VALUE_BYTES",
+    "MAX_INVENTORY_TARGET_ID_BYTES",
+    "MAX_INVENTORY_TARGETS",
+    "MAX_INVENTORY_TARGETS_PER_PAGE",
+    "MAX_INVENTORY_UNITS",
     "MAX_MESSAGE_BYTES",
     "MAX_PROTOCOL_TOKENS",
     "MAX_SEQUENCE",
@@ -1748,6 +2154,10 @@ __all__ = [
     "ApplyResultStatus",
     "ClientHello",
     "HandshakeContext",
+    "InventoryResult",
+    "InventoryResultStatus",
+    "InventoryTarget",
+    "InventoryUnit",
     "ProtocolAuthenticationError",
     "ProtocolCompatibilityError",
     "ProtocolError",
@@ -1759,6 +2169,7 @@ __all__ = [
     "VerifiedEnvelope",
     "accept_challenge",
     "accept_v2_challenge",
+    "assemble_inventory_results",
     "build_application_ready",
     "build_apply",
     "build_apply_result",
@@ -1767,6 +2178,8 @@ __all__ = [
     "build_authenticate",
     "build_challenge",
     "build_hello",
+    "build_inventory_request",
+    "build_inventory_result",
     "build_ready",
     "build_v2_authenticate",
     "build_v2_challenge",
@@ -1797,6 +2210,8 @@ __all__ = [
     "parse_binary_apply",
     "parse_binary_apply_result",
     "parse_hello",
+    "parse_inventory_request",
+    "parse_inventory_result",
     "parse_v2_hello",
     "select_websocket_subprotocol",
     "sign_envelope",

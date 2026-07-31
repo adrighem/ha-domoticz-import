@@ -19,6 +19,7 @@ from custom_components.domoticz_sync.core.capabilities import (
 from custom_components.domoticz_sync.core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
     MAX_MESSAGE_BYTES,
@@ -34,6 +35,10 @@ from custom_components.domoticz_sync.core.protocol import (
     ApplyResultStatus,
     ClientHello,
     HandshakeContext,
+    InventoryResult,
+    InventoryResultStatus,
+    InventoryTarget,
+    InventoryUnit,
     ProtocolAuthenticationError,
     ProtocolCompatibilityError,
     ProtocolFormatError,
@@ -42,6 +47,7 @@ from custom_components.domoticz_sync.core.protocol import (
     V2HandshakeContext,
     accept_challenge,
     accept_v2_challenge,
+    assemble_inventory_results,
     build_application_ready,
     build_apply,
     build_apply_result,
@@ -50,6 +56,8 @@ from custom_components.domoticz_sync.core.protocol import (
     build_binary_apply_result,
     build_challenge,
     build_hello,
+    build_inventory_request,
+    build_inventory_result,
     build_ready,
     build_v2_authenticate,
     build_v2_challenge,
@@ -80,6 +88,8 @@ from custom_components.domoticz_sync.core.protocol import (
     parse_binary_apply,
     parse_binary_apply_result,
     parse_hello,
+    parse_inventory_request,
+    parse_inventory_result,
     parse_v2_hello,
     select_websocket_subprotocol,
     sign_envelope,
@@ -166,8 +176,13 @@ def _fixed_v2_context(
     )
 
 
-def _v2_session() -> tuple[bytes, V2HandshakeContext, str]:
-    context = _fixed_v2_context()
+def _v2_session(
+    features: tuple[str, ...] = SUPPORTED_V2_FEATURES,
+) -> tuple[bytes, V2HandshakeContext, str]:
+    context = _fixed_v2_context(
+        client_features=features,
+        server_features=features,
+    )
     session_key = derive_v2_session_key(_fixed_pairing_key(), context)
     return session_key, context, derive_v2_session_id(session_key, context)
 
@@ -221,6 +236,63 @@ def _binary_capability(
         value=value,
         availability=availability,
         semantic=semantic,
+    )
+
+
+def _inventory_selection() -> ProtocolSelection:
+    return _selection((FEATURE_DOMOTICZ_INVENTORY_V1,))
+
+
+def _inventory_unit(
+    *,
+    unit: int = 1,
+    name: str = "Living room motion",
+    n_value: int = 0,
+    s_value: str = "Off",
+    custom_option: str | None = None,
+    has_other_options: bool = False,
+) -> InventoryUnit:
+    return InventoryUnit(
+        unit=unit,
+        name=name,
+        type=244,
+        subtype=73,
+        switch_type=8,
+        used=True,
+        n_value=n_value,
+        s_value=s_value,
+        custom_option=custom_option,
+        has_other_options=has_other_options,
+    )
+
+
+def _inventory_target(
+    target_id: str = "HA00000000000000000000001",
+    *,
+    timed_out: bool = False,
+    units: tuple[InventoryUnit, ...] | None = None,
+) -> InventoryTarget:
+    return InventoryTarget(
+        target_id=target_id,
+        timed_out=timed_out,
+        units=(_inventory_unit(),) if units is None else units,
+    )
+
+
+def _inventory_result(
+    *,
+    request_id: str = "inventory-1",
+    status: InventoryResultStatus = InventoryResultStatus.CONFIRMED,
+    page: int = 1,
+    complete: bool = True,
+    targets: tuple[InventoryTarget, ...] | None = None,
+) -> InventoryResult:
+    return InventoryResult(
+        request_id=request_id,
+        status=status,
+        page=page,
+        complete=complete,
+        targets=(_inventory_target(),) if targets is None else targets,
     )
 
 
@@ -1351,6 +1423,687 @@ def test_application_ready_is_exact_and_does_not_require_optional_features() -> 
     for mutation in mutations:
         with pytest.raises(ProtocolFormatError):
             parse_application_ready(selection, mutation)
+
+
+def test_inventory_feature_negotiates_independently_for_mixed_v2_peers() -> None:
+    """Inventory is selected only when both authenticated peers advertise it."""
+    old_features = SUPPORTED_V2_FEATURES
+    inventory_features = tuple(
+        sorted((*SUPPORTED_V2_FEATURES, FEATURE_DOMOTICZ_INVENTORY_V1))
+    )
+
+    assert FEATURE_DOMOTICZ_INVENTORY_V1 not in SUPPORTED_V2_FEATURES
+    assert SUPPORTED_V2_FEATURES == tuple(sorted(SUPPORTED_V2_FEATURES))
+    assert _fixed_v2_context(
+        client_features=inventory_features,
+        server_features=old_features,
+    ).selection.features == old_features
+    assert _fixed_v2_context(
+        client_features=old_features,
+        server_features=inventory_features,
+    ).selection.features == old_features
+    assert _fixed_v2_context(
+        client_features=inventory_features,
+        server_features=inventory_features,
+    ).selection.supports(
+        FEATURE_DOMOTICZ_INVENTORY_V1
+    )
+
+
+def test_inventory_request_codec_is_exact_and_feature_gated() -> None:
+    """Only a negotiated inventory session can exchange a bounded request."""
+    selection = _inventory_selection()
+    payload = build_inventory_request(selection, "inventory-1")
+
+    assert payload == {
+        "schema": 1,
+        "type": "inventory_request",
+        "request_id": "inventory-1",
+    }
+    assert parse_inventory_request(selection, payload) == "inventory-1"
+
+    without_inventory = _selection((FEATURE_HA_EXPORT_NUMERIC_V1,))
+    with pytest.raises(ProtocolCompatibilityError):
+        build_inventory_request(without_inventory, "inventory-1")
+    with pytest.raises(ProtocolCompatibilityError):
+        parse_inventory_request(without_inventory, payload)
+
+    mutations = []
+    for key in payload:
+        missing = deepcopy(payload)
+        del missing[key]
+        mutations.append(missing)
+    extra = deepcopy(payload)
+    extra["unexpected"] = True
+    mutations.append(extra)
+    wrong_schema = deepcopy(payload)
+    wrong_schema["schema"] = True
+    mutations.append(wrong_schema)
+    wrong_type = deepcopy(payload)
+    wrong_type["type"] = "inventory_result"
+    mutations.append(wrong_type)
+    invalid_request_id = deepcopy(payload)
+    invalid_request_id["request_id"] = "contains space"
+    mutations.append(invalid_request_id)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_inventory_request(selection, mutation)
+
+
+def test_confirmed_inventory_page_round_trips_the_exact_remote_snapshot() -> None:
+    """Every managed field survives the strict inventory result codec."""
+    selection = _inventory_selection()
+    first = _inventory_unit()
+    second = InventoryUnit(
+        unit=2,
+        name="Outdoor temperature",
+        type=243,
+        subtype=31,
+        switch_type=0,
+        used=False,
+        n_value=-1,
+        s_value="12.5",
+        custom_option="1;ppm",
+        has_other_options=True,
+    )
+    result = _inventory_result(
+        page=7,
+        complete=False,
+        targets=(
+            _inventory_target(
+                timed_out=True,
+                units=(first, second),
+            ),
+        ),
+    )
+    payload = build_inventory_result(selection, result)
+
+    assert payload == {
+        "schema": 1,
+        "type": "inventory_result",
+        "request_id": "inventory-1",
+        "status": "confirmed",
+        "page": 7,
+        "complete": False,
+        "targets": [
+            {
+                "target_id": "HA00000000000000000000001",
+                "timed_out": True,
+                "units": [
+                    {
+                        "unit": 1,
+                        "name": "Living room motion",
+                        "type": 244,
+                        "subtype": 73,
+                        "switch_type": 8,
+                        "used": True,
+                        "n_value": 0,
+                        "s_value": "Off",
+                        "custom_option": None,
+                        "has_other_options": False,
+                    },
+                    {
+                        "unit": 2,
+                        "name": "Outdoor temperature",
+                        "type": 243,
+                        "subtype": 31,
+                        "switch_type": 0,
+                        "used": False,
+                        "n_value": -1,
+                        "s_value": "12.5",
+                        "custom_option": "1;ppm",
+                        "has_other_options": True,
+                    },
+                ],
+            },
+        ],
+    }
+    assert parse_inventory_result(selection, payload) == result
+
+
+def test_rejected_inventory_result_is_sanitized_and_not_an_empty_snapshot() -> None:
+    """A remote refusal has one fixed shape and cannot mean no devices."""
+    selection = _inventory_selection()
+    result = _inventory_result(
+        status=InventoryResultStatus.REJECTED,
+        targets=(),
+    )
+    payload = build_inventory_result(selection, result)
+
+    assert payload == {
+        "schema": 1,
+        "type": "inventory_result",
+        "request_id": "inventory-1",
+        "status": "rejected",
+        "page": 1,
+        "complete": True,
+        "targets": [],
+    }
+    assert parse_inventory_result(selection, payload) == result
+    with pytest.raises(ProtocolCompatibilityError):
+        assemble_inventory_results(selection, "inventory-1", (result,))
+
+    mutations = []
+    for field, value in (
+        ("page", 2),
+        ("complete", False),
+        (
+            "targets",
+            [build_inventory_result(selection, _inventory_result())["targets"][0]],
+        ),
+    ):
+        mutation = deepcopy(payload)
+        mutation[field] = value
+        mutations.append(mutation)
+    details = deepcopy(payload)
+    details["error"] = "remote internal detail"
+    mutations.append(details)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_inventory_result(selection, mutation)
+
+
+def test_inventory_messages_round_trip_inside_signed_ordered_envelopes() -> None:
+    """Request and response correlation is protected by the v2 session MAC."""
+    inventory_features = tuple(
+        sorted((*SUPPORTED_V2_FEATURES, FEATURE_DOMOTICZ_INVENTORY_V1))
+    )
+    session_key, context, session_id = _v2_session(inventory_features)
+    selection = context.selection
+    request_envelope = sign_envelope(
+        session_key,
+        protocol_version=selection.version,
+        direction=DIRECTION_HA_TO_DOMOTICZ,
+        session_id=session_id,
+        sequence=1,
+        payload=build_inventory_request(selection, "inventory-1"),
+    )
+    request = verify_envelope(
+        session_key,
+        request_envelope,
+        protocol_version=selection.version,
+        expected_direction=DIRECTION_HA_TO_DOMOTICZ,
+        expected_session_id=session_id,
+        last_sequence=0,
+    )
+    assert parse_inventory_request(selection, request.payload) == "inventory-1"
+
+    result_envelope = sign_envelope(
+        session_key,
+        protocol_version=selection.version,
+        direction=DIRECTION_DOMOTICZ_TO_HA,
+        session_id=session_id,
+        sequence=1,
+        payload=build_inventory_result(selection, _inventory_result()),
+    )
+    verified_result = verify_envelope(
+        session_key,
+        result_envelope,
+        protocol_version=selection.version,
+        expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+        expected_session_id=session_id,
+        last_sequence=0,
+    )
+    assert (
+        parse_inventory_result(selection, verified_result.payload)
+        == _inventory_result()
+    )
+
+    for last_sequence in (1, 2):
+        with pytest.raises(
+            ProtocolSequenceError,
+            match="^invalid protocol sequence$",
+        ):
+            verify_envelope(
+                session_key,
+                result_envelope,
+                protocol_version=selection.version,
+                expected_direction=DIRECTION_DOMOTICZ_TO_HA,
+                expected_session_id=session_id,
+                last_sequence=last_sequence,
+            )
+
+
+def test_inventory_result_parser_rejects_extensions_and_missing_fields() -> None:
+    """No message, target, or unit layer has an unsigned extension point."""
+    selection = _inventory_selection()
+    payload = build_inventory_result(selection, _inventory_result())
+    mutations = []
+
+    for path in ((), ("targets", 0), ("targets", 0, "units", 0)):
+        extra = deepcopy(payload)
+        current = extra
+        for component in path:
+            current = current[component]
+        current["unexpected"] = True
+        mutations.append(extra)
+
+    for path, key in (
+        ((), "request_id"),
+        ((), "complete"),
+        (("targets", 0), "timed_out"),
+        (("targets", 0, "units", 0), "switch_type"),
+    ):
+        missing = deepcopy(payload)
+        current = missing
+        for component in path:
+            current = current[component]
+        del current[key]
+        mutations.append(missing)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_inventory_result(selection, mutation)
+
+
+def test_inventory_result_parser_requires_exact_scalar_types() -> None:
+    """Booleans and integers cannot be confused at any inventory layer."""
+    selection = _inventory_selection()
+    payload = build_inventory_result(selection, _inventory_result())
+    mutations = []
+
+    scalar_mutations = (
+        (("schema",), True),
+        (("page",), True),
+        (("complete",), 1),
+        (("status",), "failed"),
+        (("request_id",), 1),
+        (("targets", 0, "target_id"), " leading-space"),
+        (("targets", 0, "timed_out"), 0),
+        (("targets", 0, "units", 0, "unit"), True),
+        (("targets", 0, "units", 0, "type"), True),
+        (("targets", 0, "units", 0, "subtype"), 73.0),
+        (("targets", 0, "units", 0, "switch_type"), "8"),
+        (("targets", 0, "units", 0, "used"), 1),
+        (("targets", 0, "units", 0, "n_value"), True),
+        (("targets", 0, "units", 0, "name"), 1),
+        (("targets", 0, "units", 0, "s_value"), None),
+        (("targets", 0, "units", 0, "custom_option"), 1),
+        (("targets", 0, "units", 0, "has_other_options"), 0),
+    )
+    for path, value in scalar_mutations:
+        mutation = deepcopy(payload)
+        current = mutation
+        for component in path[:-1]:
+            current = current[component]
+        current[path[-1]] = value
+        mutations.append(mutation)
+
+    for mutation in mutations:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_inventory_result(selection, mutation)
+
+
+def test_inventory_strings_use_explicit_utf8_byte_bounds() -> None:
+    """Remote strings are rejected rather than truncated at fixed byte limits."""
+    assert protocol.MAX_INVENTORY_TARGET_ID_BYTES == 128
+    assert protocol.MAX_INVENTORY_NAME_BYTES == 512
+    assert protocol.MAX_INVENTORY_S_VALUE_BYTES == 4096
+    assert protocol.MAX_INVENTORY_OPTION_BYTES == 1024
+
+    selection = _inventory_selection()
+    at_limit = _inventory_result(
+        targets=(
+            _inventory_target(
+                "a" * protocol.MAX_INVENTORY_TARGET_ID_BYTES,
+                units=(
+                    _inventory_unit(
+                        name="n" * protocol.MAX_INVENTORY_NAME_BYTES,
+                        s_value="s" * protocol.MAX_INVENTORY_S_VALUE_BYTES,
+                        custom_option="o" * protocol.MAX_INVENTORY_OPTION_BYTES,
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert parse_inventory_result(
+        selection,
+        build_inventory_result(selection, at_limit),
+    ) == at_limit
+
+    multibyte_at_limit = _inventory_unit(
+        name="\N{LATIN SMALL LETTER E WITH ACUTE}"
+        * (protocol.MAX_INVENTORY_NAME_BYTES // 2)
+    )
+    assert len(multibyte_at_limit.name.encode("utf-8")) == (
+        protocol.MAX_INVENTORY_NAME_BYTES
+    )
+
+    invalid_factories = (
+        lambda: _inventory_target(
+            "a" * (protocol.MAX_INVENTORY_TARGET_ID_BYTES + 1)
+        ),
+        lambda: _inventory_unit(
+            name="\N{LATIN SMALL LETTER E WITH ACUTE}"
+            * ((protocol.MAX_INVENTORY_NAME_BYTES // 2) + 1)
+        ),
+        lambda: _inventory_unit(
+            s_value="\N{LATIN SMALL LETTER E WITH ACUTE}"
+            * ((protocol.MAX_INVENTORY_S_VALUE_BYTES // 2) + 1)
+        ),
+        lambda: _inventory_unit(
+            custom_option="\N{LATIN SMALL LETTER E WITH ACUTE}"
+            * ((protocol.MAX_INVENTORY_OPTION_BYTES // 2) + 1)
+        ),
+    )
+    for factory in invalid_factories:
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            factory()
+
+
+def test_inventory_page_requires_deterministic_target_and_unit_order() -> None:
+    """Duplicate or reordered identities cannot create an ambiguous snapshot."""
+    selection = _inventory_selection()
+    first_id = "HA00000000000000000000001"
+    second_id = "HA00000000000000000000002"
+    result = _inventory_result(
+        targets=(
+            _inventory_target(
+                first_id,
+                units=(_inventory_unit(unit=1), _inventory_unit(unit=2)),
+            ),
+            _inventory_target(second_id),
+        ),
+    )
+    payload = build_inventory_result(selection, result)
+
+    reversed_targets = deepcopy(payload)
+    reversed_targets["targets"].reverse()
+    duplicate_targets = deepcopy(payload)
+    duplicate_targets["targets"][1]["target_id"] = first_id
+    reversed_units = deepcopy(payload)
+    reversed_units["targets"][0]["units"].reverse()
+    duplicate_units = deepcopy(payload)
+    duplicate_units["targets"][0]["units"][1]["unit"] = 1
+
+    for mutation in (
+        reversed_targets,
+        duplicate_targets,
+        reversed_units,
+        duplicate_units,
+    ):
+        with pytest.raises(
+            ProtocolFormatError,
+            match="^invalid protocol message$",
+        ):
+            parse_inventory_result(selection, mutation)
+
+    empty_parent = _inventory_result(
+        targets=(_inventory_target(units=()),),
+    )
+    assert parse_inventory_result(
+        selection,
+        build_inventory_result(selection, empty_parent),
+    ) == empty_parent
+
+
+def test_inventory_assembly_distinguishes_empty_from_incomplete() -> None:
+    """Only a correlated terminal confirmation can authorize reconciliation."""
+    selection = _inventory_selection()
+    empty = _inventory_result(targets=())
+    assert assemble_inventory_results(
+        selection,
+        "inventory-1",
+        (empty,),
+    ) == ()
+
+    incomplete = _inventory_result(
+        complete=False,
+        targets=(_inventory_target(),),
+    )
+    with pytest.raises(ProtocolFormatError):
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            (incomplete,),
+        )
+    with pytest.raises(ProtocolFormatError):
+        assemble_inventory_results(
+            selection,
+            "different-request",
+            (empty,),
+        )
+
+
+def test_inventory_assembly_requires_one_contiguous_terminal_page_sequence() -> None:
+    """Gaps, repeats, early terminals, and pages after completion fail closed."""
+    selection = _inventory_selection()
+    first = _inventory_result(
+        page=1,
+        complete=False,
+        targets=(_inventory_target("HA00000000000000000000001"),),
+    )
+    second = _inventory_result(
+        page=2,
+        targets=(_inventory_target("HA00000000000000000000002"),),
+    )
+    assert assemble_inventory_results(
+        selection,
+        "inventory-1",
+        (first, second),
+    ) == first.targets + second.targets
+
+    invalid_sequences = (
+        (second,),
+        (first,),
+        (first, _inventory_result(page=3, targets=second.targets)),
+        (first, _inventory_result(page=1, targets=second.targets)),
+        (_inventory_result(targets=first.targets), second),
+        (
+            first,
+            second,
+            _inventory_result(
+                page=3,
+                targets=(_inventory_target("HA00000000000000000000003"),),
+            ),
+        ),
+    )
+    for pages in invalid_sequences:
+        with pytest.raises(ProtocolFormatError):
+            assemble_inventory_results(selection, "inventory-1", pages)
+
+
+def test_inventory_assembly_rejects_cross_page_identity_ambiguity() -> None:
+    """Global target ordering and correlation are validated after all pages arrive."""
+    selection = _inventory_selection()
+    first_id = "HA00000000000000000000001"
+    second_id = "HA00000000000000000000002"
+    first = _inventory_result(
+        page=1,
+        complete=False,
+        targets=(_inventory_target(first_id),),
+    )
+    duplicate = _inventory_result(
+        page=2,
+        targets=(_inventory_target(first_id),),
+    )
+    out_of_order_first = _inventory_result(
+        page=1,
+        complete=False,
+        targets=(_inventory_target(second_id),),
+    )
+    mismatched_request = _inventory_result(
+        request_id="inventory-2",
+        page=2,
+        targets=(_inventory_target(second_id),),
+    )
+
+    for pages in (
+        (first, duplicate),
+        (out_of_order_first, duplicate),
+        (first, mismatched_request),
+    ):
+        with pytest.raises(ProtocolFormatError):
+            assemble_inventory_results(selection, "inventory-1", pages)
+
+
+def test_inventory_count_and_payload_bounds_are_enforced() -> None:
+    """Paging remains bounded before the complete snapshot is trusted."""
+    assert protocol.MAX_INVENTORY_TARGETS == 512
+    assert protocol.MAX_INVENTORY_UNITS == 1024
+    assert protocol.MAX_INVENTORY_PAGES == 512
+    assert protocol.MAX_INVENTORY_TARGETS_PER_PAGE == 64
+    assert protocol.MAX_INVENTORY_PAYLOAD_BYTES == 60 * 1024
+    assert protocol.INVENTORY_TIMEOUT_SECONDS == 10
+
+    selection = _inventory_selection()
+    targets = tuple(
+        _inventory_target(f"HA{index:023d}")
+        for index in range(protocol.MAX_INVENTORY_TARGETS_PER_PAGE + 1)
+    )
+    with pytest.raises(ProtocolFormatError):
+        build_inventory_result(
+            selection,
+            _inventory_result(targets=targets),
+        )
+
+    oversized_payload = _inventory_result(
+        targets=tuple(
+            _inventory_target(
+                f"HA{index:023d}",
+                units=(_inventory_unit(name="n", s_value="x" * 750),),
+            )
+            for index in range(protocol.MAX_INVENTORY_TARGETS_PER_PAGE)
+        ),
+    )
+    with pytest.raises(ProtocolFormatError):
+        build_inventory_result(selection, oversized_payload)
+
+
+def test_inventory_accepts_exact_aggregate_limits_and_rejects_one_more() -> None:
+    """The complete snapshot caps are inclusive and checked across pages."""
+    selection = _inventory_selection()
+    all_targets = tuple(
+        _inventory_target(
+            f"HA{index:023d}",
+            units=(_inventory_unit(unit=1), _inventory_unit(unit=2)),
+        )
+        for index in range(protocol.MAX_INVENTORY_TARGETS)
+    )
+    pages = tuple(
+        _inventory_result(
+            page=(offset // protocol.MAX_INVENTORY_TARGETS_PER_PAGE) + 1,
+            complete=(
+                offset + protocol.MAX_INVENTORY_TARGETS_PER_PAGE
+                == protocol.MAX_INVENTORY_TARGETS
+            ),
+            targets=all_targets[
+                offset : offset + protocol.MAX_INVENTORY_TARGETS_PER_PAGE
+            ],
+        )
+        for offset in range(
+            0,
+            protocol.MAX_INVENTORY_TARGETS,
+            protocol.MAX_INVENTORY_TARGETS_PER_PAGE,
+        )
+    )
+    wire_pages = tuple(
+        parse_inventory_result(
+            selection,
+            build_inventory_result(selection, page),
+        )
+        for page in pages
+    )
+    assert assemble_inventory_results(
+        selection,
+        "inventory-1",
+        wire_pages,
+    ) == all_targets
+
+    too_many_units = list(all_targets)
+    too_many_units[0] = _inventory_target(
+        too_many_units[0].target_id,
+        units=(
+            _inventory_unit(unit=1),
+            _inventory_unit(unit=2),
+            _inventory_unit(unit=3),
+        ),
+    )
+    pages_with_extra_unit = tuple(
+        _inventory_result(
+            page=(offset // protocol.MAX_INVENTORY_TARGETS_PER_PAGE) + 1,
+            complete=(
+                offset + protocol.MAX_INVENTORY_TARGETS_PER_PAGE
+                == protocol.MAX_INVENTORY_TARGETS
+            ),
+            targets=tuple(
+                too_many_units[
+                    offset : offset + protocol.MAX_INVENTORY_TARGETS_PER_PAGE
+                ]
+            ),
+        )
+        for offset in range(
+            0,
+            protocol.MAX_INVENTORY_TARGETS,
+            protocol.MAX_INVENTORY_TARGETS_PER_PAGE,
+        )
+    )
+    with pytest.raises(ProtocolFormatError):
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            pages_with_extra_unit,
+        )
+
+    last_page = pages[-1]
+    too_many_targets = pages[:-1] + (
+        _inventory_result(
+            page=last_page.page,
+            complete=False,
+            targets=last_page.targets,
+        ),
+        _inventory_result(
+            page=last_page.page + 1,
+            targets=(
+                _inventory_target(f"HA{protocol.MAX_INVENTORY_TARGETS:023d}"),
+            ),
+        ),
+    )
+    with pytest.raises(ProtocolFormatError):
+        assemble_inventory_results(
+            selection,
+            "inventory-1",
+            too_many_targets,
+        )
+
+
+def test_inventory_page_count_is_capped_at_512() -> None:
+    """Even minimally populated page streams have a hard overall ceiling."""
+    selection = _inventory_selection()
+    pages = tuple(
+        _inventory_result(
+            page=index + 1,
+            complete=index + 1 == protocol.MAX_INVENTORY_PAGES,
+            targets=(_inventory_target(f"HA{index:023d}"),),
+        )
+        for index in range(protocol.MAX_INVENTORY_PAGES)
+    )
+    assert len(
+        assemble_inventory_results(selection, "inventory-1", pages)
+    ) == protocol.MAX_INVENTORY_TARGETS
+
+    with pytest.raises(ProtocolFormatError):
+        _inventory_result(
+            page=protocol.MAX_INVENTORY_PAGES + 1,
+            targets=(_inventory_target(),),
+        )
 
 
 def test_apply_codecs_require_the_negotiated_numeric_feature() -> None:

@@ -70,6 +70,16 @@ ha-export.numeric.v1
 ha-export.binary.v1
 ```
 
+Remote Domoticz inventory is a separate read-only feature:
+
+```text
+domoticz-inventory.v1
+```
+
+An implementation advertises this feature only when it implements the complete
+request, paging, validation, and fail-closed behavior below. Inventory support
+does not change either export feature.
+
 Home Assistant may send an export action only when its feature appears in
 `selected_features`. A session can support numeric export, binary export, both,
 or neither. The Domoticz plugin rejects a feature-bearing message that was not
@@ -81,7 +91,9 @@ V2 application messages use exact schemas:
 - `apply` and `apply_result` use schema `1` and require
   `ha-export.numeric.v1`; and
 - `binary_apply` and `binary_apply_result` use schema `1` and require
-  `ha-export.binary.v1`.
+  `ha-export.binary.v1`; and
+- `inventory_request` and `inventory_result` use schema `1` and require
+  `domoticz-inventory.v1`.
 
 The numeric schemas remain unchanged by the addition of binary export. Parsers
 require the exact keys and value types for the selected message and schema.
@@ -95,6 +107,170 @@ Peers advertise support for the new feature and use it only when it is
 selected. Unknown but syntactically valid feature identifiers may be advertised
 and are harmless when they are not in the intersection.
 
+## Authenticated Domoticz Inventory
+
+`domoticz-inventory.v1` lets Home Assistant obtain one read-only snapshot of
+the targets owned by the connected Domoticz plugin hardware instance. It does
+not enumerate other Domoticz hardware. Home Assistant sends the request only
+after `application_ready`, and only when the feature is in `selected_features`.
+
+The request is the exact schema below. `request_id` follows the existing
+non-empty application identifier rules and correlates every result page with
+this request.
+
+```json
+{
+  "schema": 1,
+  "type": "inventory_request",
+  "request_id": "inventory-1"
+}
+```
+
+The plugin takes one immutable snapshot after accepting the request, sorts its
+targets by `target_id` and each target's units by `unit`, and returns consecutive
+one-based pages. Every page has this exact top-level schema:
+
+```json
+{
+  "schema": 1,
+  "type": "inventory_result",
+  "request_id": "inventory-1",
+  "status": "confirmed",
+  "page": 1,
+  "complete": true,
+  "targets": [
+    {
+      "target_id": "HAEXAMPLEDEVICEID",
+      "timed_out": false,
+      "units": [
+        {
+          "unit": 1,
+          "type": 244,
+          "subtype": 73,
+          "switch_type": 8,
+          "name": "Hall motion",
+          "used": true,
+          "n_value": 0,
+          "s_value": "Off",
+          "custom_option": null,
+          "has_other_options": false
+        }
+      ]
+    }
+  ]
+}
+```
+
+The result contains only `schema`, `type`, `request_id`, `status`, `page`,
+`complete`, and `targets`. `status` is exactly `confirmed` or `rejected`; `page`
+is a positive safe integer; `complete` is a JSON boolean; and `targets` is an
+array. The nested schemas are also exact:
+
+- A target contains only `target_id`, `timed_out`, and `units`.
+  `target_id` is the non-empty Domoticz `DeviceID`, with no surrounding
+  whitespace, used as the protocol's opaque target ID, and is at most 128 UTF-8
+  bytes. `timed_out` is a JSON boolean. `units` is an array and may be empty so
+  a partially removed device remains observable.
+- A unit contains only `unit`, `name`, `type`, `subtype`, `switch_type`, `used`,
+  `n_value`, `s_value`, `custom_option`, and `has_other_options`. `unit` is an
+  integer from 1 through 255. `type`, `subtype`, and `switch_type` are
+  non-negative safe integers. `name` is at most 512 UTF-8 bytes and `s_value`
+  is at most 4,096 UTF-8 bytes. `used` and `has_other_options` are JSON
+  booleans; `n_value` is a safe integer; and `custom_option` is either the exact
+  string value of Domoticz's `Custom` option, bounded to 1,024 UTF-8 bytes, or
+  JSON `null` when that key is absent. `has_other_options` is true when the unit
+  has any option key other than `Custom`. Arbitrary option names and values are
+  deliberately not placed on the wire. The wire booleans normalize Domoticz's
+  `0` and `1` flags without changing their meaning.
+- `target_id` values are unique in the complete snapshot. Unit numbers are
+  unique within their target. A target and all of its units are atomic and are
+  never split between pages.
+
+Each `inventory_request` and `inventory_result` is the payload of the existing
+v2 signed application envelope. The envelope authenticates the session,
+direction, sequence, and complete payload. The request direction is
+`home_assistant_to_domoticz`; every result page uses
+`domoticz_to_home_assistant`. There is no second inner signature.
+
+### Bounds and completion
+
+One request has one fixed ten-second deadline from sending the request through
+receiving its terminal page. A page does not extend that deadline. Only one
+inventory request may be in flight on a session. Implementations enforce all of
+these limits before accepting the snapshot:
+
+- at most 512 result pages, numbered consecutively from `1`;
+- at most 64 targets in one page and 512 targets in the complete snapshot;
+- at most 1,024 units across the complete snapshot;
+- at most 60 KiB of canonical JSON in each inventory application payload,
+  leaving room inside the existing 64 KiB signed-envelope limit; and
+- exactly one terminal page with `complete` equal to `true`.
+
+Every page of an accepted snapshot has `status` equal to `confirmed`. Every
+non-terminal confirmed page contains at least one target. A terminal confirmed
+page also contains at least one target unless it is the complete empty
+inventory. The plugin must not truncate a snapshot to meet a bound. If it
+cannot take or represent the complete snapshot, including when one atomic
+target exceeds the payload limit, it sends only this exact terminal rejection:
+
+```json
+{
+  "schema": 1,
+  "type": "inventory_result",
+  "request_id": "inventory-1",
+  "status": "rejected",
+  "page": 1,
+  "complete": true,
+  "targets": []
+}
+```
+
+A rejected result is not an empty inventory and carries no partial targets or
+diagnostic text.
+
+Home Assistant stages pages without exposing them to reconciliation. It accepts
+the inventory only after the terminal page and after validating the signature,
+session, direction, sequence, request ID, status, page order, exact schemas,
+uniqueness, bounds, and complete snapshot. Before that terminal page, a
+rejection; a missing, duplicate, late, or out-of-order page; a mismatched
+request ID; an unknown or extra field; an invalid value; a timeout; a
+disconnect; or a limit violation discards the whole staged snapshot. It must
+not turn partial data into deletions, adoption, drift repair, or an empty
+inventory. The durable target catalogs remain unchanged. The terminal page is
+authoritative; any later inventory page is a new session protocol violation and
+closes the connection rather than retroactively rolling back confirmed work.
+
+The authoritative empty inventory has one unambiguous form:
+
+```json
+{
+  "schema": 1,
+  "type": "inventory_result",
+  "request_id": "inventory-1",
+  "status": "confirmed",
+  "page": 1,
+  "complete": true,
+  "targets": []
+}
+```
+
+This is distinct from legacy v1's frozen `{"type":"inventory","targets":[]}`
+lifecycle marker. The legacy marker does not describe real Domoticz state. A
+missing feature, missing response, timeout, or disconnect also never means that
+the remote inventory is empty.
+
+The feature ID, its application schema, the WebSocket protocol version, and the
+Home Assistant catalog schema are independent version domains. Schema `1` under
+`domoticz-inventory.v1` is immutable. An incompatible inventory shape requires
+a separately negotiated versioned feature and exact parser rather than changing
+this schema in place.
+
+This contract authenticates and integrity-protects inventory but does not
+encrypt it. Use the WSS, trusted-network, and VPN guidance under Transport
+Confidentiality. This section defines the Phase 5 wire contract only. It does
+not authorize deletion, claiming unrelated devices, or any repair action;
+reconciliation and safe repair require their own implementation and tests.
+
 ## Mixed Installations
 
 Home Assistant and the Domoticz plugin may be updated in either order. The
@@ -106,6 +282,7 @@ intermediate states are safe:
 | Old, v1 only | New, v1 and v2 aware | Authenticated v1 heartbeat session; export is disabled |
 | Current, v1 and v2 aware | Current, v2 aware | Authenticated v2 session; numeric and binary export run independently when their features are selected |
 | Current binary-aware peer | Earlier numeric-only v2 peer | Authenticated v2 session; numeric export continues and binary export stays disabled |
+| Inventory-aware peer | Earlier v2 peer without inventory | Authenticated v2 session; common export features continue and remote inventory and drift repair stay disabled |
 | Both support v2 but not the same optional feature | Mixed feature support | The v2 session may run its common baseline, but the unsupported feature is not used |
 
 No mixed state permits legacy writes. A mismatch can temporarily stop export,
@@ -208,8 +385,9 @@ was unused before this release.
 After the first export release, a catalog schema change requires an explicit,
 tested migration or another documented preservation strategy. Older software
 must never replace a future catalog with an empty current-version catalog.
-Future remote inventory formats receive their own negotiated feature and
-schema rather than reusing the local catalog version.
+The `domoticz-inventory.v1` wire format has its own negotiated feature and exact
+application schema rather than reusing the local catalog version. Future remote
+inventory formats receive their own independently negotiated version.
 
 ## Transport Confidentiality
 
