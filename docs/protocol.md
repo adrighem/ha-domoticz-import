@@ -415,6 +415,61 @@ and one or both export kinds are available. A continuous feature selected
 without inventory is unusable and fails closed rather than authorizing a live
 write from stale remote state.
 
+## Signed Reverse Commands
+
+`domoticz-control.v1` allows the connected Domoticz companion plugin to securely transmit control commands (e.g., in response to user actions in the Domoticz UI) to control the state of Home Assistant entities that are mapped to exported targets.
+
+### Threat Model
+
+1. **Command Authorization & Integrity:** To prevent unauthorized or forged commands, every command message must be cryptographically signed using the session key, packed within a `VerifiedEnvelope` envelope, and verified by Home Assistant using HMAC-SHA256 before execution.
+2. **Replay Protection:** To prevent attackers from intercepting and replaying valid commands, each control request includes a strict incremental sequence number and nonce/session validation handled by the verified envelope layers.
+3. **Target Ownership Scope:** Home Assistant strictly enforces ownership. Domoticz is only authorized to control entities that are explicitly bound to a target device (present in the local Target Catalog). Any command targeting an unbound, private, or unrelated Home Assistant entity is immediately rejected.
+4. **Idempotency:** Command correlation via `request_id` ensures that re-transmissions are handled safely and duplicate executions are avoided.
+5. **Safe Fail-Closed Errors:** Rejections and failures return detailed, log-safe audit messages without ever leaking any session secrets, pairing keys, or entity attributes.
+
+### Message Schemas
+
+#### Request (`control_request`)
+
+The Domoticz plugin sends a control request of this exact schema when a user interacts with a synchronized device:
+
+```json
+{
+  "schema": 1,
+  "type": "control_request",
+  "request_id": "control-1",
+  "target_id": "HA123456789...",
+  "unit": 1,
+  "command": "Set Level",
+  "level": 22.5,
+  "color": ""
+}
+```
+
+- `request_id` must be a non-empty, log-safe, unique transaction correlation ID.
+- `target_id` must be a valid, non-empty, whitespace-stable deterministic DeviceID.
+- `unit` must be a valid integer between `1` and `255`.
+- `command` must be a non-empty string.
+- `level` must be a finite floating-point number or integer.
+- `color` must be a string.
+
+#### Result (`control_result`)
+
+Home Assistant executes the command and returns a sanitized result:
+
+```json
+{
+  "schema": 1,
+  "type": "control_result",
+  "request_id": "control-1",
+  "status": "confirmed",
+  "error": null
+}
+```
+
+- `status` must be `"confirmed"` (on successful execution) or `"rejected"` (on validation, authorization, or execution failure).
+- `error` must be a non-empty string containing a log-safe error message when status is `"rejected"`, or `null` when status is `"confirmed"`.
+
 ## Mixed Installations
 
 Home Assistant and the Domoticz plugin may be updated in either order. The

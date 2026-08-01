@@ -2700,8 +2700,9 @@ def test_v2_mutual_handshake_and_signed_ping_pong(loaded_plugin):
     assert domoticz.statuses == [
         "Authenticated Home Assistant connection is ready; "
         "protocol=ha-domoticz-sync.v2; "
-        "features=domoticz-inventory.v1,ha-export.binary.v1,"
-        "ha-export.continuous.v1,ha-export.numeric.v1."
+        "features=domoticz-control.v1,domoticz-inventory.v1,"
+        "ha-export.binary.v1,ha-export.continuous.v1,"
+        "ha-export.numeric.v1."
     ]
 
     server_ping_id = protocol.generate_nonce()

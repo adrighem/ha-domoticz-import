@@ -19,6 +19,7 @@ from custom_components.domoticz_sync.core.capabilities import (
 from custom_components.domoticz_sync.core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_DOMOTICZ_CONTROL_V1,
     FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_CONTINUOUS_V1,
@@ -35,6 +36,9 @@ from custom_components.domoticz_sync.core.protocol import (
     ApplyResult,
     ApplyResultStatus,
     ClientHello,
+    ControlRequest,
+    ControlResult,
+    ControlResultStatus,
     HandshakeContext,
     InventoryResult,
     InventoryResultStatus,
@@ -56,6 +60,8 @@ from custom_components.domoticz_sync.core.protocol import (
     build_binary_apply,
     build_binary_apply_result,
     build_challenge,
+    build_control,
+    build_control_result,
     build_hello,
     build_inventory_request,
     build_inventory_result,
@@ -89,6 +95,8 @@ from custom_components.domoticz_sync.core.protocol import (
     parse_apply_result,
     parse_binary_apply,
     parse_binary_apply_result,
+    parse_control,
+    parse_control_result,
     parse_hello,
     parse_inventory_request,
     parse_inventory_result,
@@ -2875,3 +2883,128 @@ def test_binary_apply_result_builder_rejects_ambiguous_results(
             target_id,
             source,
         )
+
+
+def _control_selection() -> ProtocolSelection:
+    """Return a protocol selection that supports domoticz-control.v1."""
+    return ProtocolSelection(
+        version=PROTOCOL_VERSION_V2,
+        websocket_subprotocol=WEBSOCKET_SUBPROTOCOL_V2,
+        features=(FEATURE_DOMOTICZ_CONTROL_V1,),
+    )
+
+
+def test_control_request_builder_and_parser() -> None:
+    """A valid control request is built and parsed accurately across peers."""
+    selection = _control_selection()
+
+    built = build_control(
+        selection=selection,
+        request_id="control-1",
+        target_id="HA123456789",
+        unit=1,
+        command="Set Level",
+        level=22.5,
+        color="RGB",
+    )
+
+    # Verify built message
+    assert built["schema"] == 1
+    assert built["type"] == "control_request"
+    assert built["request_id"] == "control-1"
+    assert built["target_id"] == "HA123456789"
+    assert built["unit"] == 1
+    assert built["command"] == "Set Level"
+    assert built["level"] == 22.5
+    assert built["color"] == "RGB"
+
+    # Verify parsed message
+    parsed = parse_control(selection, built)
+    assert parsed.request_id == "control-1"
+    assert parsed.target_id == "HA123456789"
+    assert parsed.unit == 1
+    assert parsed.command == "Set Level"
+    assert parsed.level == 22.5
+    assert parsed.color == "RGB"
+
+
+def test_control_request_requires_negotiated_feature() -> None:
+    """Calling control functions requires the negotiated domoticz-control.v1 feature."""
+    incompatible = _selection(features=())  # supports nothing, not control
+
+    with pytest.raises(ProtocolCompatibilityError, match="incompatible protocol"):
+        build_control(
+            selection=incompatible,
+            request_id="control-1",
+            target_id="HA123456789",
+            unit=1,
+            command="On",
+            level=0.0,
+            color="",
+        )
+
+    with pytest.raises(ProtocolCompatibilityError, match="incompatible protocol"):
+        parse_control(incompatible, {"schema": 1, "type": "control_request"})
+
+
+def test_control_request_validation() -> None:
+    """ControlRequest strictly validates its fields."""
+    with pytest.raises(ProtocolFormatError, match="invalid protocol message"):
+        ControlRequest("  ", "HA1", 1, "On", 0, "")
+
+    with pytest.raises(ProtocolFormatError, match="invalid protocol message"):
+        ControlRequest("req-1", "  ", 1, "On", 0, "")
+
+    with pytest.raises(ProtocolFormatError, match="invalid protocol message"):
+        ControlRequest("req-1", "HA1", 0, "On", 0, "")
+
+    with pytest.raises(ValueError, match="command must not be empty"):
+        ControlRequest("req-1", "HA1", 1, "  ", 0, "")
+
+    with pytest.raises(TypeError, match="level must be a finite number"):
+        ControlRequest("req-1", "HA1", 1, "On", float("nan"), "")
+
+
+def test_control_result_builder_and_parser() -> None:
+    """A valid control result is built and parsed accurately across peers."""
+    selection = _control_selection()
+
+    # Test Confirmed
+    built_ok = build_control_result(
+        selection=selection,
+        request_id="control-1",
+        status=ControlResultStatus.CONFIRMED,
+    )
+    assert built_ok["status"] == "confirmed"
+    assert built_ok["error"] is None
+
+    parsed_ok = parse_control_result(selection, built_ok)
+    assert parsed_ok.request_id == "control-1"
+    assert parsed_ok.status is ControlResultStatus.CONFIRMED
+    assert parsed_ok.error is None
+
+    # Test Rejected with error
+    built_fail = build_control_result(
+        selection=selection,
+        request_id="control-1",
+        status=ControlResultStatus.REJECTED,
+        error="Entity lock is currently engaged",
+    )
+    assert built_fail["status"] == "rejected"
+    assert built_fail["error"] == "Entity lock is currently engaged"
+
+    parsed_fail = parse_control_result(selection, built_fail)
+    assert parsed_fail.request_id == "control-1"
+    assert parsed_fail.status is ControlResultStatus.REJECTED
+    assert parsed_fail.error == "Entity lock is currently engaged"
+
+
+def test_control_result_validation() -> None:
+    """ControlResult rejects contradictory or malformed fields."""
+    # Confirmed with error is invalid
+    with pytest.raises(ValueError, match="confirmed control results"):
+        ControlResult("req-1", ControlResultStatus.CONFIRMED, error="Some error")
+
+    # Rejected with empty string error is invalid
+    with pytest.raises(ValueError, match="rejected control results"):
+        ControlResult("req-1", ControlResultStatus.REJECTED, error="   ")

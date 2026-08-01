@@ -35,8 +35,10 @@ FEATURE_DOMOTICZ_INVENTORY_V1 = "domoticz-inventory.v1"
 FEATURE_HA_EXPORT_BINARY_V1 = "ha-export.binary.v1"
 FEATURE_HA_EXPORT_CONTINUOUS_V1 = "ha-export.continuous.v1"
 FEATURE_HA_EXPORT_NUMERIC_V1 = "ha-export.numeric.v1"
+FEATURE_DOMOTICZ_CONTROL_V1 = "domoticz-control.v1"
 SUPPORTED_WEBSOCKET_SUBPROTOCOLS = (WEBSOCKET_SUBPROTOCOL_V2,)
 SUPPORTED_V2_FEATURES = (
+    FEATURE_DOMOTICZ_CONTROL_V1,
     FEATURE_DOMOTICZ_INVENTORY_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_CONTINUOUS_V1,
@@ -152,6 +154,17 @@ _COMPOUND_CAPABILITY_KEYS = {
     "availability",
     "capabilities",
 }
+_CONTROL_REQUEST_KEYS = {
+    "schema",
+    "type",
+    "request_id",
+    "target_id",
+    "unit",
+    "command",
+    "level",
+    "color",
+}
+_CONTROL_RESULT_KEYS = {"schema", "type", "request_id", "status", "error"}
 _SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _ENVELOPE_KEYS = {
     "version",
@@ -426,6 +439,61 @@ class ApplyResult:
                 raise ProtocolFormatError("invalid protocol message")
         elif self.target_id is not None or self.source is not None:
             raise ProtocolFormatError("invalid protocol message")
+
+
+class ControlResultStatus(str, Enum):
+    """The only safe outcomes returned for one remote control action."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class ControlRequest:
+    """One correlation identifier and complete target-neutral control action."""
+
+    request_id: str
+    target_id: str
+    unit: int
+    command: str
+    level: float
+    color: str
+
+    def __post_init__(self) -> None:
+        """Validate direct construction as strictly as parsed input."""
+        _validate_request_id(self.request_id)
+        _validate_target_id(self.target_id)
+        _validate_bounded_integer(self.unit, 1, 255)
+        if not isinstance(self.command, str):
+            raise TypeError("command must be a string")
+        if not self.command.strip():
+            raise ValueError("command must not be empty")
+        if type(self.level) not in (int, float) or not math.isfinite(self.level):
+            raise TypeError("level must be a finite number")
+        if not isinstance(self.color, str):
+            raise TypeError("color must be a string")
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    """A sanitized control confirmation or rejection."""
+
+    request_id: str
+    status: ControlResultStatus
+    error: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Require result fields to agree with their status."""
+        _validate_request_id(self.request_id)
+        if not isinstance(self.status, ControlResultStatus):
+            raise TypeError("status must be a ControlResultStatus")
+        if self.status is ControlResultStatus.CONFIRMED:
+            if self.error is not None:
+                raise ValueError("confirmed control results must not have an error")
+        else:
+            if self.error is not None:
+                if not isinstance(self.error, str) or not self.error.strip():
+                    raise ValueError("rejected control results must have a non-empty string error or None")
 
 
 @dataclass(frozen=True)
@@ -1470,6 +1538,104 @@ def parse_binary_apply_result(
 ) -> ApplyResult:
     """Parse one exact binary result without accepting remote error details."""
     return _parse_export_apply_result(selection, document, _BINARY_EXPORT_CODEC)
+
+
+def build_control(
+    selection: ProtocolSelection,
+    request_id: str,
+    target_id: str,
+    unit: int,
+    command: str,
+    level: float,
+    color: str,
+) -> Dict[str, object]:
+    """Build one signed control request."""
+    _require_export_selection(selection, FEATURE_DOMOTICZ_CONTROL_V1)
+    request = ControlRequest(
+        request_id=request_id,
+        target_id=target_id,
+        unit=unit,
+        command=command,
+        level=level,
+        color=color,
+    )
+    return _normalize_payload(
+        {
+            "schema": 1,
+            "type": "control_request",
+            "request_id": request.request_id,
+            "target_id": request.target_id,
+            "unit": request.unit,
+            "command": request.command,
+            "level": request.level,
+            "color": request.color,
+        }
+    )
+
+
+def parse_control(
+    selection: ProtocolSelection,
+    document: object,
+) -> ControlRequest:
+    """Parse one control request."""
+    _require_export_selection(selection, FEATURE_DOMOTICZ_CONTROL_V1)
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _CONTROL_REQUEST_KEYS,
+            "control_request",
+        )
+        return ControlRequest(
+            request_id=_require_string(data["request_id"]),
+            target_id=_require_string(data["target_id"]),
+            unit=data["unit"],
+            command=_require_string(data["command"]),
+            level=data["level"],
+            color=_require_string(data["color"]),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
+
+
+def build_control_result(
+    selection: ProtocolSelection,
+    request_id: str,
+    status: ControlResultStatus,
+    error: Optional[str] = None,
+) -> Dict[str, object]:
+    """Build one signed control result."""
+    _require_export_selection(selection, FEATURE_DOMOTICZ_CONTROL_V1)
+    result = ControlResult(request_id=request_id, status=status, error=error)
+    return _normalize_payload(
+        {
+            "schema": 1,
+            "type": "control_result",
+            "request_id": result.request_id,
+            "status": result.status.value,
+            "error": result.error,
+        }
+    )
+
+
+def parse_control_result(
+    selection: ProtocolSelection,
+    document: object,
+) -> ControlResult:
+    """Parse one control result."""
+    _require_export_selection(selection, FEATURE_DOMOTICZ_CONTROL_V1)
+    try:
+        data = _require_application_message(
+            _normalize_payload(document),
+            _CONTROL_RESULT_KEYS,
+            "control_result",
+        )
+        return ControlResult(
+            request_id=_require_string(data["request_id"]),
+            status=ControlResultStatus(data["status"]),
+            error=data["error"] if data["error"] is None else _require_string(data["error"]),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ProtocolFormatError("invalid protocol message") from None
 
 
 def _build_export_apply(
