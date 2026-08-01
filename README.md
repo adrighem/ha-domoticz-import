@@ -13,7 +13,7 @@ contains a Home Assistant custom integration and a Domoticz Python plugin.
 | What you want | Direction | How it works |
 | --- | --- | --- |
 | See Domoticz devices in Home Assistant | Domoticz -> Home Assistant | The Home Assistant integration polls the Domoticz JSON API and creates read-only sensors and binary sensors. |
-| See selected Home Assistant entities in Domoticz | Home Assistant -> Domoticz | The optional Domoticz plugin connects to Home Assistant and creates or updates read-only Domoticz devices when it connects. |
+| See and control Home Assistant entities in Domoticz | Home Assistant -> Domoticz | The optional Domoticz plugin connects to Home Assistant, mirrors entities in Domoticz, and securely forwards Domoticz UI commands back to Home Assistant. |
 
 The Home Assistant integration is required for both directions. It imports from
 Domoticz and provides the pairing details for the optional Domoticz plugin.
@@ -127,10 +127,7 @@ the set of Home Assistant entities is created when the integration loads.
 
 ## Use Home Assistant Entities in Domoticz
 
-The export side is optional. It creates passive mirrors in Domoticz for
-selected Home Assistant numeric sensors and binary sensors. These targets are
-read-only; the plugin refuses Domoticz commands and never sends them to Home
-Assistant.
+The export side is optional. It mirrors selected Home Assistant entities (like numeric sensors, binary sensors, and switches) directly in Domoticz. The state synchronizes continuously in real-time. If bidirectional control is enabled, any changes or switch toggles made in the Domoticz interface are securely verified via HMAC-SHA256 and executed back in Home Assistant!
 
 ### Install the Domoticz plugin
 
@@ -280,8 +277,7 @@ text, and non-finite values are not exported.
 | Any other, missing, or future device class | Generic On/Off |
 
 Door Lock Inverted preserves Home Assistant's binary meaning: `on` means
-unlocked. All binary targets are passive mirrors. Changing one in Domoticz
-does not send a command to Home Assistant.
+unlocked. If bidirectional control is enabled, toggling these devices in Domoticz sends secure control commands back to Home Assistant. Otherwise, they act as passive mirrors.
 
 See the
 [complete Home Assistant to Domoticz mapping](docs/entity-mapping.md) for
@@ -539,8 +535,6 @@ Domoticz password, tokens, cookies, or other credentials in an issue.
   profile changes, and ambiguous unit layouts are left untouched.
 - Recreating a deleted unavailable target cannot recover its old Domoticz
   value. The replacement starts with a neutral value and remains timed out.
-- Exported devices are read-only. Reverse commands and interactive entities
-  are not implemented.
 - Only directly labelled numeric sensors and passive binary sensors are
   exported. Compound and multi-capability devices are not implemented.
 - Native numeric type selection is conservative. Other finite numeric values

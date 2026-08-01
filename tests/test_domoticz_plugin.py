@@ -166,6 +166,8 @@ class FakeDomoticz(ModuleType):
 @pytest.fixture
 def loaded_plugin(monkeypatch):
     """Load plugin.py with an isolated DomoticzEx implementation."""
+    import secrets
+    monkeypatch.setattr(secrets, "randbelow", lambda n: 0)
     fake_domoticz = FakeDomoticz()
     monkeypatch.setitem(sys.modules, "DomoticzEx", fake_domoticz)
     monkeypatch.delitem(sys.modules, "core", raising=False)

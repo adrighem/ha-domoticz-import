@@ -17,7 +17,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from .capabilities import Availability, Capability, CapabilityKind, CompoundCapability, SourceIdentity
+from .capabilities import (
+    Availability,
+    Capability,
+    CapabilityKind,
+    CompoundCapability,
+    SourceIdentity,
+)
 from .reconciliation import (
     ReconciliationAction,
     ReconciliationActionKind,

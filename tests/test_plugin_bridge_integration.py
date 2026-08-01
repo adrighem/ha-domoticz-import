@@ -2965,10 +2965,19 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
     hass.states.async_set(source_entry.entity_id, STATE_OFF)
 
     # Preload target record in Catalog so it's authorized
-    from custom_components.domoticz_sync.core.capabilities import Capability, CapabilityKind, SourceIdentity
+    from custom_components.domoticz_sync.catalog_storage import (
+        HomeAssistantBinaryCatalogStorage,
+    )
+    from custom_components.domoticz_sync.core.capabilities import (
+        Capability,
+        CapabilityKind,
+        SourceIdentity,
+    )
+    from custom_components.domoticz_sync.core.catalog import (
+        TargetCatalog,
+        catalog_to_document,
+    )
     from custom_components.domoticz_sync.core.reconciliation import TargetRecord
-    from custom_components.domoticz_sync.core.catalog import TargetCatalog, catalog_to_document
-    from custom_components.domoticz_sync.catalog_storage import HomeAssistantBinaryCatalogStorage
 
     capability = Capability(
         source=SourceIdentity("home_assistant", "instance-1", source_entry.id, "state"),
@@ -2976,17 +2985,26 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
         name="Test Switch",
         value=False,
     )
-    target_id = "HA_TEST_SWITCH"
+    from custom_components.domoticz_sync.core.protocol import derive_domoticz_target_id
+    target_id = derive_domoticz_target_id(capability.source)
     catalog = TargetCatalog((TargetRecord(target_id, capability),))
 
-    storage = HomeAssistantBinaryCatalogStorage(hass, entry.entry_id, "domoticz_test")
+    storage = HomeAssistantBinaryCatalogStorage(hass, entry_id=entry.entry_id, destination_id="00000000-0000-0000-0000-000000000000")
     await storage.async_save(catalog_to_document(catalog))
 
     # Mock service calls
     service_calls = []
-    async def mock_service_call(domain, service, service_data, blocking=True, context=None):
-        service_calls.append((domain, service, service_data))
-    monkeypatch.setattr(hass.services, "async_call", mock_service_call)
+    import homeassistant.core
+    original_async_call = homeassistant.core.ServiceRegistry.async_call
+    async def mock_service_call(self, domain, service, service_data, blocking=True, context=None, **kwargs):
+        if domain == "homeassistant" and service in {"turn_on", "turn_off"}:
+            entity_id = service_data.get("entity_id") if isinstance(service_data, dict) else ""
+            if isinstance(entity_id, str) and entity_id.startswith("switch.") and "brightness_pct" in service_data:
+                raise ValueError("unsupported command: switch entities do not support brightness")
+            service_calls.append((domain, service, service_data))
+            return None
+        return await original_async_call(self, domain, service, service_data, blocking, context, **kwargs)
+    monkeypatch.setattr(homeassistant.core.ServiceRegistry, "async_call", mock_service_call)
 
     # Initialize manager and view
     manager = DomoticzBridgeManager(HomeAssistantExportApplication(hass))
@@ -3012,6 +3030,7 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
         link_id=link_id,
         pairing_key=pairing_key,
     )
+    fake_domoticz.configuration["domoticz_sync_destination_id"] = "00000000-0000-0000-0000-000000000000"
 
     # Open connection and do handshake
     plugin, connection, websocket, send_position, _inventory = await _open_plugin_connection(

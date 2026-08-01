@@ -10,9 +10,12 @@ from typing import Final, Protocol
 from aiohttp import WSCloseCode, WSMsgType, web
 from homeassistant.components.http import HomeAssistantView
 
+from .catalog_storage import (
+    HomeAssistantBinaryCatalogStorage,
+    HomeAssistantCatalogStorage,
+)
 from .const import DOMAIN
-from .catalog_storage import HomeAssistantCatalogStorage, HomeAssistantBinaryCatalogStorage
-from .core import catalog_from_document, Capability
+from .core import Capability, CapabilityKind, catalog_from_document
 from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
@@ -784,7 +787,7 @@ class DomoticzBridgeManager:
         hass = self._application._hass
 
         # 1. Check numeric catalog
-        num_storage = HomeAssistantCatalogStorage(hass, entry_id, destination_id)
+        num_storage = HomeAssistantCatalogStorage(hass, entry_id=entry_id, destination_id=destination_id)
         try:
             num_doc = await num_storage.async_load()
             if num_doc is not None:
@@ -796,7 +799,7 @@ class DomoticzBridgeManager:
             pass
 
         # 2. Check binary catalog
-        bin_storage = HomeAssistantBinaryCatalogStorage(hass, entry_id, destination_id)
+        bin_storage = HomeAssistantBinaryCatalogStorage(hass, entry_id=entry_id, destination_id=destination_id)
         try:
             bin_doc = await bin_storage.async_load()
             if bin_doc is not None:
@@ -864,6 +867,13 @@ class DomoticzBridgeManager:
             service = "turn_off"
             data = {"entity_id": entity_id}
         elif cmd in {"set level", "setlevel", "set_level"}:
+            if capability.kind is CapabilityKind.BINARY:
+                return build_control_result(
+                    session.selection,
+                    request.request_id,
+                    ControlResultStatus.REJECTED,
+                    error=f"unsupported command {request.command!r}",
+                )
             domain = "homeassistant"
             service = "turn_on"
             data = {

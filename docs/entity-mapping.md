@@ -52,11 +52,9 @@ Custom Sensors because rotation does not necessarily describe a fan.
 The non-numeric sensor device classes `date`, `enum`, `timestamp`, and `uptime`
 are not exported by the numeric feature.
 
-## Passive Binary Sensors
+## Passive Binary Sensors and Switches
 
-Binary sensors use Domoticz General Switch devices with Type 244 and Subtype
-73. They are read-only mirrors: a Domoticz command is refused and never sent
-back to Home Assistant.
+Binary sensors and switches use Domoticz General Switch devices with Type 244 and Subtype 73. When bidirectional control is enabled, toggling these devices in Domoticz will send secure, signed control commands back to Home Assistant. Otherwise, they act as read-only passive mirrors.
 
 | Home Assistant device class | Domoticz SwitchType |
 | --- | --- |

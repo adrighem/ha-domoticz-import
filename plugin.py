@@ -2051,7 +2051,9 @@ class DomoticzSyncPlugin:
             return
         self._reset_session()
         self.phase = PHASE_DISCONNECTED
-        self._reconnect_remaining = self._reconnect_delay
+        # Apply random jitter up to 50% of the current base delay
+        jitter = secrets.randbelow(max(2, self._reconnect_delay // 2 + 1))
+        self._reconnect_remaining = self._reconnect_delay + jitter
         self._reconnect_delay = min(self._reconnect_delay * 2, _MAX_RECONNECT_TICKS)
 
     def _reset_session(self):
