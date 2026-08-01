@@ -166,7 +166,11 @@
 
 ## Phase 9: Interactive Entities
 
-- [ ] Task 9.1: Select the first safe interactive entity domains
-- [ ] Task 9.2: Map Domoticz commands to Home Assistant services
-- [ ] Task 9.3: Add permission, feedback, and failure handling
-- [ ] Task 9.4: Test, document, and manually verify interactive entities
+- [x] Task 9.1: Select the first safe interactive entity domains
+  (`605b675`)
+- [x] Task 9.2: Map Domoticz commands to Home Assistant services
+  (`605b675`)
+- [x] Task 9.3: Add permission, feedback, and failure handling
+  (`605b675`)
+- [x] Task 9.4: Test, document, and manually verify interactive entities
+  (`605b675`)
