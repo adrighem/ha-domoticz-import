@@ -518,6 +518,92 @@ def test_ambiguous_or_counter_numeric_values_fall_back_to_custom(
     assert profile.manages_options is True
 
 
+def test_temp_hum_profile_selection_and_encoding(loaded_plugin):
+    """Temp + Hum compound capability produces the 82/1 Temp+Hum profile and encodes correctly."""
+    module, _domoticz = loaded_plugin
+    protocol = module.wire_protocol
+
+    cap_temp = protocol.Capability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temperature"),
+        protocol.CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        semantic="temperature",
+        unit="°C",
+    )
+    cap_hum = protocol.Capability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "humidity"),
+        protocol.CapabilityKind.NUMERIC,
+        "Humidity",
+        55.0,
+        semantic="humidity",
+        unit="%",
+    )
+    compound = protocol.CompoundCapability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temp_hum"),
+        "Climate",
+        (cap_temp, cap_hum),
+    )
+
+    profile = module._target_profile(compound)
+    assert profile.type_id == 82
+    assert profile.subtype == 1
+    assert profile.switch_type == 0
+    assert profile.manages_options is False
+
+    encoded = profile.encoder(compound, None)
+    assert encoded == (0, "21.5;55;1")
+
+
+def test_temp_hum_profile_encoding_partial_availability(loaded_plugin):
+    """Temp + Hum compound capability encodes with fallback to existing values when partially available."""
+    module, domoticz = loaded_plugin
+    protocol = module.wire_protocol
+
+    cap_temp = protocol.Capability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temperature"),
+        protocol.CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        semantic="temperature",
+        unit="°C",
+    )
+    cap_hum = protocol.Capability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "humidity"),
+        protocol.CapabilityKind.NUMERIC,
+        "Humidity",
+        None,
+        availability=protocol.Availability.UNAVAILABLE,
+        semantic="humidity",
+        unit="%",
+    )
+    compound = protocol.CompoundCapability(
+        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temp_hum"),
+        "Climate",
+        (cap_temp, cap_hum),
+    )
+
+    profile = module._target_profile(compound)
+    with pytest.raises(module.DomoticzApplyError):
+        profile.encoder(compound, None)
+
+    device_id = module._device_id_for_source(compound.source)
+    domoticz.devices[device_id] = FakeDevice(domoticz, device_id)
+    module.Domoticz.Unit(
+        Name="Climate",
+        DeviceID=device_id,
+        Unit=1,
+        Type=82,
+        Subtype=1,
+        Switchtype=0,
+        Used=1,
+        sValue="22.0;60;1",
+    ).Create()
+
+    encoded = profile.encoder(compound, None)
+    assert encoded == (0, "21.5;60;1")
+
+
 @pytest.mark.parametrize(
     ("semantic", "expected_switch_type"),
     [

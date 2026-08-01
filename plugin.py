@@ -302,6 +302,59 @@ def _encode_humidity(value, unit):
     return rounded, status
 
 
+def _encode_temp_hum(compound, _unit):
+    temp_cap = None
+    hum_cap = None
+    for cap in compound.capabilities:
+        if cap.semantic == "temperature":
+            temp_cap = cap
+        elif cap.semantic == "humidity":
+            hum_cap = cap
+
+    if temp_cap is None or hum_cap is None:
+        raise DomoticzApplyError
+
+    device_id = _device_id_for_source(compound.source)
+    existing_temp = None
+    existing_hum = None
+    existing_status = "0"
+
+    devices = globals().get("Devices")
+    if devices is not None and device_id in devices:
+        device = devices[device_id]
+        units = getattr(device, "Units", None)
+        if units is not None and _TARGET_UNIT in units:
+            unit_obj = units[_TARGET_UNIT]
+            s_val = getattr(unit_obj, "sValue", None)
+            if isinstance(s_val, str) and s_val:
+                parts = s_val.split(";")
+                if len(parts) >= 3:
+                    existing_temp = parts[0]
+                    existing_hum = parts[1]
+                    existing_status = parts[2]
+
+    # Handle Temperature
+    if temp_cap.value is not None and temp_cap.is_available:
+        _, temp_svalue = _encode_temperature(temp_cap.value, temp_cap.unit)
+    elif existing_temp is not None:
+        temp_svalue = existing_temp
+    else:
+        raise DomoticzApplyError
+
+    # Handle Humidity
+    if hum_cap.value is not None and hum_cap.is_available:
+        rounded_hum, status = _encode_humidity(hum_cap.value, hum_cap.unit)
+        hum_svalue = str(rounded_hum)
+        hum_status = str(status)
+    elif existing_hum is not None:
+        hum_svalue = existing_hum
+        hum_status = existing_status
+    else:
+        raise DomoticzApplyError
+
+    return 0, f"{temp_svalue};{hum_svalue};{hum_status}"
+
+
 def _encode_percentage(value, unit):
     if unit not in {"%", "percent"}:
         raise DomoticzApplyError
@@ -448,6 +501,7 @@ _CUSTOM_PROFILE = _TargetProfile(
 )
 _TEMPERATURE_PROFILE = _TargetProfile(80, 5, 0, _encode_temperature, False)
 _HUMIDITY_PROFILE = _TargetProfile(81, 1, 0, _encode_humidity, False)
+_TEMP_HUM_PROFILE = _TargetProfile(82, 1, 0, _encode_temp_hum, False)
 _PERCENTAGE_PROFILE = _TargetProfile(243, 6, 0, _encode_percentage, False)
 _ATMOSPHERIC_PRESSURE_PROFILE = _TargetProfile(
     243, 26, 0, _encode_atmospheric_pressure, False
@@ -500,6 +554,12 @@ _PROFILE_BY_SEMANTIC = {
 
 def _target_profile(capability):
     """Choose a conservative native Domoticz profile or Custom fallback."""
+    if capability.kind.value == "compound":
+        semantics = {cap.semantic for cap in capability.capabilities}
+        if semantics == {"temperature", "humidity"}:
+            return _TEMP_HUM_PROFILE
+        return _CUSTOM_PROFILE
+
     if getattr(capability, "state_class", None) not in {None, "measurement"}:
         return _CUSTOM_PROFILE
 
@@ -1261,9 +1321,9 @@ class DomoticzSyncPlugin:
             raise DomoticzApplyError
 
     def _apply_action(self, action):
-        """Idempotently converge and re-read one numeric Domoticz target."""
+        """Idempotently converge and re-read one numeric or compound Domoticz target."""
         capability = action.capability
-        if capability.kind.value != "numeric":
+        if capability.kind.value not in {"numeric", "compound"}:
             raise DomoticzApplyError
         return self._apply_profile_action(action, _target_profile(capability))
 
@@ -1292,9 +1352,13 @@ class DomoticzSyncPlugin:
             raise DomoticzApplyError
 
         available = capability.availability.value == "available"
-        desired_values = (
-            profile.encoder(capability.value, capability.unit) if available else None
-        )
+        if available:
+            if capability.kind.value == "compound":
+                desired_values = profile.encoder(capability, None)
+            else:
+                desired_values = profile.encoder(capability.value, capability.unit)
+        else:
+            desired_values = None
         options = (
             _custom_sensor_options(capability.unit) if profile.manages_options else None
         )
@@ -1362,9 +1426,13 @@ class DomoticzSyncPlugin:
             raise DomoticzApplyError
 
         available = capability.availability.value == "available"
-        desired_values = (
-            profile.encoder(capability.value, capability.unit) if available else None
-        )
+        if available:
+            if capability.kind.value == "compound":
+                desired_values = profile.encoder(capability, None)
+            else:
+                desired_values = profile.encoder(capability.value, capability.unit)
+        else:
+            desired_values = None
         desired_options = (
             _custom_sensor_options(capability.unit) if profile.manages_options else None
         )

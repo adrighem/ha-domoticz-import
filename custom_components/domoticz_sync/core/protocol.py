@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
+from .capabilities import Availability, Capability, CapabilityKind, CompoundCapability, SourceIdentity
 from .reconciliation import (
     ReconciliationAction,
     ReconciliationActionKind,
@@ -144,6 +144,13 @@ _CAPABILITY_KEYS = {
     "semantic",
     "unit",
     "state_class",
+}
+_COMPOUND_CAPABILITY_KEYS = {
+    "source",
+    "kind",
+    "name",
+    "availability",
+    "capabilities",
 }
 _SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _ENVELOPE_KEYS = {
@@ -2058,8 +2065,19 @@ def _source_from_dict(document: object) -> SourceIdentity:
     )
 
 
-def _capability_to_dict(capability: Capability) -> Dict[str, object]:
+def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Dict[str, object]:
     """Serialize every field that defines one capability snapshot."""
+    if isinstance(capability, CompoundCapability):
+        return {
+            "source": _source_to_dict(capability.source),
+            "kind": capability.kind.value,
+            "name": capability.name,
+            "availability": capability.availability.value,
+            "capabilities": [
+                _capability_to_dict(cap)
+                for cap in capability.capabilities
+            ],
+        }
     return {
         "source": _source_to_dict(capability.source),
         "kind": capability.kind.value,
@@ -2072,8 +2090,28 @@ def _capability_to_dict(capability: Capability) -> Dict[str, object]:
     }
 
 
-def _capability_from_dict(document: object) -> Capability:
+def _capability_from_dict(document: object) -> Union[Capability, CompoundCapability]:
     """Parse one exact capability using the complete neutral semantics."""
+    if not isinstance(document, dict):
+        raise TypeError("capability must be a dict")
+    kind_str = document.get("kind")
+    if kind_str == CapabilityKind.COMPOUND.value:
+        _require_exact_object(document, _COMPOUND_CAPABILITY_KEYS)
+        source = _source_from_dict(document["source"])
+        nested_list = document["capabilities"]
+        if not isinstance(nested_list, list):
+            raise TypeError("capabilities must be a list")
+        capabilities = tuple(_capability_from_dict(item) for item in nested_list)
+        for cap in capabilities:
+            if not isinstance(cap, Capability):
+                raise TypeError("compound capability nested list must contain Capability values")
+        return CompoundCapability(
+            source=source,
+            name=document["name"],
+            capabilities=capabilities,
+            availability=Availability(document["availability"]),
+        )
+
     _require_exact_object(document, _CAPABILITY_KEYS)
     return Capability(
         source=_source_from_dict(document["source"]),

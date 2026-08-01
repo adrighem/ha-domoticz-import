@@ -112,6 +112,16 @@ and removing a Home Assistant export label does not delete the existing target.
 If the inventory is incomplete, rejected, malformed, or ambiguous, no
 inventory-aware repair or catalog change is performed.
 
+## Compound Devices (Multi-capability Entities)
+
+Multi-capability entities are grouped into a single native compound Domoticz device when the sub-capabilities are exported from the same physical device.
+
+| Grouped Home Assistant device classes | Domoticz Type / SubType | sValue Format |
+| --- | --- | --- |
+| `temperature` and `humidity` | `82 / 1` (Temp + Hum) | `TEMP;HUM;HUM_STATUS` |
+
+If one of the component capabilities becomes temporarily unavailable (e.g., the humidity sensor is offline but the temperature sensor is online), the compound device supports **partial availability**. The bridge safely retains and falls back to the last known value of the unavailable component parsed from the existing Domoticz device's `sValue`, while atomically updating the available components in place.
+
 ## Continuous Synchronization
 
 Continuous synchronization is enabled only when the authenticated session
