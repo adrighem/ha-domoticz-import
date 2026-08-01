@@ -13,6 +13,7 @@ from custom_components.domoticz_sync.core.capabilities import (
     Availability,
     Capability,
     CapabilityKind,
+    CompoundCapability,
     SourceIdentity,
 )
 from custom_components.domoticz_sync.core.catalog import (
@@ -458,3 +459,52 @@ def test_deserialization_wraps_duplicate_target_id() -> None:
                 "targets": [record, duplicate],
             }
         )
+
+
+def test_compound_capability_serialization_round_trip() -> None:
+    """A catalog with a CompoundCapability serializes and deserializes accurately."""
+    source = SourceIdentity("home_assistant", "instance-1", "climate-1", "temp_hum")
+    cap1 = Capability(
+        SourceIdentity("home_assistant", "instance-1", "climate-1", "temperature"),
+        CapabilityKind.NUMERIC,
+        "Temperature",
+        21.5,
+        Availability.AVAILABLE,
+        semantic="temperature",
+        unit="celsius",
+    )
+    cap2 = Capability(
+        SourceIdentity("home_assistant", "instance-1", "climate-1", "humidity"),
+        CapabilityKind.NUMERIC,
+        "Humidity",
+        50.0,
+        Availability.AVAILABLE,
+        semantic="humidity",
+        unit="percent",
+    )
+    compound = CompoundCapability(source, "Climate", (cap1, cap2))
+    record = TargetRecord("target-compound", compound)
+
+    catalog = TargetCatalog((record,))
+    serialized = catalog_to_document(catalog)
+
+    # Verify serialized structure
+    assert serialized["version"] == CATALOG_SCHEMA_VERSION
+    assert len(serialized["targets"]) == 1
+    serialized_cap = serialized["targets"][0]["capability"]
+    assert serialized_cap["kind"] == "compound"
+    assert serialized_cap["name"] == "Climate"
+    assert len(serialized_cap["capabilities"]) == 2
+    assert serialized_cap["capabilities"][0]["name"] == "Temperature"
+    assert serialized_cap["capabilities"][1]["name"] == "Humidity"
+
+    # Verify deserialization
+    deserialized = catalog_from_document(serialized)
+    assert len(deserialized) == 1
+    deserialized_record = deserialized.records[0]
+    assert deserialized_record.target_id == "target-compound"
+    assert isinstance(deserialized_record.capability, CompoundCapability)
+    assert deserialized_record.capability.name == "Climate"
+    assert len(deserialized_record.capability.capabilities) == 2
+    assert deserialized_record.capability.capabilities[0].value == 21.5
+    assert deserialized_record.capability.capabilities[1].value == 50.0

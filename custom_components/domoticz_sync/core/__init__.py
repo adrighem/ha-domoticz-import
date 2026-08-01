@@ -5,6 +5,7 @@ from .capabilities import (
     Capability,
     CapabilityKind,
     CapabilityValue,
+    CompoundCapability,
     SourceIdentity,
 )
 from .catalog import (
@@ -191,6 +192,7 @@ __all__ = [
     "Capability",
     "CapabilityKind",
     "CapabilityValue",
+    "CompoundCapability",
     "CatalogFormatError",
     "CatalogStorage",
     "CatalogStorageError",

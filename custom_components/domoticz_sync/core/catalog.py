@@ -9,7 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
-from .capabilities import Availability, Capability, CapabilityKind, SourceIdentity
+from .capabilities import (
+    Availability,
+    Capability,
+    CapabilityKind,
+    CompoundCapability,
+    SourceIdentity,
+)
 from .reconciliation import TargetRecord
 
 CATALOG_SCHEMA_VERSION = 3
@@ -28,12 +34,55 @@ _CAPABILITY_KEYS = {
     "unit",
     "state_class",
 }
+_COMPOUND_CAPABILITY_KEYS = {
+    "source",
+    "kind",
+    "name",
+    "availability",
+    "capabilities",
+}
 _SOURCE_KEYS = {"system", "instance_id", "object_id", "capability_id"}
 _CATALOG_PARSE_ERRORS = (KeyError, TypeError, ValueError, OverflowError)
 
 
 class CatalogFormatError(ValueError):
     """A persisted target catalog is missing, unsupported, or malformed."""
+
+
+def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Dict[str, object]:
+    """Serialize a capability or compound capability."""
+    source = capability.source
+    if isinstance(capability, CompoundCapability):
+        return {
+            "source": {
+                "system": source.system,
+                "instance_id": source.instance_id,
+                "object_id": source.object_id,
+                "capability_id": source.capability_id,
+            },
+            "kind": capability.kind.value,
+            "name": capability.name,
+            "availability": capability.availability.value,
+            "capabilities": [
+                _capability_to_dict(cap)
+                for cap in capability.capabilities
+            ],
+        }
+    return {
+        "source": {
+            "system": source.system,
+            "instance_id": source.instance_id,
+            "object_id": source.object_id,
+            "capability_id": source.capability_id,
+        },
+        "kind": capability.kind.value,
+        "name": capability.name,
+        "value": capability.value,
+        "availability": capability.availability.value,
+        "semantic": capability.semantic,
+        "unit": capability.unit,
+        "state_class": capability.state_class,
+    }
 
 
 @dataclass(frozen=True, init=False)
@@ -120,26 +169,10 @@ class TargetCatalog:
         """Serialize the complete catalog to the JSON-compatible v3 schema."""
         targets: List[Dict[str, object]] = []
         for record in self._records:
-            capability = record.capability
-            source = capability.source
             targets.append(
                 {
                     "target_id": record.target_id,
-                    "capability": {
-                        "source": {
-                            "system": source.system,
-                            "instance_id": source.instance_id,
-                            "object_id": source.object_id,
-                            "capability_id": source.capability_id,
-                        },
-                        "kind": capability.kind.value,
-                        "name": capability.name,
-                        "value": capability.value,
-                        "availability": capability.availability.value,
-                        "semantic": capability.semantic,
-                        "unit": capability.unit,
-                        "state_class": capability.state_class,
-                    },
+                    "capability": _capability_to_dict(record.capability),
                     "stale": record.stale,
                     "pending": record.pending,
                 }
@@ -191,6 +224,57 @@ def _require_object(value: object, expected_keys: Set[str]) -> None:
         raise ValueError("invalid object fields")
 
 
+def _capability_from_dict(data: object) -> Union[Capability, CompoundCapability]:
+    """Deserialize a capability or compound capability."""
+    if not isinstance(data, dict):
+        raise TypeError("capability must be a dict")
+    kind_str = data.get("kind")
+    if kind_str == CapabilityKind.COMPOUND.value:
+        _require_object(data, _COMPOUND_CAPABILITY_KEYS)
+        source_data = data["source"]
+        _require_object(source_data, _SOURCE_KEYS)
+        source = SourceIdentity(
+            system=source_data["system"],
+            instance_id=source_data["instance_id"],
+            object_id=source_data["object_id"],
+            capability_id=source_data["capability_id"],
+        )
+        nested_list = data["capabilities"]
+        if not isinstance(nested_list, list):
+            raise TypeError("capabilities must be a list")
+        capabilities = tuple(_capability_from_dict(item) for item in nested_list)
+        for cap in capabilities:
+            if not isinstance(cap, Capability):
+                raise TypeError("compound capability nested list must contain Capability values")
+        return CompoundCapability(
+            source=source,
+            name=data["name"],
+            capabilities=capabilities,
+            availability=Availability(data["availability"]),
+        )
+
+    # Standard Capability
+    _require_object(data, _CAPABILITY_KEYS)
+    source_data = data["source"]
+    _require_object(source_data, _SOURCE_KEYS)
+    source = SourceIdentity(
+        system=source_data["system"],
+        instance_id=source_data["instance_id"],
+        object_id=source_data["object_id"],
+        capability_id=source_data["capability_id"],
+    )
+    return Capability(
+        source=source,
+        kind=CapabilityKind(data["kind"]),
+        name=data["name"],
+        value=data["value"],
+        availability=Availability(data["availability"]),
+        semantic=data["semantic"],
+        unit=data["unit"],
+        state_class=data["state_class"],
+    )
+
+
 def _record_from_dict(data: object, version: int) -> TargetRecord:
     """Build one fully validated record, migrating v2 pending state safely."""
     target_keys = (
@@ -199,27 +283,7 @@ def _record_from_dict(data: object, version: int) -> TargetRecord:
         else _TARGET_KEYS_V3
     )
     _require_object(data, target_keys)
-    capability_data = data["capability"]
-    _require_object(capability_data, _CAPABILITY_KEYS)
-    source_data = capability_data["source"]
-    _require_object(source_data, _SOURCE_KEYS)
-
-    source = SourceIdentity(
-        system=source_data["system"],
-        instance_id=source_data["instance_id"],
-        object_id=source_data["object_id"],
-        capability_id=source_data["capability_id"],
-    )
-    capability = Capability(
-        source=source,
-        kind=CapabilityKind(capability_data["kind"]),
-        name=capability_data["name"],
-        value=capability_data["value"],
-        availability=Availability(capability_data["availability"]),
-        semantic=capability_data["semantic"],
-        unit=capability_data["unit"],
-        state_class=capability_data["state_class"],
-    )
+    capability = _capability_from_dict(data["capability"])
     return TargetRecord(
         target_id=data["target_id"],
         capability=capability,

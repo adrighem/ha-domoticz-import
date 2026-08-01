@@ -10,6 +10,7 @@ from custom_components.domoticz_sync.core import (
     Availability,
     Capability,
     CapabilityKind,
+    CompoundCapability,
     SourceIdentity,
 )
 
@@ -231,3 +232,58 @@ def test_capability_records_are_immutable(source: SourceIdentity) -> None:
 
     with pytest.raises(FrozenInstanceError):
         capability.value = False
+
+
+def test_compound_capability_creation_and_attributes(source: SourceIdentity) -> None:
+    """A CompoundCapability is successfully created and preserves nested capabilities."""
+    cap1 = Capability(source, CapabilityKind.NUMERIC, "Temperature", 21.5)
+    cap2 = Capability(
+        SourceIdentity("home_assistant", "instance-1", "entity-registry-id", "humidity"),
+        CapabilityKind.NUMERIC,
+        "Humidity",
+        50.0,
+    )
+
+    compound = CompoundCapability(
+        source=SourceIdentity("home_assistant", "instance-1", "entity-registry-id", "temp_hum"),
+        name="Climate Sensor",
+        capabilities=(cap1, cap2),
+    )
+
+    assert compound.kind is CapabilityKind.COMPOUND
+    assert compound.name == "Climate Sensor"
+    assert compound.capabilities == (cap1, cap2)
+    assert compound.value is None
+    assert compound.semantic is None
+    assert compound.unit is None
+    assert compound.state_class is None
+    assert compound.is_available
+    # Nested capabilities must retain their exact source identities (not lost)
+    assert compound.capabilities[0].source.capability_id == "state"
+    assert compound.capabilities[1].source.capability_id == "humidity"
+
+
+def test_compound_capability_validation() -> None:
+    """CompoundCapability validates its fields strictly on initialization."""
+    with pytest.raises(TypeError, match="source"):
+        CompoundCapability(source="not-a-source", name="Invalid", capabilities=())
+
+    with pytest.raises(TypeError, match="name"):
+        CompoundCapability(source=SourceIdentity("a", "b", "c", "d"), name=123, capabilities=())
+
+    with pytest.raises(ValueError, match="name"):
+        CompoundCapability(source=SourceIdentity("a", "b", "c", "d"), name="   ", capabilities=())
+
+    with pytest.raises(TypeError, match="capabilities"):
+        CompoundCapability(
+            source=SourceIdentity("a", "b", "c", "d"),
+            name="Valid",
+            capabilities="not-a-tuple",
+        )
+
+    with pytest.raises(TypeError, match="capabilities"):
+        CompoundCapability(
+            source=SourceIdentity("a", "b", "c", "d"),
+            name="Valid",
+            capabilities=(123,),
+        )

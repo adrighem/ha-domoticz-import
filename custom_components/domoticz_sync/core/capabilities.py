@@ -18,6 +18,7 @@ class CapabilityKind(str, Enum):
     NUMERIC = "numeric"
     BINARY = "binary"
     TEXT = "text"
+    COMPOUND = "compound"
 
 
 class Availability(str, Enum):
@@ -128,6 +129,62 @@ class Capability:
             raise TypeError(f"{name} must be a string or None")
         if not value.strip():
             raise ValueError(f"{name} must not be empty")
+
+    @property
+    def is_available(self) -> bool:
+        """Return whether the current value can be consumed."""
+        return self.availability is Availability.AVAILABLE
+
+
+@dataclass(frozen=True)
+class CompoundCapability:
+    """A collection of nested capabilities that are updated together."""
+
+    source: SourceIdentity
+    name: str
+    capabilities: Tuple[Capability, ...]
+    availability: Availability = Availability.AVAILABLE
+
+    def __post_init__(self) -> None:
+        """Validate compound capability structure."""
+        if not isinstance(self.source, SourceIdentity):
+            raise TypeError("source must be a SourceIdentity")
+        if not isinstance(self.name, str):
+            raise TypeError("name must be a string")
+        if not self.name.strip():
+            raise ValueError("name must not be empty")
+        if type(self.capabilities) is not tuple:
+            raise TypeError("capabilities must be a tuple")
+        for cap in self.capabilities:
+            if not isinstance(cap, Capability):
+                raise TypeError("capabilities must contain Capability values")
+        if not isinstance(self.availability, Availability):
+            raise TypeError("availability must be an Availability")
+
+    @property
+    def kind(self) -> CapabilityKind:
+        """Return the capability kind."""
+        return CapabilityKind.COMPOUND
+
+    @property
+    def value(self) -> None:
+        """Compound capabilities do not have a single scalar value."""
+        return None
+
+    @property
+    def semantic(self) -> Optional[str]:
+        """Compound capabilities do not have a single semantic tag."""
+        return None
+
+    @property
+    def unit(self) -> Optional[str]:
+        """Compound capabilities do not have a single unit of measurement."""
+        return None
+
+    @property
+    def state_class(self) -> Optional[str]:
+        """Compound capabilities do not have a single state class."""
+        return None
 
     @property
     def is_available(self) -> bool:

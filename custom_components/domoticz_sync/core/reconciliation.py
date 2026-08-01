@@ -9,9 +9,9 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
-from .capabilities import Availability, Capability, SourceIdentity
+from .capabilities import Availability, Capability, CompoundCapability, SourceIdentity
 
 _MAX_CANONICAL_IDENTITY_BYTES = 64 * 1024
 
@@ -118,15 +118,15 @@ class TargetRecord:
     """The last capability snapshot associated with a target object."""
 
     target_id: str
-    capability: Capability
+    capability: Union[Capability, CompoundCapability]
     stale: bool = False
     pending: bool = False
 
     def __post_init__(self) -> None:
         """Validate persisted target state before planning."""
         _validate_target_id(self.target_id)
-        if not isinstance(self.capability, Capability):
-            raise TypeError("capability must be a Capability")
+        if not isinstance(self.capability, (Capability, CompoundCapability)):
+            raise TypeError("capability must be a Capability or CompoundCapability")
         _validate_stale(self.stale, self.capability)
         if not isinstance(self.pending, bool):
             raise TypeError("pending must be a bool")
@@ -139,7 +139,7 @@ class ReconciliationAction:
     """One target-neutral synchronization operation."""
 
     kind: ReconciliationActionKind
-    capability: Capability
+    capability: Union[Capability, CompoundCapability]
     target_id: Optional[str] = None
     stale: bool = False
 
@@ -147,8 +147,8 @@ class ReconciliationAction:
         """Keep invalid operations out of target adapters."""
         if not isinstance(self.kind, ReconciliationActionKind):
             raise TypeError("kind must be a ReconciliationActionKind")
-        if not isinstance(self.capability, Capability):
-            raise TypeError("capability must be a Capability")
+        if not isinstance(self.capability, (Capability, CompoundCapability)):
+            raise TypeError("capability must be a Capability or CompoundCapability")
         _validate_stale(self.stale, self.capability)
 
         if self.kind is ReconciliationActionKind.CREATE:
@@ -173,7 +173,7 @@ class ReconciliationAction:
             )
 
 
-def _validate_stale(stale: object, capability: Capability) -> None:
+def _validate_stale(stale: object, capability: Union[Capability, CompoundCapability]) -> None:
     """Validate whether a capability is absent from its source snapshot."""
     if not isinstance(stale, bool):
         raise TypeError("stale must be a bool")
@@ -182,14 +182,14 @@ def _validate_stale(stale: object, capability: Capability) -> None:
 
 
 def _index_capabilities(
-    capabilities: Iterable[Capability],
+    capabilities: Iterable[Union[Capability, CompoundCapability]],
     scope: SourceScope,
-) -> Dict[SourceIdentity, Capability]:
+) -> Dict[SourceIdentity, Union[Capability, CompoundCapability]]:
     """Index a snapshot and reject ambiguous source identities."""
-    indexed: Dict[SourceIdentity, Capability] = {}
+    indexed: Dict[SourceIdentity, Union[Capability, CompoundCapability]] = {}
     for capability in capabilities:
-        if not isinstance(capability, Capability):
-            raise TypeError("current capabilities must be Capability values")
+        if not isinstance(capability, (Capability, CompoundCapability)):
+            raise TypeError("current capabilities must be Capability or CompoundCapability values")
         if not scope.contains(capability.source):
             raise ValueError(
                 f"current capability is outside source scope: {capability.source.key!r}"
@@ -260,7 +260,7 @@ def _index_observations(
 
 
 def validate_deterministic_target_ownership(
-    current: Iterable[Capability],
+    current: Iterable[Union[Capability, CompoundCapability]],
     targets: Iterable[TargetRecord],
 ) -> None:
     """Validate ownership across current capabilities and one or more catalogs."""
@@ -272,8 +272,8 @@ def validate_deterministic_target_ownership(
 
     source_identities: Set[SourceIdentity] = set()
     for capability in current:
-        if not isinstance(capability, Capability):
-            raise TypeError("current capabilities must be Capability values")
+        if not isinstance(capability, (Capability, CompoundCapability)):
+            raise TypeError("current capabilities must be Capability or CompoundCapability values")
         if capability.source in source_identities:
             raise TargetBindingError("duplicate current source identity")
         catalog_kind = catalog_kinds.get(capability.source)
@@ -291,8 +291,13 @@ def validate_deterministic_target_ownership(
         sources_by_target_id[target_id] = source
 
 
-def _unavailable(capability: Capability) -> Capability:
+def _unavailable(capability: Union[Capability, CompoundCapability]) -> Union[Capability, CompoundCapability]:
     """Return an unavailable snapshot while preserving capability metadata."""
+    if isinstance(capability, CompoundCapability):
+        return replace(
+            capability,
+            availability=Availability.UNAVAILABLE,
+        )
     return replace(
         capability,
         value=None,
@@ -302,7 +307,7 @@ def _unavailable(capability: Capability) -> Capability:
 
 def plan_reconciliation(
     scope: SourceScope,
-    current: Iterable[Capability],
+    current: Iterable[Union[Capability, CompoundCapability]],
     known_targets: Iterable[TargetRecord],
     observations: Optional[Iterable[TargetObservation]] = None,
 ) -> Tuple[ReconciliationAction, ...]:
