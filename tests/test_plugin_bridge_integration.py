@@ -2934,3 +2934,127 @@ async def test_real_bridge_preserves_mixed_v2_fallback(
             bridge_view,
             2,
         )
+
+
+@pytest.mark.asyncio
+async def test_real_bridge_handles_signed_control_commands_end_to_end(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user command in Domoticz successfully maps and executes a service call in HA."""
+    export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="integration-entry",
+        data={CONF_EXPORT_LABEL_ID: export_label.label_id},
+    )
+    entry.add_to_hass(hass)
+
+    registry = er.async_get(hass)
+    source_entry = registry.async_get_or_create(
+        "switch",
+        "integration_test",
+        "test-switch-id",
+        suggested_object_id="test_switch",
+    )
+    registry.async_update_entity(
+        source_entry.entity_id,
+        labels={export_label.label_id},
+    )
+    hass.states.async_set(source_entry.entity_id, STATE_OFF)
+
+    # Preload target record in Catalog so it's authorized
+    from custom_components.domoticz_sync.core.capabilities import Capability, CapabilityKind, SourceIdentity
+    from custom_components.domoticz_sync.core.reconciliation import TargetRecord
+    from custom_components.domoticz_sync.core.catalog import TargetCatalog, catalog_to_document
+    from custom_components.domoticz_sync.catalog_storage import HomeAssistantBinaryCatalogStorage
+
+    capability = Capability(
+        source=SourceIdentity("home_assistant", "instance-1", source_entry.id, "state"),
+        kind=CapabilityKind.BINARY,
+        name="Test Switch",
+        value=False,
+    )
+    target_id = "HA_TEST_SWITCH"
+    catalog = TargetCatalog((TargetRecord(target_id, capability),))
+
+    storage = HomeAssistantBinaryCatalogStorage(hass, entry.entry_id, "domoticz_test")
+    await storage.async_save(catalog_to_document(catalog))
+
+    # Mock service calls
+    service_calls = []
+    async def mock_service_call(domain, service, service_data, blocking=True, context=None):
+        service_calls.append((domain, service, service_data))
+    monkeypatch.setattr(hass.services, "async_call", mock_service_call)
+
+    # Initialize manager and view
+    manager = DomoticzBridgeManager(HomeAssistantExportApplication(hass))
+    link_id = generate_link_id()
+    pairing_key = generate_pairing_key()
+    await manager.async_register_link(
+        entry_id=entry.entry_id,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    assert await async_setup_component(hass, "http", {})
+    assert hass.http is not None
+    bridge_view = _ObservedBridgeView(manager)
+    hass.http.register_view(bridge_view)
+    client = await hass_client_no_auth()
+    endpoint = client.make_url("/")
+
+    plugin_module, fake_domoticz = _load_plugin(
+        monkeypatch,
+        address=endpoint.host,
+        port=endpoint.port,
+        link_id=link_id,
+        pairing_key=pairing_key,
+    )
+
+    # Open connection and do handshake
+    plugin, connection, websocket, send_position, _inventory = await _open_plugin_connection(
+        plugin_module,
+        fake_domoticz,
+        client,
+        monkeypatch,
+    )
+
+    assert plugin.phase == plugin_module.PHASE_READY
+
+    # Invoke onCommand to turn on the switch
+    plugin.onCommand(target_id, 1, "On", 0, "")
+
+    # Forward the sent packet over the WebSocket
+    control_request, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(control_request)
+
+    # Receive the control_result response
+    raw_response = await _receive_text(websocket)
+    plugin.onMessage(connection, {"Payload": raw_response})
+
+    # Verify service was executed in Home Assistant
+    assert len(service_calls) == 1
+    assert service_calls[0] == ("homeassistant", "turn_on", {"entity_id": source_entry.entity_id})
+    assert any("confirmed" in status for status in fake_domoticz.statuses)
+
+    # Try a rejected command (e.g. invalid command "Set Level" for a binary switch)
+    plugin.onCommand(target_id, 1, "Set Level", 50, "")
+    control_request, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(control_request)
+
+    raw_response = await _receive_text(websocket)
+    plugin.onMessage(connection, {"Payload": raw_response})
+
+    # Verify no new service call was executed
+    assert len(service_calls) == 1
+    assert any("rejected command: unsupported command" in err for err in fake_domoticz.errors)
+
+    await _close_plugin_connection(
+        plugin,
+        websocket,
+        manager,
+        bridge_view,
+        1,
+    )

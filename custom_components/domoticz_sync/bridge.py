@@ -11,9 +11,12 @@ from aiohttp import WSCloseCode, WSMsgType, web
 from homeassistant.components.http import HomeAssistantView
 
 from .const import DOMAIN
+from .catalog_storage import HomeAssistantCatalogStorage, HomeAssistantBinaryCatalogStorage
+from .core import catalog_from_document, Capability
 from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
+    FEATURE_DOMOTICZ_CONTROL_V1,
     FEATURE_HA_EXPORT_BINARY_V1,
     FEATURE_HA_EXPORT_CONTINUOUS_V1,
     FEATURE_HA_EXPORT_NUMERIC_V1,
@@ -21,12 +24,14 @@ from .core.protocol import (
     PROTOCOL_VERSION,
     SUPPORTED_V2_FEATURES,
     SUPPORTED_WEBSOCKET_SUBPROTOCOLS,
+    ControlResultStatus,
     ProtocolAuthenticationError,
     ProtocolCompatibilityError,
     ProtocolError,
     ProtocolSelection,
     build_application_ready,
     build_challenge,
+    build_control_result,
     build_ready,
     build_v2_challenge,
     build_v2_ready,
@@ -40,6 +45,7 @@ from .core.protocol import (
     make_handshake_context,
     make_v2_handshake_context,
     parse_application_ready,
+    parse_control,
     parse_hello,
     parse_v2_hello,
     select_websocket_subprotocol,
@@ -646,6 +652,17 @@ class DomoticzBridgeManager:
                 )
                 continue
 
+            if message_type == "control_request":
+                if session.selection is None or not session.selection.supports(FEATURE_DOMOTICZ_CONTROL_V1):
+                    raise ProtocolError("invalid protocol message")
+                try:
+                    request = parse_control(session.selection, payload)
+                    result = await self._async_handle_control_request(session, request)
+                except Exception:
+                    raise ProtocolError("invalid protocol message")
+                await self._async_send_payload(session, result)
+                continue
+
             if message_type == "pong":
                 pong_id = _validate_heartbeat_payload(payload)
                 if pending_ping_id is None or pong_id != pending_ping_id:
@@ -754,6 +771,134 @@ class DomoticzBridgeManager:
         ):
             raise error
         raise ProtocolError("application session is unavailable") from None
+
+    async def _async_find_mapped_capability(
+        self,
+        entry_id: str,
+        destination_id: str,
+        target_id: str,
+    ) -> Optional[Capability]:
+        """Find the mapped capability for a given target_id across numeric and binary catalogs."""
+        if self._application is None:
+            return None
+        hass = self._application._hass
+
+        # 1. Check numeric catalog
+        num_storage = HomeAssistantCatalogStorage(hass, entry_id, destination_id)
+        try:
+            num_doc = await num_storage.async_load()
+            if num_doc is not None:
+                num_catalog = catalog_from_document(num_doc)
+                for record in num_catalog:
+                    if record.target_id == target_id:
+                        return record.capability
+        except Exception:
+            pass
+
+        # 2. Check binary catalog
+        bin_storage = HomeAssistantBinaryCatalogStorage(hass, entry_id, destination_id)
+        try:
+            bin_doc = await bin_storage.async_load()
+            if bin_doc is not None:
+                bin_catalog = catalog_from_document(bin_doc)
+                for record in bin_catalog:
+                    if record.target_id == target_id:
+                        return record.capability
+        except Exception:
+            pass
+
+        return None
+
+    async def _async_handle_control_request(
+        self,
+        session: BridgeSession,
+        request: object,
+    ) -> dict[str, object]:
+        """Validate, map, and execute one incoming Domoticz control request."""
+        # Since request is passed as parsed object (ControlRequest)
+        if self._application is None:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error="bridge application is unavailable",
+            )
+        hass = self._application._hass
+
+        # 1. Find the mapped capability in the target catalogs
+        capability = await self._async_find_mapped_capability(
+            session.entry_id,
+            session.destination_id,
+            request.target_id,
+        )
+        if capability is None:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error=f"target_id {request.target_id!r} is not owned by this session",
+            )
+
+        # 2. Get the Home Assistant entity_id using the entity registry
+        from homeassistant.helpers import entity_registry as er
+        registry = er.async_get(hass)
+        entry = registry.async_get(capability.source.object_id)
+        if entry is None:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error=f"source entity registry entry {capability.source.object_id!r} not found",
+            )
+
+        entity_id = entry.entity_id
+
+        # 3. Map command to Home Assistant service
+        cmd = request.command.lower()
+        if cmd == "on":
+            domain = "homeassistant"
+            service = "turn_on"
+            data = {"entity_id": entity_id}
+        elif cmd == "off":
+            domain = "homeassistant"
+            service = "turn_off"
+            data = {"entity_id": entity_id}
+        elif cmd in {"set level", "setlevel", "set_level"}:
+            domain = "homeassistant"
+            service = "turn_on"
+            data = {
+                "entity_id": entity_id,
+                "brightness_pct": int(request.level),
+            }
+        else:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error=f"unsupported command {request.command!r}",
+            )
+
+        # 4. Call the service safely
+        try:
+            await hass.services.async_call(
+                domain,
+                service,
+                data,
+                blocking=True,
+            )
+        except Exception as err:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error=f"service call failed: {err}",
+            )
+
+        return build_control_result(
+            session.selection,
+            request.request_id,
+            ControlResultStatus.CONFIRMED,
+        )
 
 
 class DomoticzBridgeView(HomeAssistantView):
