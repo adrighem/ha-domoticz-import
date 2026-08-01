@@ -4,7 +4,7 @@
     key="HADomoticzSync"
     name="Home Assistant Domoticz Sync"
     author="Vincent van Adrighem"
-    version="0.5.0"
+    version="0.6.0"
     wikilink="https://github.com/adrighem/ha-domoticz-sync">
     <description>
         <h2>Home Assistant Domoticz Sync</h2>
