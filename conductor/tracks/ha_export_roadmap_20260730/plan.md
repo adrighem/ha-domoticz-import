@@ -144,7 +144,8 @@
 
 ## Phase 7: Multi-capability Read-only Entities
 
-- [ ] Task 7.1: Model compound measurements without losing source identity
+- [x] Task 7.1: Model compound measurements without losing source identity
+  (`b91aacb`)
 - [ ] Task 7.2: Add conservative Domoticz compound-device profiles
 - [ ] Task 7.3: Test partial availability and atomic updates
 - [ ] Task 7.4: Document and manually verify compound devices
