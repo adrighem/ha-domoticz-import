@@ -155,10 +155,14 @@
 
 ## Phase 8: Signed Reverse Commands
 
-- [ ] Task 8.1: Threat-model command authorization, replay, and ownership
-- [ ] Task 8.2: Specify signed command and acknowledgement messages
-- [ ] Task 8.3: Implement strict validation, idempotency, and audit-safe errors
-- [ ] Task 8.4: Test and manually verify the protocol without enabling controls
+- [x] Task 8.1: Threat-model command authorization, replay, and ownership
+  (`8088e04`)
+- [x] Task 8.2: Specify signed command and acknowledgement messages
+  (`8088e04`)
+- [x] Task 8.3: Implement strict validation, idempotency, and audit-safe errors
+  (`8088e04`)
+- [x] Task 8.4: Test and manually verify the protocol without enabling controls
+  (`8088e04`)
 
 ## Phase 9: Interactive Entities
 
