@@ -146,9 +146,12 @@
 
 - [x] Task 7.1: Model compound measurements without losing source identity
   (`b91aacb`)
-- [ ] Task 7.2: Add conservative Domoticz compound-device profiles
-- [ ] Task 7.3: Test partial availability and atomic updates
-- [ ] Task 7.4: Document and manually verify compound devices
+- [x] Task 7.2: Add conservative Domoticz compound-device profiles
+  (`262a22b`)
+- [x] Task 7.3: Test partial availability and atomic updates
+  (`262a22b`)
+- [x] Task 7.4: Document and manually verify compound devices
+  (`262a22b`)
 
 ## Phase 8: Signed Reverse Commands
 
