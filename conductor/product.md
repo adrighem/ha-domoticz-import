@@ -39,4 +39,4 @@ directly labeled numeric and passive binary sensors. Native numeric mappings
 use Custom Sensor as a safe fallback. Authenticated Domoticz inventory now lets
 the bridge repair safe mutable drift and recreate missing catalog-owned targets
 on reconnect without deleting, retyping, or claiming unrelated devices.
-Continuous synchronization and controls remain later roadmap phases.
+Continuous synchronization (continuous export of state, attribute, and metadata changes) and bidirectional interactive controls (signed reverse commands verified via HMAC-SHA256) are fully complete and functional.
