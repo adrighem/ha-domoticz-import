@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.6.1](https://github.com/adrighem/ha-domoticz-sync/compare/v0.6.0...v0.6.1) (2026-08-01)
+
+
+### Bug Fixes
+
+* complete export and control paths ([5086eb3](https://github.com/adrighem/ha-domoticz-sync/commit/5086eb3b940d4636fb3f75fe3d036d36a3d10dc8)), closes [#24](https://github.com/adrighem/ha-domoticz-sync/issues/24) [#25](https://github.com/adrighem/ha-domoticz-sync/issues/25) [#26](https://github.com/adrighem/ha-domoticz-sync/issues/26) [#27](https://github.com/adrighem/ha-domoticz-sync/issues/27)
+
 ## [0.6.0](https://github.com/adrighem/ha-domoticz-sync/compare/v0.5.0...v0.6.0) (2026-08-01)
 
 
