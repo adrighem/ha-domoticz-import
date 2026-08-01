@@ -14,8 +14,8 @@ from .catalog_storage import (
     HomeAssistantBinaryCatalogStorage,
     HomeAssistantCatalogStorage,
 )
-from .const import DOMAIN
-from .core import Capability, CapabilityKind, catalog_from_document
+from .const import CONTROLLABLE_EXPORT_DOMAINS, DOMAIN
+from .core import Capability, CapabilityKind, CompoundCapability, catalog_from_document
 from .core.protocol import (
     DIRECTION_DOMOTICZ_TO_HA,
     DIRECTION_HA_TO_DOMOTICZ,
@@ -67,6 +67,7 @@ BRIDGE_WEBSOCKET_PATH: Final = "/api/domoticz_sync/websocket"
 MAX_BRIDGE_MESSAGE_BYTES: Final = 64 * 1024
 MAX_APPLICATION_INBOX_MESSAGES: Final = MAX_INVENTORY_PAGES
 MAX_PENDING_HANDSHAKES: Final = 8
+MAX_CONTROL_RESULTS: Final = 256
 PREPARE_TIMEOUT: Final = 5.0
 FIRST_MESSAGE_TIMEOUT: Final = 3.0
 AUTHENTICATION_TIMEOUT: Final = 10.0
@@ -128,6 +129,10 @@ class BridgeSession:
         repr=False,
     )
     application_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    control_results: dict[str, tuple[object, dict[str, object]]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
 
 class BridgeApplicationSession:
@@ -656,13 +661,27 @@ class DomoticzBridgeManager:
                 continue
 
             if message_type == "control_request":
-                if session.selection is None or not session.selection.supports(FEATURE_DOMOTICZ_CONTROL_V1):
+                if session.selection is None or not session.selection.supports(
+                    FEATURE_DOMOTICZ_CONTROL_V1
+                ):
                     raise ProtocolError("invalid protocol message")
                 try:
                     request = parse_control(session.selection, payload)
-                    result = await self._async_handle_control_request(session, request)
+                    cached = session.control_results.get(request.request_id)
+                    if cached is not None:
+                        cached_request, result = cached
+                        if request != cached_request:
+                            raise ProtocolError("invalid protocol message")
+                    else:
+                        result = await self._async_handle_control_request(
+                            session, request
+                        )
+                        if len(session.control_results) >= MAX_CONTROL_RESULTS:
+                            oldest_request_id = next(iter(session.control_results))
+                            session.control_results.pop(oldest_request_id)
+                        session.control_results[request.request_id] = (request, result)
                 except Exception:
-                    raise ProtocolError("invalid protocol message")
+                    raise ProtocolError("invalid protocol message") from None
                 await self._async_send_payload(session, result)
                 continue
 
@@ -780,14 +799,18 @@ class DomoticzBridgeManager:
         entry_id: str,
         destination_id: str,
         target_id: str,
-    ) -> Optional[Capability]:
-        """Find the mapped capability for a given target_id across numeric and binary catalogs."""
+    ) -> Capability | CompoundCapability | None:
+        """Find a mapped capability across numeric and binary catalogs."""
         if self._application is None:
             return None
         hass = self._application._hass
 
         # 1. Check numeric catalog
-        num_storage = HomeAssistantCatalogStorage(hass, entry_id=entry_id, destination_id=destination_id)
+        num_storage = HomeAssistantCatalogStorage(
+            hass,
+            entry_id=entry_id,
+            destination_id=destination_id,
+        )
         try:
             num_doc = await num_storage.async_load()
             if num_doc is not None:
@@ -799,7 +822,11 @@ class DomoticzBridgeManager:
             pass
 
         # 2. Check binary catalog
-        bin_storage = HomeAssistantBinaryCatalogStorage(hass, entry_id=entry_id, destination_id=destination_id)
+        bin_storage = HomeAssistantBinaryCatalogStorage(
+            hass,
+            entry_id=entry_id,
+            destination_id=destination_id,
+        )
         try:
             bin_doc = await bin_storage.async_load()
             if bin_doc is not None:
@@ -828,6 +855,14 @@ class DomoticzBridgeManager:
             )
         hass = self._application._hass
 
+        if request.unit != 1:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error="target unit is not controllable",
+            )
+
         # 1. Find the mapped capability in the target catalogs
         capability = await self._async_find_mapped_capability(
             session.entry_id,
@@ -839,11 +874,12 @@ class DomoticzBridgeManager:
                 session.selection,
                 request.request_id,
                 ControlResultStatus.REJECTED,
-                error=f"target_id {request.target_id!r} is not owned by this session",
+                error="target is not owned by this session",
             )
 
         # 2. Get the Home Assistant entity_id using the entity registry
         from homeassistant.helpers import entity_registry as er
+
         registry = er.async_get(hass)
         entry = registry.async_get(capability.source.object_id)
         if entry is None:
@@ -851,10 +887,17 @@ class DomoticzBridgeManager:
                 session.selection,
                 request.request_id,
                 ControlResultStatus.REJECTED,
-                error=f"source entity registry entry {capability.source.object_id!r} not found",
+                error="source entity is unavailable",
             )
 
         entity_id = entry.entity_id
+        if entry.domain not in CONTROLLABLE_EXPORT_DOMAINS:
+            return build_control_result(
+                session.selection,
+                request.request_id,
+                ControlResultStatus.REJECTED,
+                error="source entity is not controllable",
+            )
 
         # 3. Map command to Home Assistant service
         cmd = request.command.lower()
@@ -872,7 +915,7 @@ class DomoticzBridgeManager:
                     session.selection,
                     request.request_id,
                     ControlResultStatus.REJECTED,
-                    error=f"unsupported command {request.command!r}",
+                    error="command is not supported",
                 )
             domain = "homeassistant"
             service = "turn_on"
@@ -885,7 +928,7 @@ class DomoticzBridgeManager:
                 session.selection,
                 request.request_id,
                 ControlResultStatus.REJECTED,
-                error=f"unsupported command {request.command!r}",
+                error="command is not supported",
             )
 
         # 4. Call the service safely
@@ -896,12 +939,12 @@ class DomoticzBridgeManager:
                 data,
                 blocking=True,
             )
-        except Exception as err:
+        except Exception:
             return build_control_result(
                 session.selection,
                 request.request_id,
                 ControlResultStatus.REJECTED,
-                error=f"service call failed: {err}",
+                error="service call failed",
             )
 
         return build_control_result(

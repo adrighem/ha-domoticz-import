@@ -2942,7 +2942,7 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
     hass_client_no_auth: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A user command in Domoticz successfully maps and executes a service call in HA."""
+    """A Domoticz command executes a Home Assistant service call."""
     export_label = lr.async_get(hass).async_create(EXPORT_LABEL_NAME)
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -2986,25 +2986,51 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
         value=False,
     )
     from custom_components.domoticz_sync.core.protocol import derive_domoticz_target_id
+
     target_id = derive_domoticz_target_id(capability.source)
     catalog = TargetCatalog((TargetRecord(target_id, capability),))
 
-    storage = HomeAssistantBinaryCatalogStorage(hass, entry_id=entry.entry_id, destination_id="00000000-0000-0000-0000-000000000000")
+    storage = HomeAssistantBinaryCatalogStorage(
+        hass,
+        entry_id=entry.entry_id,
+        destination_id="00000000-0000-0000-0000-000000000000",
+    )
     await storage.async_save(catalog_to_document(catalog))
+    registry.async_update_entity(source_entry.entity_id, labels=set())
 
     # Mock service calls
     service_calls = []
+    service_should_fail = False
     import homeassistant.core
+
     original_async_call = homeassistant.core.ServiceRegistry.async_call
-    async def mock_service_call(self, domain, service, service_data, blocking=True, context=None, **kwargs):
+
+    async def mock_service_call(
+        self, domain, service, service_data, blocking=True, context=None, **kwargs
+    ):
         if domain == "homeassistant" and service in {"turn_on", "turn_off"}:
-            entity_id = service_data.get("entity_id") if isinstance(service_data, dict) else ""
-            if isinstance(entity_id, str) and entity_id.startswith("switch.") and "brightness_pct" in service_data:
-                raise ValueError("unsupported command: switch entities do not support brightness")
+            entity_id = (
+                service_data.get("entity_id") if isinstance(service_data, dict) else ""
+            )
+            if (
+                isinstance(entity_id, str)
+                and entity_id.startswith("switch.")
+                and "brightness_pct" in service_data
+            ):
+                raise ValueError(
+                    "unsupported command: switch entities do not support brightness"
+                )
+            if service_should_fail:
+                raise ValueError("private-service-detail")
             service_calls.append((domain, service, service_data))
             return None
-        return await original_async_call(self, domain, service, service_data, blocking, context, **kwargs)
-    monkeypatch.setattr(homeassistant.core.ServiceRegistry, "async_call", mock_service_call)
+        return await original_async_call(
+            self, domain, service, service_data, blocking, context, **kwargs
+        )
+
+    monkeypatch.setattr(
+        homeassistant.core.ServiceRegistry, "async_call", mock_service_call
+    )
 
     # Initialize manager and view
     manager = DomoticzBridgeManager(HomeAssistantExportApplication(hass))
@@ -3030,10 +3056,18 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
         link_id=link_id,
         pairing_key=pairing_key,
     )
-    fake_domoticz.configuration["domoticz_sync_destination_id"] = "00000000-0000-0000-0000-000000000000"
+    fake_domoticz.configuration["domoticz_sync_destination_id"] = (
+        "00000000-0000-0000-0000-000000000000"
+    )
 
     # Open connection and do handshake
-    plugin, connection, websocket, send_position, _inventory = await _open_plugin_connection(
+    (
+        plugin,
+        connection,
+        websocket,
+        send_position,
+        _inventory,
+    ) = await _open_plugin_connection(
         plugin_module,
         fake_domoticz,
         client,
@@ -3055,7 +3089,11 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
 
     # Verify service was executed in Home Assistant
     assert len(service_calls) == 1
-    assert service_calls[0] == ("homeassistant", "turn_on", {"entity_id": source_entry.entity_id})
+    assert service_calls[0] == (
+        "homeassistant",
+        "turn_on",
+        {"entity_id": source_entry.entity_id},
+    )
     assert any("confirmed" in status for status in fake_domoticz.statuses)
 
     # Try a rejected command (e.g. invalid command "Set Level" for a binary switch)
@@ -3068,7 +3106,88 @@ async def test_real_bridge_handles_signed_control_commands_end_to_end(
 
     # Verify no new service call was executed
     assert len(service_calls) == 1
-    assert any("rejected command: unsupported command" in err for err in fake_domoticz.errors)
+    assert any(
+        "rejected command: command is not supported" in err
+        for err in fake_domoticz.errors
+    ), fake_domoticz.errors
+
+    passive_entry = registry.async_get_or_create(
+        "binary_sensor",
+        "integration_test",
+        "test-passive-id",
+        suggested_object_id="test_passive",
+    )
+    hass.states.async_set(passive_entry.entity_id, STATE_OFF)
+    passive = Capability(
+        source=SourceIdentity(
+            "home_assistant",
+            "instance-1",
+            passive_entry.id,
+            "state",
+        ),
+        kind=CapabilityKind.BINARY,
+        name="Test Passive",
+        value=False,
+    )
+    passive_target_id = derive_domoticz_target_id(passive.source)
+    await storage.async_save(
+        catalog_to_document(
+            TargetCatalog(
+                (
+                    TargetRecord(target_id, capability),
+                    TargetRecord(passive_target_id, passive),
+                )
+            )
+        )
+    )
+
+    plugin.onCommand(passive_target_id, 1, "On", 0, "")
+    control_request, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(control_request)
+    raw_response = await _receive_text(websocket)
+    plugin.onMessage(connection, {"Payload": raw_response})
+
+    assert len(service_calls) == 1
+    assert fake_domoticz.errors[-1].endswith("source entity is not controllable")
+
+    plugin.onCommand(target_id, 2, "On", 0, "")
+    control_request, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(control_request)
+    raw_response = await _receive_text(websocket)
+    plugin.onMessage(connection, {"Payload": raw_response})
+
+    assert len(service_calls) == 1
+    assert fake_domoticz.errors[-1].endswith("target unit is not controllable")
+
+    monkeypatch.setattr(
+        plugin_module.wire_protocol,
+        "generate_request_id",
+        lambda: "duplicate-control-1",
+    )
+    for _ in range(2):
+        plugin.onCommand(target_id, 1, "On", 0, "")
+        control_request, send_position = _next_text_payload(connection, send_position)
+        await websocket.send_str(control_request)
+        raw_response = await _receive_text(websocket)
+        plugin.onMessage(connection, {"Payload": raw_response})
+
+    assert len(service_calls) == 2
+
+    service_should_fail = True
+    monkeypatch.setattr(
+        plugin_module.wire_protocol,
+        "generate_request_id",
+        lambda: "service-failure-1",
+    )
+    plugin.onCommand(target_id, 1, "Off", 0, "")
+    control_request, send_position = _next_text_payload(connection, send_position)
+    await websocket.send_str(control_request)
+    raw_response = await _receive_text(websocket)
+    plugin.onMessage(connection, {"Payload": raw_response})
+
+    assert len(service_calls) == 2
+    assert fake_domoticz.errors[-1].endswith("service call failed")
+    assert all("private-service-detail" not in error for error in fake_domoticz.errors)
 
     await _close_plugin_connection(
         plugin,

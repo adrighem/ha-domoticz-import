@@ -29,8 +29,10 @@ from homeassistant.const import (  # noqa: E402
     UnitOfTemperature,
 )
 from homeassistant.core import Event, HomeAssistant  # noqa: E402
+from homeassistant.helpers import device_registry as dr  # noqa: E402
 from homeassistant.helpers import entity_registry as er  # noqa: E402
 from homeassistant.helpers import label_registry as lr  # noqa: E402
+from pytest_homeassistant_custom_component.common import MockConfigEntry  # noqa: E402
 
 from custom_components.domoticz_sync.const import (  # noqa: E402
     DATA_EXPORT_LABEL_ID,
@@ -40,6 +42,7 @@ from custom_components.domoticz_sync.const import (  # noqa: E402
 from custom_components.domoticz_sync.core import (  # noqa: E402
     Availability,
     CapabilityKind,
+    CompoundCapability,
 )
 from custom_components.domoticz_sync.home_assistant_source import (  # noqa: E402
     ExportExclusionReason,
@@ -70,6 +73,7 @@ def _register_entity(
     device_class: str | None = None,
     state_class: str | None = None,
     unit: str | None = None,
+    device_id: str | None = None,
 ) -> er.RegistryEntry:
     """Register one source entity for collection tests."""
     registry = er.async_get(hass)
@@ -83,6 +87,7 @@ def _register_entity(
         original_device_class=device_class,
         original_name=unique_id.replace("_", " ").title(),
         unit_of_measurement=unit,
+        device_id=device_id,
     )
     if labelled:
         entry = registry.async_update_entity(
@@ -90,6 +95,66 @@ def _register_entity(
             labels={EXPORT_LABEL_ID},
         )
     return entry
+
+
+def test_collects_labelled_controllable_switches(hass: HomeAssistant) -> None:
+    """Explicitly labelled switch domains become binary capabilities."""
+    switch = _register_entity(hass, "switch", "test_switch")
+    helper = _register_entity(hass, "input_boolean", "test_helper")
+    hass.states.async_set(switch.entity_id, STATE_ON)
+    hass.states.async_set(helper.entity_id, STATE_OFF)
+
+    capabilities = collect_export_capabilities(hass, instance_id="ha-instance")
+
+    by_source = {capability.source.object_id: capability for capability in capabilities}
+    assert by_source[switch.id].kind is CapabilityKind.BINARY
+    assert by_source[switch.id].value is True
+    assert by_source[helper.id].kind is CapabilityKind.BINARY
+    assert by_source[helper.id].value is False
+
+
+def test_groups_one_temperature_humidity_pair_per_device(
+    hass: HomeAssistant,
+) -> None:
+    """A physical device pair becomes one native compound capability."""
+    config_entry = MockConfigEntry(domain="test", entry_id="test-entry")
+    config_entry.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        identifiers={("test", "climate-sensor")},
+        name="Climate Sensor",
+    )
+    temperature = _register_entity(
+        hass,
+        "sensor",
+        "climate_temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        unit=UnitOfTemperature.CELSIUS,
+        device_id=device.id,
+    )
+    humidity = _register_entity(
+        hass,
+        "sensor",
+        "climate_humidity",
+        device_class=SensorDeviceClass.HUMIDITY,
+        unit="%",
+        device_id=device.id,
+    )
+    hass.states.async_set(temperature.entity_id, "21.5")
+    hass.states.async_set(humidity.entity_id, "48")
+
+    capabilities = collect_export_capabilities(hass, instance_id="ha-instance")
+
+    assert len(capabilities) == 1
+    compound = capabilities[0]
+    assert isinstance(compound, CompoundCapability)
+    assert compound.name == "Climate Sensor"
+    assert compound.source.object_id == device.id
+    assert compound.source.capability_id == "temperature_humidity"
+    assert [part.semantic for part in compound.capabilities] == [
+        "temperature",
+        "humidity",
+    ]
 
 
 def test_collects_labelled_numeric_and_binary_states(hass: HomeAssistant) -> None:
@@ -297,6 +362,7 @@ async def test_export_change_subscription_tracks_selected_supported_states(
         labelled=False,
     )
     unsupported = _register_entity(hass, "input_text", "unsupported")
+    controllable = _register_entity(hass, "input_boolean", "controllable")
     on_change = Mock()
     unsubscribe = async_subscribe_export_changes(
         hass,
@@ -308,9 +374,10 @@ async def test_export_change_subscription_tracks_selected_supported_states(
     hass.states.async_set(disabled.entity_id, STATE_ON)
     hass.states.async_set(unlabelled.entity_id, "2")
     hass.states.async_set(unsupported.entity_id, "private-value")
+    hass.states.async_set(controllable.entity_id, STATE_ON)
     await hass.async_block_till_done()
 
-    assert on_change.call_count == 2
+    assert on_change.call_count == 3
     assert all(not call.args and not call.kwargs for call in on_change.call_args_list)
 
     on_change.reset_mock()

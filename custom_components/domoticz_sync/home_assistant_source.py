@@ -38,16 +38,18 @@ from homeassistant.core import (
     State,
     callback,
 )
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.instance_id import async_get as async_get_instance_id
 
-from .const import EXPORT_LABEL_NAME
+from .const import CONTROLLABLE_EXPORT_DOMAINS, EXPORT_LABEL_NAME
 from .core import (
     Availability,
     Capability,
     CapabilityKind,
+    CompoundCapability,
     SourceIdentity,
 )
 from .export_label import async_get_export_label_id
@@ -58,6 +60,9 @@ _STATE_CAPABILITY_ID = "state"
 
 _BINARY_SENSOR_DOMAIN = "binary_sensor"
 _SENSOR_DOMAIN = "sensor"
+_SUPPORTED_EXPORT_DOMAINS = frozenset(
+    {_BINARY_SENSOR_DOMAIN, _SENSOR_DOMAIN, *CONTROLLABLE_EXPORT_DOMAINS}
+)
 
 _NON_NUMERIC_SENSOR_DEVICE_CLASSES = {"date", "enum", "timestamp", "uptime"}
 
@@ -110,7 +115,7 @@ class ExportExclusion:
 class ExportCollection:
     """Exportable capabilities and safe diagnostics for one label snapshot."""
 
-    capabilities: tuple[Capability, ...]
+    capabilities: tuple[Capability | CompoundCapability, ...]
     exclusions: tuple[ExportExclusion, ...]
 
 
@@ -165,7 +170,7 @@ def async_subscribe_export_changes(
         new_state_entity_ids = frozenset(
             entry.entity_id
             for entry in entries
-            if entry.domain in {_BINARY_SENSOR_DOMAIN, _SENSOR_DOMAIN}
+            if entry.domain in _SUPPORTED_EXPORT_DOMAINS
         )
 
         direct_entity_ids = new_direct_entity_ids
@@ -309,7 +314,7 @@ def collect_export_selection(
     if included_kinds is None:
         included_kinds = frozenset(CapabilityKind)
 
-    capabilities: list[Capability] = []
+    capabilities: list[Capability | CompoundCapability] = []
     exclusions: list[ExportExclusion] = []
     for entry in entries:
         if entry.disabled:
@@ -317,10 +322,7 @@ def collect_export_selection(
                 ExportExclusion(entry.entity_id, ExportExclusionReason.DISABLED)
             )
             continue
-        if entry.domain not in {
-            _BINARY_SENSOR_DOMAIN,
-            _SENSOR_DOMAIN,
-        }:
+        if entry.domain not in _SUPPORTED_EXPORT_DOMAINS:
             exclusions.append(
                 ExportExclusion(
                     entry.entity_id,
@@ -360,6 +362,14 @@ def collect_export_selection(
             continue
         capabilities.append(capability)
 
+    if CapabilityKind.COMPOUND in included_kinds:
+        capabilities = _group_temperature_humidity_capabilities(
+            hass,
+            entries,
+            capabilities,
+            instance_id=instance_id,
+        )
+
     return ExportCollection(tuple(capabilities), tuple(exclusions))
 
 
@@ -398,7 +408,10 @@ def _capability_from_entry(
         else er.async_get_full_entity_name(hass, entry) or entry.entity_id
     )
 
-    if entry.domain == _BINARY_SENSOR_DOMAIN:
+    if (
+        entry.domain == _BINARY_SENSOR_DOMAIN
+        or entry.domain in CONTROLLABLE_EXPORT_DOMAINS
+    ):
         return _binary_capability(source, name, device_class, state)
 
     unit = _normalized_unit(raw_unit)
@@ -410,6 +423,73 @@ def _capability_from_entry(
         state_class,
         state,
     )
+
+
+def _group_temperature_humidity_capabilities(
+    hass: HomeAssistant,
+    entries: list[er.RegistryEntry],
+    capabilities: list[Capability | CompoundCapability],
+    *,
+    instance_id: str,
+) -> list[Capability | CompoundCapability]:
+    """Group one labelled temperature and humidity pair per physical device."""
+    entries_by_id = {entry.id: entry for entry in entries}
+    candidates: dict[str, dict[str, list[Capability]]] = {}
+    for capability in capabilities:
+        if not isinstance(capability, Capability):
+            continue
+        if capability.kind is not CapabilityKind.NUMERIC:
+            continue
+        if capability.semantic not in {"temperature", "humidity"}:
+            continue
+        entry = entries_by_id.get(capability.source.object_id)
+        if entry is None or entry.device_id is None:
+            continue
+        by_semantic = candidates.setdefault(entry.device_id, {})
+        by_semantic.setdefault(capability.semantic, []).append(capability)
+
+    grouped_sources: set[SourceIdentity] = set()
+    compounds: list[CompoundCapability] = []
+    device_registry = dr.async_get(hass)
+    for device_id, by_semantic in sorted(candidates.items()):
+        temperatures = by_semantic.get("temperature", [])
+        humidities = by_semantic.get("humidity", [])
+        if len(temperatures) != 1 or len(humidities) != 1:
+            continue
+        temperature = temperatures[0]
+        humidity = humidities[0]
+        device = device_registry.async_get(device_id)
+        name = (
+            (device.name_by_user or device.name) if device is not None else None
+        ) or f"{temperature.name} + {humidity.name}"
+        availability = Availability.UNKNOWN
+        if temperature.is_available or humidity.is_available:
+            availability = Availability.AVAILABLE
+        elif (
+            temperature.availability is Availability.UNAVAILABLE
+            or humidity.availability is Availability.UNAVAILABLE
+        ):
+            availability = Availability.UNAVAILABLE
+        compounds.append(
+            CompoundCapability(
+                source=SourceIdentity(
+                    system=_SOURCE_SYSTEM,
+                    instance_id=instance_id,
+                    object_id=device_id,
+                    capability_id="temperature_humidity",
+                ),
+                name=name,
+                capabilities=(temperature, humidity),
+                availability=availability,
+            )
+        )
+        grouped_sources.update({temperature.source, humidity.source})
+
+    return [
+        capability
+        for capability in capabilities
+        if capability.source not in grouped_sources
+    ] + compounds
 
 
 def _binary_capability(

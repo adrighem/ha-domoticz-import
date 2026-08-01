@@ -235,17 +235,21 @@ def test_capability_records_are_immutable(source: SourceIdentity) -> None:
 
 
 def test_compound_capability_creation_and_attributes(source: SourceIdentity) -> None:
-    """A CompoundCapability is successfully created and preserves nested capabilities."""
+    """A compound preserves its nested capabilities."""
     cap1 = Capability(source, CapabilityKind.NUMERIC, "Temperature", 21.5)
     cap2 = Capability(
-        SourceIdentity("home_assistant", "instance-1", "entity-registry-id", "humidity"),
+        SourceIdentity(
+            "home_assistant", "instance-1", "entity-registry-id", "humidity"
+        ),
         CapabilityKind.NUMERIC,
         "Humidity",
         50.0,
     )
 
     compound = CompoundCapability(
-        source=SourceIdentity("home_assistant", "instance-1", "entity-registry-id", "temp_hum"),
+        source=SourceIdentity(
+            "home_assistant", "instance-1", "entity-registry-id", "temp_hum"
+        ),
         name="Climate Sensor",
         capabilities=(cap1, cap2),
     )
@@ -269,10 +273,14 @@ def test_compound_capability_validation() -> None:
         CompoundCapability(source="not-a-source", name="Invalid", capabilities=())
 
     with pytest.raises(TypeError, match="name"):
-        CompoundCapability(source=SourceIdentity("a", "b", "c", "d"), name=123, capabilities=())
+        CompoundCapability(
+            source=SourceIdentity("a", "b", "c", "d"), name=123, capabilities=()
+        )
 
     with pytest.raises(ValueError, match="name"):
-        CompoundCapability(source=SourceIdentity("a", "b", "c", "d"), name="   ", capabilities=())
+        CompoundCapability(
+            source=SourceIdentity("a", "b", "c", "d"), name="   ", capabilities=()
+        )
 
     with pytest.raises(TypeError, match="capabilities"):
         CompoundCapability(

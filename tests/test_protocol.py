@@ -14,6 +14,7 @@ from custom_components.domoticz_sync.core.capabilities import (
     Availability,
     Capability,
     CapabilityKind,
+    CompoundCapability,
     SourceIdentity,
 )
 from custom_components.domoticz_sync.core.protocol import (
@@ -2229,6 +2230,37 @@ def test_apply_codec_rejects_non_numeric_capabilities() -> None:
     )
     with pytest.raises(ProtocolFormatError):
         parse_apply(_selection(), payload)
+
+
+def test_apply_codec_round_trips_numeric_compounds() -> None:
+    """Numeric export transports one compound capability atomically."""
+    temperature = _numeric_capability()
+    humidity = Capability(
+        source=SourceIdentity("home_assistant", "instance-1", "humidity", "state"),
+        kind=CapabilityKind.NUMERIC,
+        name="Humidity",
+        value=48.0,
+        semantic="humidity",
+        unit="percent",
+    )
+    compound = CompoundCapability(
+        source=SourceIdentity(
+            "home_assistant",
+            "instance-1",
+            "climate-device",
+            "temperature_humidity",
+        ),
+        name="Climate Sensor",
+        capabilities=(temperature, humidity),
+    )
+    action = ReconciliationAction(
+        kind=ReconciliationActionKind.CREATE,
+        capability=compound,
+    )
+
+    payload = build_apply(_selection(), "request-1", action)
+
+    assert parse_apply(_selection(), payload).action == action
 
 
 @pytest.mark.parametrize(

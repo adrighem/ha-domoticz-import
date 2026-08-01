@@ -419,12 +419,19 @@ write from stale remote state.
 
 `domoticz-control.v1` allows the connected Domoticz companion plugin to securely transmit control commands (e.g., in response to user actions in the Domoticz UI) to control the state of Home Assistant entities that are mapped to exported targets.
 
+Home Assistant authorizes On and Off only for catalog-owned targets whose
+current source domain is explicitly controllable: `switch` or `input_boolean`.
+Passive binary sensors and all other source domains reject control requests.
+
 ### Threat Model
 
 1. **Command Authorization & Integrity:** To prevent unauthorized or forged commands, every command message must be cryptographically signed using the session key, packed within a `VerifiedEnvelope` envelope, and verified by Home Assistant using HMAC-SHA256 before execution.
 2. **Replay Protection:** To prevent attackers from intercepting and replaying valid commands, each control request includes a strict incremental sequence number and nonce/session validation handled by the verified envelope layers.
 3. **Target Ownership Scope:** Home Assistant strictly enforces ownership. Domoticz is only authorized to control entities that are explicitly bound to a target device (present in the local Target Catalog). Any command targeting an unbound, private, or unrelated Home Assistant entity is immediately rejected.
-4. **Idempotency:** Command correlation via `request_id` ensures that re-transmissions are handled safely and duplicate executions are avoided.
+4. **Idempotency:** Home Assistant keeps a bounded per-session result cache.
+   Repeating an identical request returns its original result without executing
+   the service again. Reusing a request ID with different content closes the
+   session as a protocol violation.
 5. **Safe Fail-Closed Errors:** Rejections and failures return detailed, log-safe audit messages without ever leaking any session secrets, pairing keys, or entity attributes.
 
 ### Message Schemas
@@ -448,7 +455,7 @@ The Domoticz plugin sends a control request of this exact schema when a user int
 
 - `request_id` must be a non-empty, log-safe, unique transaction correlation ID.
 - `target_id` must be a valid, non-empty, whitespace-stable deterministic DeviceID.
-- `unit` must be a valid integer between `1` and `255`.
+- `unit` must be `1`, the only managed export unit.
 - `command` must be a non-empty string.
 - `level` must be a finite floating-point number or integer.
 - `color` must be a string.

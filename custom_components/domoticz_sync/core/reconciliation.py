@@ -173,7 +173,9 @@ class ReconciliationAction:
             )
 
 
-def _validate_stale(stale: object, capability: Union[Capability, CompoundCapability]) -> None:
+def _validate_stale(
+    stale: object, capability: Union[Capability, CompoundCapability]
+) -> None:
     """Validate whether a capability is absent from its source snapshot."""
     if not isinstance(stale, bool):
         raise TypeError("stale must be a bool")
@@ -189,7 +191,9 @@ def _index_capabilities(
     indexed: Dict[SourceIdentity, Union[Capability, CompoundCapability]] = {}
     for capability in capabilities:
         if not isinstance(capability, (Capability, CompoundCapability)):
-            raise TypeError("current capabilities must be Capability or CompoundCapability values")
+            raise TypeError(
+                "current capabilities must be Capability or CompoundCapability values"
+            )
         if not scope.contains(capability.source):
             raise ValueError(
                 f"current capability is outside source scope: {capability.source.key!r}"
@@ -273,7 +277,9 @@ def validate_deterministic_target_ownership(
     source_identities: Set[SourceIdentity] = set()
     for capability in current:
         if not isinstance(capability, (Capability, CompoundCapability)):
-            raise TypeError("current capabilities must be Capability or CompoundCapability values")
+            raise TypeError(
+                "current capabilities must be Capability or CompoundCapability values"
+            )
         if capability.source in source_identities:
             raise TargetBindingError("duplicate current source identity")
         catalog_kind = catalog_kinds.get(capability.source)
@@ -291,7 +297,9 @@ def validate_deterministic_target_ownership(
         sources_by_target_id[target_id] = source
 
 
-def _unavailable(capability: Union[Capability, CompoundCapability]) -> Union[Capability, CompoundCapability]:
+def _unavailable(
+    capability: Union[Capability, CompoundCapability],
+) -> Union[Capability, CompoundCapability]:
     """Return an unavailable snapshot while preserving capability metadata."""
     if isinstance(capability, CompoundCapability):
         return replace(

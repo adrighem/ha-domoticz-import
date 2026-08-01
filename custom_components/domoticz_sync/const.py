@@ -21,6 +21,8 @@ DATA_EXPORT_LABEL_ID = "_export_label_id"
 EXPORT_LABEL_ID = "domoticz_export"
 EXPORT_LABEL_NAME = "Domoticz Export"
 
+CONTROLLABLE_EXPORT_DOMAINS = frozenset({"input_boolean", "switch"})
+
 DEFAULT_NAME = "Domoticz Sync"
 DEFAULT_SCAN_INTERVAL = 60
 MIN_SCAN_INTERVAL = 10

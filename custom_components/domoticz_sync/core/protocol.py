@@ -238,20 +238,20 @@ class _ExportCodec:
     """One feature-gated application message family for a capability kind."""
 
     feature: str
-    capability_kind: CapabilityKind
+    capability_kinds: Tuple[CapabilityKind, ...]
     request_type: str
     result_type: str
 
 
 _NUMERIC_EXPORT_CODEC = _ExportCodec(
     feature=FEATURE_HA_EXPORT_NUMERIC_V1,
-    capability_kind=CapabilityKind.NUMERIC,
+    capability_kinds=(CapabilityKind.NUMERIC, CapabilityKind.COMPOUND),
     request_type="apply",
     result_type="apply_result",
 )
 _BINARY_EXPORT_CODEC = _ExportCodec(
     feature=FEATURE_HA_EXPORT_BINARY_V1,
-    capability_kind=CapabilityKind.BINARY,
+    capability_kinds=(CapabilityKind.BINARY,),
     request_type="binary_apply",
     result_type="binary_apply_result",
 )
@@ -499,7 +499,9 @@ class ControlResult:
         else:
             if self.error is not None:
                 if not isinstance(self.error, str) or not self.error.strip():
-                    raise ValueError("rejected control results must have a non-empty string error or None")
+                    raise ValueError(
+                        "rejected control results require a non-empty string error"
+                    )
 
 
 @dataclass(frozen=True)
@@ -1638,7 +1640,9 @@ def parse_control_result(
         return ControlResult(
             request_id=_require_string(data["request_id"]),
             status=ControlResultStatus(data["status"]),
-            error=data["error"] if data["error"] is None else _require_string(data["error"]),
+            error=data["error"]
+            if data["error"] is None
+            else _require_string(data["error"]),
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ProtocolFormatError("invalid protocol message") from None
@@ -1653,7 +1657,7 @@ def _build_export_apply(
     """Build one feature-gated export request with an exact discriminator."""
     _require_export_selection(selection, codec.feature)
     request = ApplyRequest(request_id=request_id, action=action)
-    if request.action.capability.kind is not codec.capability_kind:
+    if request.action.capability.kind not in codec.capability_kinds:
         raise ProtocolFormatError("invalid protocol message")
     return _normalize_payload(
         {
@@ -1682,7 +1686,7 @@ def _parse_export_apply(
             request_id=_require_string(data["request_id"]),
             action=_action_from_dict(data["action"]),
         )
-        if request.action.capability.kind is not codec.capability_kind:
+        if request.action.capability.kind not in codec.capability_kinds:
             raise ProtocolFormatError("invalid protocol message")
         return request
     except (KeyError, TypeError, ValueError, OverflowError):
@@ -2237,7 +2241,9 @@ def _source_from_dict(document: object) -> SourceIdentity:
     )
 
 
-def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Dict[str, object]:
+def _capability_to_dict(
+    capability: Union[Capability, CompoundCapability],
+) -> Dict[str, object]:
     """Serialize every field that defines one capability snapshot."""
     if isinstance(capability, CompoundCapability):
         return {
@@ -2246,8 +2252,7 @@ def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Di
             "name": capability.name,
             "availability": capability.availability.value,
             "capabilities": [
-                _capability_to_dict(cap)
-                for cap in capability.capabilities
+                _capability_to_dict(cap) for cap in capability.capabilities
             ],
         }
     return {
@@ -2276,7 +2281,9 @@ def _capability_from_dict(document: object) -> Union[Capability, CompoundCapabil
         capabilities = tuple(_capability_from_dict(item) for item in nested_list)
         for cap in capabilities:
             if not isinstance(cap, Capability):
-                raise TypeError("compound capability nested list must contain Capability values")
+                raise TypeError(
+                    "compound capability nested list must contain Capability values"
+                )
         return CompoundCapability(
             source=source,
             name=document["name"],

@@ -1041,9 +1041,14 @@ class DomoticzSyncPlugin:
             self._handle_inventory_request(payload)
             return
         if message_type == "control_result":
-            result = wire_protocol.parse_control_result(self._protocol_selection, payload)
+            result = wire_protocol.parse_control_result(
+                self._protocol_selection, payload
+            )
             if result.status == wire_protocol.ControlResultStatus.CONFIRMED:
-                Domoticz.Status(f"Home Assistant confirmed command execution for transaction {result.request_id!r}.")
+                Domoticz.Status(
+                    "Home Assistant confirmed command execution for transaction "
+                    f"{result.request_id!r}."
+                )
             else:
                 Domoticz.Error(f"Home Assistant rejected command: {result.error}")
             return
@@ -1999,7 +2004,9 @@ class DomoticzSyncPlugin:
     def onCommand(self, device_id, unit, command, level, color):
         """Forward command to Home Assistant if control is negotiated, else reject."""
         selection = self._protocol_selection
-        if selection is None or not selection.supports(wire_protocol.FEATURE_DOMOTICZ_CONTROL_V1):
+        if selection is None or not selection.supports(
+            wire_protocol.FEATURE_DOMOTICZ_CONTROL_V1
+        ):
             Domoticz.Status("Home Assistant export devices are read-only.")
             return
 

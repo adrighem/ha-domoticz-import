@@ -7,7 +7,7 @@ vendored into Domoticz releases independently of the Home Assistant adapter.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from .capabilities import (
     Availability,
@@ -49,7 +49,9 @@ class CatalogFormatError(ValueError):
     """A persisted target catalog is missing, unsupported, or malformed."""
 
 
-def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Dict[str, object]:
+def _capability_to_dict(
+    capability: Union[Capability, CompoundCapability],
+) -> Dict[str, object]:
     """Serialize a capability or compound capability."""
     source = capability.source
     if isinstance(capability, CompoundCapability):
@@ -64,8 +66,7 @@ def _capability_to_dict(capability: Union[Capability, CompoundCapability]) -> Di
             "name": capability.name,
             "availability": capability.availability.value,
             "capabilities": [
-                _capability_to_dict(cap)
-                for cap in capability.capabilities
+                _capability_to_dict(cap) for cap in capability.capabilities
             ],
         }
     return {
@@ -245,7 +246,9 @@ def _capability_from_dict(data: object) -> Union[Capability, CompoundCapability]
         capabilities = tuple(_capability_from_dict(item) for item in nested_list)
         for cap in capabilities:
             if not isinstance(cap, Capability):
-                raise TypeError("compound capability nested list must contain Capability values")
+                raise TypeError(
+                    "compound capability nested list must contain Capability values"
+                )
         return CompoundCapability(
             source=source,
             name=data["name"],

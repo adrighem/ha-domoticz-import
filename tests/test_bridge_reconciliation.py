@@ -34,6 +34,7 @@ from custom_components.domoticz_sync.core.capabilities import (  # noqa: E402
     Availability,
     Capability,
     CapabilityKind,
+    CompoundCapability,
     SourceIdentity,
 )
 from custom_components.domoticz_sync.core.catalog import (  # noqa: E402
@@ -526,7 +527,7 @@ def _inventory_and_apply_responses(
 
 def _configure_application(
     monkeypatch: pytest.MonkeyPatch,
-    capabilities: list[Capability],
+    capabilities: list[Capability | CompoundCapability],
     storage: _MemoryStorage,
     exclusions: list[ExportExclusion] | None = None,
     *,
@@ -549,7 +550,9 @@ def _configure_application(
         assert included_kinds == expected_kinds
         return ExportCollection(tuple(capabilities), tuple(exclusions))
 
-    expected_kinds = included_kinds
+    expected_kinds = included_kinds | (
+        {CapabilityKind.COMPOUND} if CapabilityKind.NUMERIC in included_kinds else set()
+    )
     monkeypatch.setattr(app_module, "collect_export_selection", collect)
 
     def make_storage(_hass, *, entry_id: str, destination_id: str):
@@ -674,6 +677,49 @@ async def test_application_reconciles_binary_only_when_independently_negotiated(
     catalog = catalog_from_document(binary_storage.document)
     assert [record.capability for record in catalog.records] == [binary]
     assert ExportExclusionReason.CAPABILITY_KIND_NOT_ENABLED.value not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_application_routes_compound_through_numeric_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Temp+Hum compounds share numeric transport and catalog persistence."""
+    temperature = Capability(
+        source=_source("temperature-source"),
+        kind=CapabilityKind.NUMERIC,
+        name="Temperature",
+        value=21.5,
+        semantic="temperature",
+        unit="celsius",
+    )
+    humidity = Capability(
+        source=_source("humidity-source"),
+        kind=CapabilityKind.NUMERIC,
+        name="Humidity",
+        value=48.0,
+        semantic="humidity",
+        unit="percent",
+    )
+    compound = CompoundCapability(
+        source=SourceIdentity(
+            "home_assistant",
+            "instance-1",
+            "device-source",
+            "temperature_humidity",
+        ),
+        name="Climate Sensor",
+        capabilities=(temperature, humidity),
+    )
+    storage = _MemoryStorage()
+    _configure_application(monkeypatch, [compound], storage)
+    session = _Session(_confirmed_response)
+
+    await HomeAssistantExportApplication(_Hass()).async_connected(session)
+
+    request = parse_apply(_SELECTION, session.sent[0])
+    assert request.action.capability == compound
+    catalog = catalog_from_document(storage.document)
+    assert [record.capability for record in catalog.records] == [compound]
 
 
 @pytest.mark.asyncio

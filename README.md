@@ -205,7 +205,7 @@ not need to be restarted.
 The integration creates a **Domoticz Export** label in Home Assistant.
 
 1. Go to **Settings** -> **Devices & services** -> **Entities**.
-2. Open a numeric sensor or binary sensor.
+2. Open a numeric sensor, binary sensor, switch, or input boolean.
 3. Add **Domoticz Export** under **Labels** and save.
 
 The label must be assigned directly to the entity. A label inherited from its
@@ -265,7 +265,7 @@ includes totals, counters, energy, AQI, ambiguous volume flow, and meanings or
 units without an exact native match. Date, enum, timestamp, uptime, arbitrary
 text, and non-finite values are not exported.
 
-### Exported passive binary mappings
+### Exported binary mappings
 
 | Home Assistant binary sensor | Domoticz SwitchType |
 | --- | --- |
@@ -277,7 +277,9 @@ text, and non-finite values are not exported.
 | Any other, missing, or future device class | Generic On/Off |
 
 Door Lock Inverted preserves Home Assistant's binary meaning: `on` means
-unlocked. If bidirectional control is enabled, toggling these devices in Domoticz sends secure control commands back to Home Assistant. Otherwise, they act as passive mirrors.
+unlocked. Binary sensors remain passive mirrors. Directly labelled Home
+Assistant `switch` and `input_boolean` entities use Generic On/Off and accept
+authenticated On and Off commands from Domoticz.
 
 See the
 [complete Home Assistant to Domoticz mapping](docs/entity-mapping.md) for
@@ -492,8 +494,8 @@ logs.
 2. Confirm that the Domoticz log reports
    `Authenticated Home Assistant connection is ready` with protocol v2 and the
    expected inventory, continuous, numeric, and binary feature names.
-3. Verify one native numeric target, one Custom Sensor fallback, and one passive
-   binary target when those representative entities are labelled.
+3. Verify one native numeric target, one Custom Sensor fallback, one passive
+   binary target, and one controllable switch when those entities are labelled.
 4. Reconnect once more and confirm that each source still has exactly one
    Domoticz target.
 
@@ -512,7 +514,7 @@ mixed-version and feature-negotiation rules.
 | Home Assistant -> Domoticz | The plugin reports invalid configuration | Enter a host without a scheme or path, a numeric port from 1 to 65535, WS or WSS, and the exact Link ID and Pairing key shown in Home Assistant. |
 | Home Assistant -> Domoticz | The plugin cannot connect | Confirm Domoticz can resolve and reach the Home Assistant host and port, the Home Assistant integration entry is loaded, and WS/WSS matches the endpoint. A reverse proxy must forward WebSocket traffic and the `Sec-WebSocket-Protocol` header. |
 | Home Assistant -> Domoticz | The connection is ready but export is disabled | Check the reported protocol and features. Install the same release tag on both systems. A v1 compatibility connection is intentionally heartbeat-only. |
-| Home Assistant -> Domoticz | A labelled entity is not exported | Put the label directly on a `sensor` or `binary_sensor` and check the Home Assistant log for a fixed exclusion reason. With continuous export, a newly eligible uncataloged source causes one controlled reconnect for fresh inventory. Without `ha-export.continuous.v1`, reconnect the plugin manually. Domoticz-origin mirrors are intentionally skipped. |
+| Home Assistant -> Domoticz | A labelled entity is not exported | Put the label directly on a `sensor`, `binary_sensor`, `switch`, or `input_boolean` and check the Home Assistant log for a fixed exclusion reason. With continuous export, a newly eligible uncataloged source causes one controlled reconnect for fresh inventory. Without `ha-export.continuous.v1`, reconnect the plugin manually. Domoticz-origin mirrors are intentionally skipped. |
 | Home Assistant -> Domoticz | A numeric sensor becomes a Custom Sensor | This is the safe fallback when meaning, unit, or state class does not exactly match a native Domoticz type. Check the mapping reference. |
 | Home Assistant -> Domoticz | A state, label, or name change is not visible | Confirm that the ready status includes `ha-export.continuous.v1`, `domoticz-inventory.v1`, and the matching numeric or binary feature. Wait for the short coalescing window. If continuous export is not selected, restart or reconnect the plugin to run the connect-time pass. |
 | Home Assistant -> Domoticz | A manually deleted target is not recreated | Confirm that the source is still selected, both peers report `domoticz-inventory.v1`, and the target was already recorded as sync-owned. A remote-only DeviceID is deliberately not claimed. Do not edit Home Assistant `.storage` files. |
@@ -535,8 +537,9 @@ Domoticz password, tokens, cookies, or other credentials in an issue.
   profile changes, and ambiguous unit layouts are left untouched.
 - Recreating a deleted unavailable target cannot recover its old Domoticz
   value. The replacement starts with a neutral value and remains timed out.
-- Only directly labelled numeric sensors and passive binary sensors are
-  exported. Compound and multi-capability devices are not implemented.
+- Only directly labelled numeric sensors, passive binary sensors, switches,
+  and input booleans are exported. Compound support currently covers one
+  temperature and one humidity entity from the same physical device.
 - Native numeric type selection is conservative. Other finite numeric values
   use Custom Sensors.
 - Only one active Domoticz plugin connection is allowed for each Link ID.

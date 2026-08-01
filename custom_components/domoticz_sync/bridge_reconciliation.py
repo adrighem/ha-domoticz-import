@@ -16,7 +16,12 @@ from .catalog_storage import (
     HomeAssistantCatalogStorage,
 )
 from .const import CONF_EXPORT_LABEL_ID
-from .core.capabilities import Capability, CapabilityKind, SourceIdentity
+from .core.capabilities import (
+    Capability,
+    CapabilityKind,
+    CompoundCapability,
+    SourceIdentity,
+)
 from .core.catalog import CatalogFormatError, TargetCatalog, catalog_from_document
 from .core.execution import (
     ApplyConfirmation,
@@ -108,7 +113,7 @@ class _ContinuousDirtySignal:
 class _InventoryAdmission:
     """One capacity-safe baseline and its session-local blocked identities."""
 
-    capabilities: tuple[Capability, ...]
+    capabilities: tuple[Capability | CompoundCapability, ...]
     blocked_sources: frozenset[SourceIdentity]
     blocked_durable_sources: frozenset[SourceIdentity]
 
@@ -299,6 +304,15 @@ _ALL_CATALOG_STRATEGIES = (
 )
 
 
+def _capability_kinds_for_strategy(
+    strategy: _ExportKindStrategy,
+) -> frozenset[CapabilityKind]:
+    """Return capability kinds stored under one negotiated feature catalog."""
+    if strategy.kind is CapabilityKind.NUMERIC:
+        return frozenset({CapabilityKind.NUMERIC, CapabilityKind.COMPOUND})
+    return frozenset({strategy.kind})
+
+
 def _negotiated_export_strategies(
     session: BridgeApplicationSession,
 ) -> tuple[_ExportKindStrategy, ...]:
@@ -367,7 +381,11 @@ class HomeAssistantExportApplication:
         rejected_desired_records: dict[SourceIdentity, TargetRecord] = {}
         try:
             instance_id = await async_get_instance_id(self._hass)
-            included_kinds = frozenset(strategy.kind for strategy in strategies)
+            included_kinds = frozenset(
+                kind
+                for strategy in strategies
+                for kind in _capability_kinds_for_strategy(strategy)
+            )
             if continuous_enabled:
                 dirty_signal = _ContinuousDirtySignal()
                 unsubscribe = async_subscribe_export_changes(
@@ -612,7 +630,7 @@ class HomeAssistantExportApplication:
         self,
         session: BridgeApplicationSession,
         instance_id: str,
-        capabilities: tuple[Capability, ...],
+        capabilities: tuple[Capability | CompoundCapability, ...],
         *,
         strategy: _ExportKindStrategy,
         observations: tuple[TargetObservation, ...] | None = None,
@@ -627,7 +645,7 @@ class HomeAssistantExportApplication:
         current = tuple(
             capability
             for capability in capabilities
-            if capability.kind is strategy.kind
+            if capability.kind in _capability_kinds_for_strategy(strategy)
         )
         if observations is None:
             return await executor.async_reconcile(scope, current)
@@ -637,7 +655,7 @@ class HomeAssistantExportApplication:
         self,
         session: BridgeApplicationSession,
         instance_id: str,
-        capabilities: tuple[Capability, ...],
+        capabilities: tuple[Capability | CompoundCapability, ...],
         *,
         strategy: _ExportKindStrategy,
         catalog: TargetCatalog,
@@ -652,7 +670,7 @@ class HomeAssistantExportApplication:
         current = tuple(
             capability
             for capability in capabilities
-            if capability.kind is strategy.kind
+            if capability.kind in _capability_kinds_for_strategy(strategy)
         )
         planned = plan_reconciliation(scope, current, catalog.records)
         actions = tuple(
@@ -663,7 +681,7 @@ class HomeAssistantExportApplication:
             and not _action_matches_catalog(action, catalog)
         )
         actions = _suppress_unchanged_rejections(
-            strategy.kind,
+            _capability_kinds_for_strategy(strategy),
             actions,
             rejected_desired_records,
         )
@@ -679,7 +697,7 @@ class HomeAssistantExportApplication:
     async def _async_preload_catalogs(
         self,
         session: BridgeApplicationSession,
-        capabilities: tuple[Capability, ...],
+        capabilities: tuple[Capability | CompoundCapability, ...],
     ) -> tuple[
         dict[CapabilityKind, CatalogStorage],
         dict[CapabilityKind, TargetCatalog],
@@ -755,7 +773,7 @@ class HomeAssistantExportApplication:
 
 def _admit_inventory_creates(
     scope: SourceScope,
-    capabilities: tuple[Capability, ...],
+    capabilities: tuple[Capability | CompoundCapability, ...],
     observations: tuple[TargetObservation, ...],
     catalogs: Mapping[CapabilityKind, TargetCatalog],
     included_kinds: frozenset[CapabilityKind],
@@ -809,16 +827,21 @@ def _admit_inventory_creates(
         units_used += 1
 
     create_actions = []
-    for kind in sorted(included_kinds, key=lambda item: item.value):
+    for strategy in _ALL_CATALOG_STRATEGIES:
+        strategy_kinds = _capability_kinds_for_strategy(strategy)
+        if not strategy_kinds & included_kinds:
+            continue
         current = tuple(
-            capability for capability in capabilities if capability.kind is kind
+            capability
+            for capability in capabilities
+            if capability.kind in strategy_kinds
         )
         create_actions.extend(
             action
             for action in plan_reconciliation(
                 scope,
                 current,
-                catalogs[kind].records,
+                catalogs[strategy.kind].records,
                 observations,
             )
             if action.kind is ReconciliationActionKind.CREATE
@@ -867,7 +890,7 @@ def _desired_record(action: ReconciliationAction) -> TargetRecord:
 
 
 def _suppress_unchanged_rejections(
-    kind: CapabilityKind,
+    kinds: frozenset[CapabilityKind],
     actions: tuple[ReconciliationAction, ...],
     rejected_desired_records: dict[SourceIdentity, TargetRecord],
 ) -> tuple[ReconciliationAction, ...]:
@@ -876,7 +899,7 @@ def _suppress_unchanged_rejections(
         action.capability.source: _desired_record(action) for action in actions
     }
     for source, rejected in tuple(rejected_desired_records.items()):
-        if rejected.capability.kind is not kind:
+        if rejected.capability.kind not in kinds:
             continue
         if desired_by_source.get(source) != rejected:
             rejected_desired_records.pop(source)

@@ -167,6 +167,7 @@ class FakeDomoticz(ModuleType):
 def loaded_plugin(monkeypatch):
     """Load plugin.py with an isolated DomoticzEx implementation."""
     import secrets
+
     monkeypatch.setattr(secrets, "randbelow", lambda n: 0)
     fake_domoticz = FakeDomoticz()
     monkeypatch.setitem(sys.modules, "DomoticzEx", fake_domoticz)
@@ -521,12 +522,14 @@ def test_ambiguous_or_counter_numeric_values_fall_back_to_custom(
 
 
 def test_temp_hum_profile_selection_and_encoding(loaded_plugin):
-    """Temp + Hum compound capability produces the 82/1 Temp+Hum profile and encodes correctly."""
+    """Temp + Hum selects and encodes the native 82/1 profile."""
     module, _domoticz = loaded_plugin
     protocol = module.wire_protocol
 
     cap_temp = protocol.Capability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temperature"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "temperature"
+        ),
         protocol.CapabilityKind.NUMERIC,
         "Temperature",
         21.5,
@@ -534,7 +537,9 @@ def test_temp_hum_profile_selection_and_encoding(loaded_plugin):
         unit="°C",
     )
     cap_hum = protocol.Capability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "humidity"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "humidity"
+        ),
         protocol.CapabilityKind.NUMERIC,
         "Humidity",
         55.0,
@@ -542,7 +547,9 @@ def test_temp_hum_profile_selection_and_encoding(loaded_plugin):
         unit="%",
     )
     compound = protocol.CompoundCapability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temp_hum"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "temp_hum"
+        ),
         "Climate",
         (cap_temp, cap_hum),
     )
@@ -558,12 +565,14 @@ def test_temp_hum_profile_selection_and_encoding(loaded_plugin):
 
 
 def test_temp_hum_profile_encoding_partial_availability(loaded_plugin):
-    """Temp + Hum compound capability encodes with fallback to existing values when partially available."""
+    """Temp + Hum retains existing values during partial availability."""
     module, domoticz = loaded_plugin
     protocol = module.wire_protocol
 
     cap_temp = protocol.Capability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temperature"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "temperature"
+        ),
         protocol.CapabilityKind.NUMERIC,
         "Temperature",
         21.5,
@@ -571,7 +580,9 @@ def test_temp_hum_profile_encoding_partial_availability(loaded_plugin):
         unit="°C",
     )
     cap_hum = protocol.Capability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "humidity"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "humidity"
+        ),
         protocol.CapabilityKind.NUMERIC,
         "Humidity",
         None,
@@ -580,7 +591,9 @@ def test_temp_hum_profile_encoding_partial_availability(loaded_plugin):
         unit="%",
     )
     compound = protocol.CompoundCapability(
-        protocol.SourceIdentity("home_assistant", "instance-1", "climate-1", "temp_hum"),
+        protocol.SourceIdentity(
+            "home_assistant", "instance-1", "climate-1", "temp_hum"
+        ),
         "Climate",
         (cap_temp, cap_hum),
     )
