@@ -1,6 +1,6 @@
 [project]
 name = "ha-domoticz-sync"
-version = "0.6.1"
+version = "0.6.2"
 description = "Home Assistant integration and Domoticz plugin for synchronizing entities"
 readme = "README.md"
 requires-python = ">=3.14.2"
