@@ -1484,6 +1484,69 @@ async def test_pre_authentication_connections_are_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reverse_command_catalog_load_failures_are_logged_safely(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Catalog lookup failures emit fixed diagnostics and fail closed."""
+    application = PersistentApplication()
+    application._hass = hass
+    manager = DomoticzBridgeManager(application)
+
+    async def raise_private_error(self) -> None:
+        raise ValueError("private-catalog-detail")
+
+    async def load_empty(self) -> None:
+        return None
+
+    caplog.set_level(logging.WARNING, logger=bridge_module.__name__)
+    monkeypatch.setattr(
+        bridge_module.HomeAssistantCatalogStorage,
+        "async_load",
+        raise_private_error,
+    )
+    monkeypatch.setattr(
+        bridge_module.HomeAssistantBinaryCatalogStorage,
+        "async_load",
+        load_empty,
+    )
+
+    assert (
+        await manager._async_find_mapped_capability(
+            "entry", "destination", "target"
+        )
+        is None
+    )
+    assert caplog.messages == [
+        "Unable to load numeric export catalog for reverse command lookup"
+    ]
+
+    caplog.clear()
+    monkeypatch.setattr(
+        bridge_module.HomeAssistantCatalogStorage,
+        "async_load",
+        load_empty,
+    )
+    monkeypatch.setattr(
+        bridge_module.HomeAssistantBinaryCatalogStorage,
+        "async_load",
+        raise_private_error,
+    )
+
+    assert (
+        await manager._async_find_mapped_capability(
+            "entry", "destination", "target"
+        )
+        is None
+    )
+    assert caplog.messages == [
+        "Unable to load binary export catalog for reverse command lookup"
+    ]
+    assert "private-catalog-detail" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_authentication_timeout_closes_connection(
     hass: HomeAssistant,
     hass_client_no_auth: ClientSessionGenerator,

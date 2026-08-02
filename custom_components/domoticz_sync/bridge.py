@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Final, Protocol
@@ -61,6 +62,8 @@ from .core.protocol import (
     verify_envelope,
     verify_v2_authenticate,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 BRIDGE_WEBSOCKET_PATH: Final = "/api/domoticz_sync/websocket"
 
@@ -819,7 +822,9 @@ class DomoticzBridgeManager:
                     if record.target_id == target_id:
                         return record.capability
         except Exception:
-            pass
+            _LOGGER.warning(
+                "Unable to load numeric export catalog for reverse command lookup"
+            )
 
         # 2. Check binary catalog
         bin_storage = HomeAssistantBinaryCatalogStorage(
@@ -835,7 +840,9 @@ class DomoticzBridgeManager:
                     if record.target_id == target_id:
                         return record.capability
         except Exception:
-            pass
+            _LOGGER.warning(
+                "Unable to load binary export catalog for reverse command lookup"
+            )
 
         return None
 
