@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.6.2](https://github.com/adrighem/ha-domoticz-sync/compare/v0.6.1...v0.6.2) (2026-08-02)
+
+
+### Bug Fixes
+
+* report reverse catalog lookup failures ([acd2f55](https://github.com/adrighem/ha-domoticz-sync/commit/acd2f55d06ad154f17af482c76a39bd692f36541))
+
 ## [0.6.1](https://github.com/adrighem/ha-domoticz-sync/compare/v0.6.0...v0.6.1) (2026-08-01)
 
 
