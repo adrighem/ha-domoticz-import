@@ -5,8 +5,8 @@ unit, state class, and Domoticz value encoding agree. A numeric sensor that
 does not have a safe native profile remains functional as a Domoticz Custom
 Sensor. It is not treated as unmapped.
 
-This matrix covers the 61 `SensorDeviceClass` values and 28
-`BinarySensorDeviceClass` values in Home Assistant 2026.7.
+This matrix covers the 62 `SensorDeviceClass` values and 28
+`BinarySensorDeviceClass` values in Home Assistant 2026.8.
 
 ## Numeric Sensors
 
@@ -36,7 +36,7 @@ The following numerical device classes deliberately use Custom Sensor:
 
 | Home Assistant device classes | Reason |
 | --- | --- |
-| `absolute_humidity`, `area`, `blood_glucose_concentration`, `conductivity`, `data_rate`, `data_size`, `duration`, `energy_distance`, `frequency`, `monetary`, `nitrogen_dioxide`, `nitrogen_monoxide`, `nitrous_oxide`, `ozone`, `ph`, `pm1`, `pm10`, `pm25`, `pm4`, `sulphur_dioxide`, `volatile_organic_compounds`, `volatile_organic_compounds_parts` | Domoticz has no single-value native profile with the same meaning and unit. |
+| `absolute_humidity`, `area`, `blood_glucose_concentration`, `conductivity`, `data_rate`, `data_size`, `duration`, `energy_distance`, `frequency`, `monetary`, `nitrogen_dioxide`, `nitrogen_monoxide`, `nitrous_oxide`, `ozone`, `ph`, `pm1`, `pm10`, `pm25`, `pm4`, `radon`, `sulphur_dioxide`, `volatile_organic_compounds`, `volatile_organic_compounds_parts` | Domoticz has no single-value native profile with the same meaning and unit. |
 | `apparent_power`, `reactive_power`, `reactive_energy` | Domoticz Usage and energy devices describe real power or energy, so using them would change the meaning. |
 | `aqi` | Domoticz Air Quality is a CO2 concentration in ppm, not an air-quality index. |
 | `energy`, `energy_storage`, `gas`, `precipitation`, `precipitation_intensity`, `volume`, `volume_storage`, `water` | The tempting Domoticz devices are counters, time-integrating devices, or compound devices. They need lifecycle or multi-capability design first. |

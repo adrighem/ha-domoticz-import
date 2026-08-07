@@ -493,6 +493,7 @@ def test_native_numeric_profile_selection_and_encoding(
         ("power", "W", "total_increasing"),
         ("aqi", None, "measurement"),
         ("energy", "kWh", "total_increasing"),
+        ("radon", "Bq/m³", "measurement"),
         ("volume_flow_rate", "m³/h", "measurement"),
         ("temperature", "mystery", "measurement"),
         (None, "°C", "measurement"),

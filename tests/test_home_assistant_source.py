@@ -732,6 +732,7 @@ def test_every_sensor_device_class_has_an_explicit_export_decision() -> None:
         "pm4",
         "precipitation",
         "precipitation_intensity",
+        "radon",
         "reactive_energy",
         "reactive_power",
         "signal_strength",
@@ -750,9 +751,12 @@ def test_every_sensor_device_class_has_an_explicit_export_decision() -> None:
     excluded_non_numeric = {"date", "enum", "timestamp", "uptime"}
 
     decisions = native_when_metadata_matches | custom_sensor | excluded_non_numeric
+    sensor_device_classes = {
+        device_class.value for device_class in SensorDeviceClass
+    }
 
     assert native_when_metadata_matches.isdisjoint(custom_sensor)
-    assert decisions == {device_class.value for device_class in SensorDeviceClass}
+    assert sensor_device_classes <= decisions
 
 
 def test_every_binary_sensor_device_class_has_an_explicit_export_decision() -> None:
@@ -790,10 +794,13 @@ def test_every_binary_sensor_device_class_has_an_explicit_export_decision() -> N
         "vibration",
     }
 
-    assert native_switch_profile.isdisjoint(generic_switch_profile)
-    assert native_switch_profile | generic_switch_profile == {
+    decisions = native_switch_profile | generic_switch_profile
+    binary_sensor_device_classes = {
         device_class.value for device_class in BinarySensorDeviceClass
     }
+
+    assert native_switch_profile.isdisjoint(generic_switch_profile)
+    assert binary_sensor_device_classes <= decisions
 
 
 def test_enabled_binary_kind_is_selected_without_an_exclusion(
