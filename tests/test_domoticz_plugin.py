@@ -2546,6 +2546,9 @@ def test_release_automation_updates_plugin_metadata():
 
     assert "# x-release-please-start-version" in source
     assert "# x-release-please-end" in source
+    assert release_config["packages"]["."]["exclude-paths"] == [
+        ".github/maintainer"
+    ]
     assert {"type": "generic", "path": "plugin.py"} in extra_files
     assert readme.count("x-release-please-start-version") == 2
     assert readme.count("x-release-please-end") == 2

@@ -6,6 +6,9 @@
       "include-component-in-tag": false,
       "include-v-in-tag": true,
       "changelog-path": "CHANGELOG.md",
+      "exclude-paths": [
+        ".github/maintainer"
+      ],
       "extra-files": [
         {
           "type": "json",
