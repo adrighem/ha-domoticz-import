@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 Release Please maintains this file from Conventional Commit messages.
 
+## [0.6.3](https://github.com/adrighem/ha-domoticz-sync/compare/v0.6.2...v0.6.3) (2026-08-07)
+
+
+### Documentation
+
+* record maintainer run for PR 30 ([1310f1e](https://github.com/adrighem/ha-domoticz-sync/commit/1310f1ef4b325c60bbe0da8736fbed277ec78aff)), closes [#30](https://github.com/adrighem/ha-domoticz-sync/issues/30)
+
 ## [0.6.2](https://github.com/adrighem/ha-domoticz-sync/compare/v0.6.1...v0.6.2) (2026-08-02)
 
 
