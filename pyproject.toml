@@ -33,7 +33,7 @@ test = [
   "pytest-asyncio>=1.3.0"
 ]
 home-assistant-test = [
-  "pytest-homeassistant-custom-component==0.13.354"
+  "pytest-homeassistant-custom-component==0.13.355"
 ]
 lint = [
   "ruff>=0.8"
